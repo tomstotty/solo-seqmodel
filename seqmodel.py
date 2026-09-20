@@ -250,7 +250,13 @@ def attention(q, k, v, mask=None):
             kj = k[j]
             acc = 0.0
             for d in range(D):
-                acc += qi[d] * kj[d]
+                try:
+                    acc += qi[d] * kj[d]
+                except OverflowError:
+                    # 两个合法 F 大整数先乘后加时可能在 int→float
+                    # 转换处溢出，按契约改抛 ValueError。
+                    raise ValueError(
+                        "score dot product overflowed")
                 if not math.isfinite(acc):
                     raise ValueError(
                         "score dot product accumulated to a non-finite value")
@@ -301,7 +307,12 @@ def attention(q, k, v, mask=None):
             for j in range(Tk):
                 wv = w_row[j]
                 if wv != 0.0:
-                    acc += wv * v[j][a]
+                    try:
+                        acc += wv * v[j][a]
+                    except OverflowError:
+                        # 合法 F 大整数在与 float 权值相乘时可能于
+                        # int→float 转换处溢出，改抛 ValueError。
+                        raise ValueError("context overflowed")
                     if not math.isfinite(acc):
                         raise ValueError(
                             "context accumulated to a non-finite value")
@@ -309,6 +320,283 @@ def attention(q, k, v, mask=None):
         c.append(c_row)
 
     return c, w
+
+
+def attention_backward(q, k, v, dc, mask=None):
+    """缩放点积注意力的反向传播，返回 (dq, dk, dv)，不修改或复用任何输入。
+
+    q、k、v、mask 完全沿用 attention 的契约；dc 须为 Tq×Dv 的 F 列表
+    矩阵，否则抛 ValueError。先按与 attention 完全相同的前向语义重算
+    权重 w，再令
+        dw[i][j] = Σ_a (dc[i][a]*v[j][a])（mask False 位为 0.0）
+        r[i]      = Σ_j (w[i][j]*dw[i][j])
+        ds[i][j]  = w[i][j]*(dw[i][j]-r[i])/sqrt(D)（False 位为 0.0）
+        dq[i][d]  = Σ_j (ds[i][j]*k[j][d])
+        dk[j][d]  = Σ_i (ds[i][j]*q[i][d])
+        dv[j][a]  = Σ_i (w[i][j]*dc[i][a])
+    每个 Σ 均自 0.0 按其下标升序累加。返回形状依次为 Tq×D、Tk×D、
+    Tk×Dv，元素均为 float，逐层新建列表。任一中间量或输出溢出或成为
+    非有限值均抛 ValueError；实参数量错误沿用 Python 自带的 TypeError。
+    相同输入结果确定。
+    """
+    # q：非空 Tq×D 的 F 列表矩阵，D>0，首行长度确定 D。
+    if type(q) is not list or len(q) == 0:
+        raise ValueError("q must be a non-empty list")
+    Tq = len(q)
+    first_row = q[0]
+    if type(first_row) is not list or len(first_row) == 0:
+        raise ValueError("q rows must be non-empty lists")
+    D = len(first_row)
+    for x in first_row:
+        if not _is_f(x):
+            raise ValueError("q entries must be finite numbers, got %r"
+                             % (x,))
+    for row in q[1:]:
+        if type(row) is not list or len(row) != D:
+            raise ValueError("q must be a rectangular list of shape Tq×%d"
+                             % D)
+        for x in row:
+            if not _is_f(x):
+                raise ValueError("q entries must be finite numbers, got %r"
+                                 % (x,))
+
+    # k：非空 Tk×D 的 F 列表矩阵，与 q 共享 D。
+    if type(k) is not list or len(k) == 0:
+        raise ValueError("k must be a non-empty list")
+    Tk = len(k)
+    for row in k:
+        if type(row) is not list or len(row) != D:
+            raise ValueError("k must be a list of shape Tk×%d" % D)
+        for x in row:
+            if not _is_f(x):
+                raise ValueError("k entries must be finite numbers, got %r"
+                                 % (x,))
+
+    # v：Tk×Dv 的 F 列表矩阵，Dv>0，与 k 共享 Tk。
+    if type(v) is not list or len(v) != Tk or Tk == 0:
+        raise ValueError("v must be a list with exactly %d rows" % Tk)
+    first_row = v[0]
+    if type(first_row) is not list or len(first_row) == 0:
+        raise ValueError("v rows must be non-empty lists")
+    Dv = len(first_row)
+    for x in first_row:
+        if not _is_f(x):
+            raise ValueError("v entries must be finite numbers, got %r"
+                             % (x,))
+    for row in v[1:]:
+        if type(row) is not list or len(row) != Dv:
+            raise ValueError("v must be a rectangular list of shape %d×%d"
+                             % (Tk, Dv))
+        for x in row:
+            if not _is_f(x):
+                raise ValueError("v entries must be finite numbers, got %r"
+                                 % (x,))
+
+    # dc：Tq×Dv 的 F 列表矩阵。
+    if type(dc) is not list or len(dc) != Tq:
+        raise ValueError("dc must be a list of shape %d×%d" % (Tq, Dv))
+    for row in dc:
+        if type(row) is not list or len(row) != Dv:
+            raise ValueError("dc must be a list of shape %d×%d" % (Tq, Dv))
+        for x in row:
+            if not _is_f(x):
+                raise ValueError("dc entries must be finite numbers, got %r"
+                                 % (x,))
+
+    # mask：None 或 Tq×Tk 的列表矩阵，元素 type 恰为 bool。
+    if mask is None:
+        active = [[True] * Tk for _ in range(Tq)]
+    else:
+        if type(mask) is not list or len(mask) != Tq:
+            raise ValueError("mask must be a list of shape %d×%d"
+                             % (Tq, Tk))
+        active = []
+        for row in mask:
+            if type(row) is not list or len(row) != Tk:
+                raise ValueError("mask must be a list of shape %d×%d"
+                                 % (Tq, Tk))
+            for m in row:
+                if type(m) is not bool:
+                    raise ValueError("mask entries must be exactly bool, "
+                                     "got %r" % (m,))
+            active.append(list(row))
+        # 全屏蔽行在此提前判定（s 计算前）。
+        for i in range(Tq):
+            if not any(active[i]):
+                raise ValueError("mask row %d is entirely False" % i)
+
+    scale = math.sqrt(float(D))
+
+    # 按与 attention 相同的前向语义重算 w。
+    w = []
+    for i in range(Tq):
+        qi = q[i]
+
+        # s[i][j] 从 0.0 按 d 升序累加点积，再除 sqrt(D)。
+        s_row = [0.0] * Tk
+        for j in range(Tk):
+            kj = k[j]
+            acc = 0.0
+            for d in range(D):
+                try:
+                    acc += qi[d] * kj[d]
+                except OverflowError:
+                    raise ValueError("score dot product overflowed")
+                if not math.isfinite(acc):
+                    raise ValueError(
+                        "score dot product accumulated to a non-finite value")
+            sval = acc / scale
+            if not math.isfinite(sval):
+                raise ValueError("score became non-finite after scaling")
+            s_row[j] = sval
+
+        # 行最大值只在 True 位取。
+        m = None
+        for j in range(Tk):
+            if active[i][j]:
+                sj = s_row[j]
+                if m is None or sj > m:
+                    m = sj
+
+        # e = exp(s - m) 仅在 True 位计算；分母按 j 升序从 0.0 累加。
+        e_row = [0.0] * Tk
+        denom = 0.0
+        for j in range(Tk):
+            if active[i][j]:
+                try:
+                    ev = math.exp(s_row[j] - m)
+                except OverflowError:
+                    raise ValueError("softmax exp overflowed")
+                if not math.isfinite(ev):
+                    raise ValueError("softmax exp became non-finite")
+                e_row[j] = ev
+                denom += ev
+                if not math.isfinite(denom):
+                    raise ValueError(
+                        "softmax denominator accumulated to a non-finite value")
+
+        # False 位权重保持 0.0；归一化后须有限。
+        w_row = [0.0] * Tk
+        for j in range(Tk):
+            if active[i][j]:
+                wv = e_row[j] / denom
+                if not math.isfinite(wv):
+                    raise ValueError("attention weight became non-finite")
+                w_row[j] = wv
+        w.append(w_row)
+
+    # 输出逐层新建，元素均为 float。
+    dq = [[0.0] * D for _ in range(Tq)]
+    dk = [[0.0] * D for _ in range(Tk)]
+    dv = [[0.0] * Dv for _ in range(Tk)]
+
+    # i 升序：逐行算 dw、r、ds、dq；dk 与 dv 跨 i 升序累加。
+    for i in range(Tq):
+        w_row = w[i]
+        active_row = active[i]
+        dc_row = dc[i]
+
+        # dw[i][j] = Σ_a dc[i][a]*v[j][a]，False 位为 0.0。
+        dw_row = [0.0] * Tk
+        for j in range(Tk):
+            if not active_row[j]:
+                continue
+            vj = v[j]
+            acc = 0.0
+            for a in range(Dv):
+                try:
+                    acc += dc_row[a] * vj[a]
+                except OverflowError:
+                    raise ValueError("dw overflowed")
+                if not math.isfinite(acc):
+                    raise ValueError("dw accumulated to a non-finite value")
+            dw_row[j] = acc
+
+        # r[i] = Σ_j w[i][j]*dw[i][j]，按 j 升序自 0.0 累加。
+        r = 0.0
+        for j in range(Tk):
+            if w_row[j] != 0.0:
+                try:
+                    r += w_row[j] * dw_row[j]
+                except OverflowError:
+                    raise ValueError("r overflowed")
+                if not math.isfinite(r):
+                    raise ValueError("r accumulated to a non-finite value")
+
+        # ds[i][j] = w[i][j]*(dw[i][j]-r[i])/sqrt(D)，False 位为 0.0。
+        ds_row = [0.0] * Tk
+        for j in range(Tk):
+            if not active_row[j]:
+                continue
+            diff = dw_row[j] - r
+            if not math.isfinite(diff):
+                raise ValueError("dw-r became non-finite")
+            try:
+                dsv = w_row[j] * diff / scale
+            except OverflowError:
+                raise ValueError("ds overflowed")
+            if not math.isfinite(dsv):
+                raise ValueError("ds became non-finite")
+            ds_row[j] = dsv
+
+        # dq[i][d] = Σ_j ds[i][j]*k[j][d]，按 j 升序自 0.0 累加。
+        dq_row = dq[i]
+        for d in range(D):
+            acc = 0.0
+            for j in range(Tk):
+                if ds_row[j] != 0.0:
+                    try:
+                        acc += ds_row[j] * k[j][d]
+                    except OverflowError:
+                        raise ValueError("dq overflowed")
+                    if not math.isfinite(acc):
+                        raise ValueError("dq accumulated to a non-finite value")
+            dq_row[d] = acc
+
+        # dk[j][d] = Σ_i ds[i][j]*q[i][d]：i 升序累加到同一输出单元。
+        qi = q[i]
+        for j in range(Tk):
+            dsij = ds_row[j]
+            if dsij != 0.0:
+                dk_row = dk[j]
+                for d in range(D):
+                    try:
+                        dk_row[d] += dsij * qi[d]
+                    except OverflowError:
+                        raise ValueError("dk overflowed")
+                    if not math.isfinite(dk_row[d]):
+                        raise ValueError(
+                            "dk accumulated to a non-finite value")
+
+            # dv[j][a] = Σ_i w[i][j]*dc[i][a]：i 升序累加，与 ds
+            # 是否为零无关（False 位 w 为 0.0，自然跳过）。
+            wij = w_row[j]
+            if wij != 0.0:
+                dv_row = dv[j]
+                for a in range(Dv):
+                    try:
+                        dv_row[a] += wij * dc_row[a]
+                    except OverflowError:
+                        raise ValueError("dv overflowed")
+                    if not math.isfinite(dv_row[a]):
+                        raise ValueError(
+                            "dv accumulated to a non-finite value")
+
+    # 输出终检：所有元素必须为有限 float。
+    for row in dq:
+        for x in row:
+            if type(x) is not float or not math.isfinite(x):
+                raise ValueError("dq became non-finite")
+    for row in dk:
+        for x in row:
+            if type(x) is not float or not math.isfinite(x):
+                raise ValueError("dk became non-finite")
+    for row in dv:
+        for x in row:
+            if type(x) is not float or not math.isfinite(x):
+                raise ValueError("dv became non-finite")
+
+    return dq, dk, dv
 
 
 class VanillaRNN(object):
