@@ -14,8 +14,15 @@ import random
 
 
 def _is_f(value):
-    """F 判定：int/f.float（不含 bool）且有限。"""
-    return (type(value) is int or type(value) is float) and math.isfinite(value)
+    """F 判定：type(v) 为 int 或 float（不含 bool），float(v) 转换成功
+    且有限。超大整数（float 转换溢出）不满足 F。"""
+    if type(value) is not int and type(value) is not float:
+        return False
+    try:
+        fv = float(value)
+    except (OverflowError, ValueError):
+        return False
+    return math.isfinite(fv)
 
 
 def _check_matrix(values, rows, cols, name):
@@ -62,10 +69,8 @@ def clip_gradients(dWxh, dWhh, dbh, max_norm):
     且逐层新建列表，不修改或复用输入列表。
     """
     def _is_grad_f(value):
-        # 与 F 一致，但 int 一律视为有限（任意大的整数也有限）。
-        if type(value) is int:
-            return True
-        return type(value) is float and math.isfinite(value)
+        # 与共享 F 判定一致：float(v) 转换成功且有限（超大整数非法）。
+        return _is_f(value)
 
     def _require_f(value, name):
         if not _is_grad_f(value):
@@ -462,3 +467,86 @@ class LSTMCell(object):
         dx = dz[:I]
         dh_prev = dz[I:]
         return dx, dh_prev, dc_prev, dW, db
+
+    def backward_sequence(self, dhs, caches, dh_last=None, dc_last=None,
+                          tbptt_steps=None):
+        """沿整个序列反向传播，固定返回 (dxs, dh0, dc0, dW, db)。
+
+        caches 须为非空时序 list，每项均符合 forward 的公开缓存契约；
+        dhs 须为同长度 T 的 T×H 的 F 列表；dh_last、dc_last 为 None
+        （等价于全零）或长度 H 的 F 列表；tbptt_steps 为 None 或非 bool
+        的正 int。任一校验失败或中间量非有限均抛 ValueError；实参数量
+        错误沿用 Python 自带的 TypeError。
+
+        置 ph = dh_last（或零）、pc = dc_last（或零），从 t = T-1 至 0
+        调用 backward(dhs[t] + ph, pc, caches[t])，将返回的 dx 放回第 t
+        位，并以返回的 dh_prev、dc_prev 作为新的 ph、pc 继续；dW、db 各
+        元素从 0.0 起按 t 降序逐步累加。若给定 K = tbptt_steps，则每处
+        理完 K 步且尚有更早步时将 ph、pc 清零（窗口从序列末端对齐，跨
+        窗状态梯度为零）。
+
+        返回值形状依次为 T×I、H、H、4H×(I+H)、4H；dh0、dc0 为 t = 0
+        一步所得的 dh_prev、dc_prev。结果均为全新 float 列表（dW 逐层
+        新建），不修改或复用 dhs、caches、dh_last、dc_last 及本单元
+        参数，结果确定。
+        """
+        I, H = self.I, self.H
+
+        if type(caches) is not list or len(caches) == 0:
+            raise ValueError("caches must be a non-empty list")
+        T = len(caches)
+        dhs = _check_matrix(dhs, T, H, "dhs")
+
+        if dh_last is None:
+            ph = [0.0] * H
+        else:
+            ph = _check_vector(dh_last, H, "dh_last")
+        if dc_last is None:
+            pc = [0.0] * H
+        else:
+            pc = _check_vector(dc_last, H, "dc_last")
+
+        if tbptt_steps is None:
+            K = None
+        elif type(tbptt_steps) is not int or tbptt_steps <= 0:
+            raise ValueError(
+                "tbptt_steps must be None or a positive integer")
+        else:
+            K = tbptt_steps
+
+        M = I + H
+        dxs = [None] * T
+        dW = [[0.0] * M for _ in range(4 * H)]
+        db = [0.0] * (4 * H)
+
+        steps = 0
+        for t in range(T - 1, -1, -1):
+            dh_t = [dhs[t][k] + ph[k] for k in range(H)]
+            dx, dh_prev, dc_prev, dW_t, db_t = self.backward(
+                dh_t, pc, caches[t])
+            dxs[t] = dx
+            ph = dh_prev
+            pc = dc_prev
+
+            for k in range(4 * H):
+                row = dW[k]
+                src = dW_t[k]
+                for j in range(M):
+                    v = row[j] + src[j]
+                    if not math.isfinite(v):
+                        raise ValueError(
+                            "dW accumulated to a non-finite value")
+                    row[j] = v
+                vb = db[k] + db_t[k]
+                if not math.isfinite(vb):
+                    raise ValueError("db accumulated to a non-finite value")
+                db[k] = vb
+
+            steps += 1
+            if K is not None and steps % K == 0 and t > 0:
+                ph = [0.0] * H
+                pc = [0.0] * H
+
+        dh0 = ph
+        dc0 = pc
+        return dxs, dh0, dc0, dW, db
