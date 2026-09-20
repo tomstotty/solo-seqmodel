@@ -13,7 +13,14 @@ TypeError。
 import json
 import math
 import random
+import re
 import sys
+
+
+# sample 的 SEED/LENGTH 词法：整串匹配，无前导零、无符号正整数或 0，
+# SEED 额外允许负号。
+_SEED_RE = re.compile(r"0|-?[1-9][0-9]*")
+_LENGTH_RE = re.compile(r"0|[1-9][0-9]*")
 
 
 def _is_f(value):
@@ -513,14 +520,31 @@ class VanillaRNN(object):
             x = xs[t]
             h = [0.0] * H
             for i in range(H):
-                acc = bh[i]
+                acc = float(bh[i])
                 wx_row = Wxh[i]
                 for j in range(I):
-                    acc += wx_row[j] * x[j]
+                    try:
+                        acc += wx_row[j] * x[j]
+                    except OverflowError:
+                        raise ValueError(
+                            "hidden affine accumulated non-finitely")
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "hidden affine accumulated non-finitely")
                 wh_row = Whh[i]
                 for j in range(H):
-                    acc += wh_row[j] * h_prev[j]
-                h[i] = math.tanh(acc)
+                    try:
+                        acc += wh_row[j] * h_prev[j]
+                    except OverflowError:
+                        raise ValueError(
+                            "hidden affine accumulated non-finitely")
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "hidden affine accumulated non-finitely")
+                ni = math.tanh(acc)
+                if not math.isfinite(ni):
+                    raise ValueError("tanh produced a non-finite value")
+                h[i] = ni
             hs.append(h)
             h_prev = h
 
@@ -555,37 +579,73 @@ class VanillaRNN(object):
             # dt = (1 - h_t^2) ⊙ (dhs[t] + dh_next)
             dt = [0.0] * H
             for i in range(H):
-                dt[i] = (1.0 - h[i] * h[i]) * (dhs[t][i] + dh_next[i])
+                try:
+                    di = (1.0 - h[i] * h[i]) * (dhs[t][i] + dh_next[i])
+                except OverflowError:
+                    raise ValueError("tanh gradient became non-finite")
+                if not math.isfinite(di):
+                    raise ValueError("tanh gradient became non-finite")
+                dt[i] = di
 
             # dx_t = Wxhᵀ dt
             dx_row = dxs[t]
             for j in range(I):
                 acc = 0.0
                 for i in range(H):
-                    acc += Wxh[i][j] * dt[i]
+                    try:
+                        acc += Wxh[i][j] * dt[i]
+                    except OverflowError:
+                        raise ValueError(
+                            "dx accumulated to a non-finite value")
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "dx accumulated to a non-finite value")
                 dx_row[j] = acc
 
             # dbh += dt；dWxh += dt ⊗ x_t
             for i in range(H):
                 di = dt[i]
                 dbh[i] += di
+                if not math.isfinite(dbh[i]):
+                    raise ValueError("dbh accumulated to a non-finite value")
                 gw_row = dWxh[i]
                 for j in range(I):
-                    gw_row[j] += di * x[j]
+                    try:
+                        gw_row[j] += di * x[j]
+                    except OverflowError:
+                        raise ValueError(
+                            "dWxh accumulated to a non-finite value")
+                    if not math.isfinite(gw_row[j]):
+                        raise ValueError(
+                            "dWxh accumulated to a non-finite value")
 
             # dWhh += dt ⊗ h_{t-1}
             for i in range(H):
                 di = dt[i]
                 gw_row = dWhh[i]
                 for j in range(H):
-                    gw_row[j] += di * h_prev[j]
+                    try:
+                        gw_row[j] += di * h_prev[j]
+                    except OverflowError:
+                        raise ValueError(
+                            "dWhh accumulated to a non-finite value")
+                    if not math.isfinite(gw_row[j]):
+                        raise ValueError(
+                            "dWhh accumulated to a non-finite value")
 
             # 传给 h_{t-1} 的梯度：dh_next = Whhᵀ dt
             new_dh = [0.0] * H
             for j in range(H):
                 acc = 0.0
                 for i in range(H):
-                    acc += Whh[i][j] * dt[i]
+                    try:
+                        acc += Whh[i][j] * dt[i]
+                    except OverflowError:
+                        raise ValueError(
+                            "dh_next accumulated to a non-finite value")
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "dh_next accumulated to a non-finite value")
                 new_dh[j] = acc
             dh_next = new_dh
 
@@ -1277,17 +1337,147 @@ def _train(model_path, corpus_path, out_path):
         f.write(text.encode("utf-8"))
 
 
+def _sample(model_path, start, seed_text, temperature_text, length_text):
+    """按温度 softmax 从 RNN 语言模型采样，返回生成码点组成的 str。
+
+    MODEL 沿用 perplexity 的八键读取契约。START 须为词表内的单码点 str；
+    SEED 整串匹配 0|-?[1-9][0-9]*；TEMPERATURE 经 float 解析后须有限且 > 0；
+    LENGTH 整串匹配 0|[1-9][0-9]*，否则抛 ValueError。
+
+    置 r=random.Random(int(SEED))、h=h0、x=START 的词表索引。循环 LENGTH
+    次：按 _perplexity 的公式、下标及累加顺序由 x、h 计算 n 与 logit z；
+    依 k 升序计算 a_k=z_k/TEMPERATURE、m=max(a)、e_k=exp(a_k-m)，d 从 0.0
+    累加 e。令 u=r.random()*d，从 0.0 依 k 升序累加 e，选择首个累计值严格
+    大于 u 的字符，均不大于则选词表末项；追加该字符后令 h=n、x=k。任一
+    运算非有限均抛 ValueError。
+    """
+    if _SEED_RE.fullmatch(seed_text) is None:
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    if _LENGTH_RE.fullmatch(length_text) is None:
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    seed = int(seed_text)
+    length = int(length_text)
+    try:
+        temperature = float(temperature_text)
+    except (ValueError, OverflowError):
+        raise ValueError("TEMPERATURE must parse with float()")
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite number greater than 0")
+    if type(start) is not str or len(start) != 1:
+        raise ValueError("START must be a single codepoint")
+
+    vocab, Wxh, Whh, bh, Why, by, h0 = _load_perplexity_model(model_path)
+    V = len(vocab)
+    H = len(bh)
+    table = {ch: i for i, ch in enumerate(vocab)}
+    x = table.get(start)
+    if x is None:
+        raise ValueError("START must be a codepoint in vocab")
+
+    r = random.Random(seed)
+    h = h0
+    out = []
+    for _ in range(length):
+        # n_i = tanh(bh_i + Wxh_i,x + Σ_j Whh_i,j*h_j)：公式、下标与累加
+        # 顺序与 _perplexity 完全一致。
+        n = [0.0] * H
+        for i in range(H):
+            acc = float(bh[i])
+            acc += Wxh[i][x]
+            if not math.isfinite(acc):
+                raise ValueError("hidden affine accumulated non-finitely")
+            wh_row = Whh[i]
+            for j in range(H):
+                try:
+                    acc += wh_row[j] * h[j]
+                except OverflowError:
+                    raise ValueError(
+                        "hidden affine accumulated non-finitely")
+                if not math.isfinite(acc):
+                    raise ValueError("hidden affine accumulated non-finitely")
+            ni = math.tanh(acc)
+            if not math.isfinite(ni):
+                raise ValueError("tanh produced a non-finite value")
+            n[i] = ni
+
+        # z_k = by_k + Σ_j Why_k,j*n_j，依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(H):
+                try:
+                    acc += why_row[j] * n[j]
+                except OverflowError:
+                    raise ValueError(
+                        "output affine accumulated non-finitely")
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # 温度 logit：依 k 升序计算 a_k=z_k/TEMPERATURE。
+        a = [0.0] * V
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("temperature-scaled logit is non-finite")
+            a[k] = ak
+
+        # m=max(a)，e_k=exp(a_k-m)，d 从 0.0 依 k 升序累加。
+        m = max(a)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            ev = math.exp(a[k] - m)
+            if not math.isfinite(ev):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ev
+            d += ev
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        u = r.random() * d
+        if not math.isfinite(u):
+            raise ValueError("sampling threshold is non-finite")
+
+        # 从 0.0 依 k 升序累加 e，选首个累计值严格大于 u 的 k；无则末项。
+        chosen = V - 1
+        cum = 0.0
+        for k in range(V):
+            cum += e[k]
+            if not math.isfinite(cum):
+                raise ValueError(
+                    "softmax cumulative sum accumulated non-finitely")
+            if cum > u:
+                chosen = k
+                break
+
+        out.append(vocab[chosen])
+        h = n
+        x = chosen
+
+    return "".join(out)
+
+
 def main(argv):
-    """命令行入口：perplexity 与 train 两个子命令。
+    """命令行入口：perplexity、train 与 sample 三个子命令。
 
     python seqmodel.py perplexity MODEL CORPUS：成功时 stdout 恰为
     format(exp(L/T), '.17g') + '\\n' 并返回 0。
 
     python seqmodel.py train MODEL CORPUS OUT：对模型做一次全语料 SGD
-    并写出新模型，成功时 stdout 为空并返回 0。
+    并写出新模型，成功时 stdout 为空并返回 0；计算全部成功前不写 OUT。
 
-    参数、文件读取、UTF-8/JSON 解析、模型/语料校验或非有限计算等任何失败
-    均返回 2，stdout 为空，且 stderr 恰为 "error\\n"，不输出回溯。
+    python seqmodel.py sample MODEL START SEED TEMPERATURE LENGTH：成功时
+    stdout 恰为 LENGTH 个生成码点的 UTF-8 字节加一个 LF（LENGTH 为 0 时
+    仅 LF），不写任何文件，并返回 0。
+
+    参数数量、词法、文件读取、UTF-8/JSON 解析、模型/语料校验或非有限计算
+    等任何失败均返回 2，stdout 为空，且 stderr 恰为 "error\\n"，不输出
+    回溯。
     """
     try:
         if len(argv) == 4 and argv[1] == "perplexity":
@@ -1295,10 +1485,14 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 5 and argv[1] == "train":
             _train(argv[2], argv[3], argv[4])
+        elif len(argv) == 7 and argv[1] == "sample":
+            output = _sample(argv[2], argv[3], argv[4], argv[5], argv[6])
+            sys.stdout.buffer.write(output.encode("utf-8") + b"\n")
         else:
             raise ValueError(
                 "usage: seqmodel.py perplexity MODEL CORPUS | "
-                "seqmodel.py train MODEL CORPUS OUT")
+                "seqmodel.py train MODEL CORPUS OUT | "
+                "seqmodel.py sample MODEL START SEED TEMPERATURE LENGTH")
     except Exception:
         sys.stderr.buffer.write(b"error\n")
         return 2
