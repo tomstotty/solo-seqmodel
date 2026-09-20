@@ -1303,6 +1303,7 @@ def _train(model_path, corpus_path, out_path):
 
 _INT_RE = re.compile(r"\A(?:0|-?[1-9][0-9]*)\Z")
 _NONNEG_INT_RE = re.compile(r"\A(?:0|[1-9][0-9]*)\Z")
+_POS_INT_RE = re.compile(r"\A[1-9][0-9]*\Z")
 
 
 def _sample(model_path, start, seed_text, temperature_text, length_text):
@@ -1499,8 +1500,249 @@ def _sample_anneal(model_path, start, seed_text, start_t_text, end_t_text,
                         vocab.index(start), length, temperature_at)
 
 
+def _attn_hidden(x, h, Wxh, Whh, bh, H, mem):
+    """计算一步注意力增广隐状态，返回 (n, u)，不修改任何输入。
+
+    先严格按 _perplexity 的 RNN 公式、下标与累加顺序由 x、h 求 n：
+    仿射累加器自 float(bh[i]) 起，先加 Wxh_i,x，再依 j 升序加 Whh_i,j*h_j，
+    最后 tanh。mem 为调用方已截取好的 M_t（自旧到新，至多 WINDOW 项，调用
+    方保证恒非空）：以 attention([n], mem, mem, None) 返回的首行 c[0] 逐项
+    令 u_i=n_i+c[0][i]。任一运算非有限均抛 ValueError。
+    """
+    # n_i = tanh(bh_i + Wxh_i,x + Σ_j Whh_i,j*h_j)：起点、下标与累加顺序
+    # 与 _perplexity 完全相同。
+    n = [0.0] * H
+    for i in range(H):
+        acc = float(bh[i])
+        acc += Wxh[i][x]
+        if not math.isfinite(acc):
+            raise ValueError("hidden affine accumulated non-finitely")
+        wh_row = Whh[i]
+        for j in range(H):
+            acc += wh_row[j] * h[j]
+            if not math.isfinite(acc):
+                raise ValueError("hidden affine accumulated non-finitely")
+        ni = math.tanh(acc)
+        if not math.isfinite(ni):
+            raise ValueError("tanh produced a non-finite value")
+        n[i] = ni
+
+    c, _w = attention([n], mem, mem, None)
+    c0 = c[0]
+    u = [0.0] * H
+    for i in range(H):
+        ui = n[i] + c0[i]
+        if not math.isfinite(ui):
+            raise ValueError(
+                "attention-augmented hidden became non-finite")
+        u[i] = ui
+    return n, u
+
+
+def _perplexity_attn(model_path, corpus_path, window_text):
+    """计算注意力增广 RNN 语言模型的困惑度，返回待写出的字符串。
+
+    WINDOW 整串匹配 [1-9][0-9]*，否则抛 ValueError。MODEL、CORPUS 完全沿用
+    _perplexity 的读取、形状、F、UTF-8、词表及语料契约。
+
+    置 h=h0、记忆=[h0]、L=0.0、T=len(CORPUS)-1，t 升序（x、y 为当前、下一
+    字符索引）：M_t 取 [h0,n_0,...,n_{t-1}] 末尾至多 WINDOW 项（自旧到新）；
+    按 _perplexity 的公式与累加顺序由 x、h 求 n_t，再以
+    attention([n_t],M_t,M_t,None) 首行 c 逐项令 u_i=n_t[i]+c[0][i]。logit
+    z_k = by_k + Σ_j Why_k,j*u_j（仅以 u 替代原隐藏向量），其后 m=max(z)、
+    d 从 0.0 依 k 升序累加 exp(z_k-m)、L += m+log(d)-z_y 均与 _perplexity
+    相同；随后 h=n_t 并把 n_t 追加进记忆。任一中间量非有限（含最终
+    exp(L/T) 溢出）均抛 ValueError。成功返回 format(exp(L/T), '.17g')+'\\n'。
+    """
+    # WINDOW：整串匹配正整数词法（禁止空白、+ 前缀、前导零、下划线、0）。
+    if not _POS_INT_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+    window = int(window_text)
+
+    vocab, Wxh, Whh, bh, Why, by, h0 = _load_perplexity_model(model_path)
+    V = len(vocab)
+    H = len(bh)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    h = h0
+    memory = [h0]
+    L = 0.0
+    T = len(ids) - 1
+    for t in range(T):
+        x = ids[t]
+        y = ids[t + 1]
+
+        # M_t 为 [h0,n_0,...,n_{t-1}] 末尾至多 WINDOW 项，自旧到新。
+        n, u = _attn_hidden(x, h, Wxh, Whh, bh, H, memory[-window:])
+
+        # z_k = by_k + Σ_j Why_k,j*u_j，仅以 u 替代 n，其余与 _perplexity
+        # 相同：依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(H):
+                acc += why_row[j] * u[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # log-sum-exp：m=max(z)，d 从 0.0 依 k 升序累加 exp(z_k-m)。
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        d = 0.0
+        for k in range(V):
+            d += math.exp(z[k] - m)
+            if not math.isfinite(d):
+                raise ValueError("softmax denominator accumulated non-finitely")
+
+        step = m + math.log(d) - z[y]
+        if not math.isfinite(step):
+            raise ValueError("cross-entropy step is non-finite")
+        L += step
+        if not math.isfinite(L):
+            raise ValueError("total cross-entropy accumulated non-finitely")
+        h = n
+        memory.append(n)
+
+    perplexity = math.exp(L / T)
+    if not math.isfinite(perplexity):
+        raise ValueError("perplexity is non-finite")
+    return format(perplexity, ".17g") + "\n"
+
+
+def _sample_attn(model_path, start, seed_text, temperature_text,
+                 length_text, window_text):
+    """从注意力增广 RNN 语言模型采样 LENGTH 个码点，返回待写出的字符串。
+
+    WINDOW 整串匹配 [1-9][0-9]*；MODEL、START、SEED、TEMPERATURE、LENGTH
+    的校验与 _sample 完全一致，否则抛 ValueError。整次调用仅初始化一次
+    r=random.Random(int(SEED))，不写任何文件。
+
+    置 h=h0、记忆=[h0]、x=START 索引。循环 LENGTH 次：M_t 取
+    [h0,n_0,...,n_{t-1}] 末尾至多 WINDOW 项（自旧到新）；按 _perplexity 的
+    公式与累加顺序由 x、h 求 n_t，再以 attention([n_t],M_t,M_t,None) 首行 c
+    逐项令 u_i=n_t[i]+c[0][i]。logit 仅以 u 替代原隐藏向量，其后
+    a_k=z_k/TEMPERATURE、稳定 softmax、u=r.random()*d 及按词表升序累计选首个
+    严格超过者（无则取词表末项）均与 _sample_loop 完全相同；随后 h=n_t、
+    x=选中项，并把 n_t 追加进记忆。任一运算非有限均抛 ValueError。成功返回
+    LENGTH 个码点再加一个 LF。
+    """
+    # WINDOW：整串匹配正整数词法（禁止空白、+ 前缀、前导零、下划线、0）。
+    if not _POS_INT_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+    window = int(window_text)
+
+    vocab, Wxh, Whh, bh, Why, by, h0 = _load_perplexity_model(model_path)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # TEMPERATURE：float() 可解析且有限、严格大于 0；inf/nan/0/负数均失败。
+    temperature = float(temperature_text)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    V = len(vocab)
+    H = len(bh)
+    rng = random.Random(seed)
+    h = h0
+    x = vocab.index(start)
+    memory = [h0]
+    out = []
+
+    for t in range(length):
+        # M_t 为 [h0,n_0,...,n_{t-1}] 末尾至多 WINDOW 项，自旧到新。
+        n, u = _attn_hidden(x, h, Wxh, Whh, bh, H, memory[-window:])
+
+        # z_k = by_k + Σ_j Why_k,j*u_j，仅以 u 替代 n，其余与 _sample_loop
+        # 相同：依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(H):
+                acc += why_row[j] * u[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # u=r.random()*d；自 0.0 依 k 升序累加 e_k，选首个累计值严格大于
+        # u 者；无则取词表末项。
+        threshold = rng.random() * d
+        if not math.isfinite(threshold):
+            raise ValueError("sample threshold became non-finite")
+        chosen = V - 1
+        cum = 0.0
+        for k in range(V):
+            cum += e[k]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > threshold:
+                chosen = k
+                break
+
+        out.append(vocab[chosen])
+        h = n
+        memory.append(n)
+        x = chosen
+
+    return "".join(out) + "\n"
+
+
 def main(argv):
-    """命令行入口：perplexity、train 与 sample 三个子命令。
+    """命令行入口：perplexity、train、sample、sample-anneal 及对应的
+    注意力增广子命令。
 
     python seqmodel.py perplexity MODEL CORPUS：成功时 stdout 恰为
     format(exp(L/T), '.17g') + '\\n' 并返回 0。
@@ -1517,6 +1759,14 @@ def main(argv):
     START_T+(END_T-START_T)*t/(LENGTH-1)（LENGTH 为 1 时仅用 START_T，
     为 0 时不计算温度）；输出契约与 sample 相同。
 
+    python seqmodel.py perplexity-attn MODEL CORPUS WINDOW：每步在 RNN 隐
+    状态 n_t 上叠加对 [h0,n_0,...,n_{t-1}] 末尾至多 WINDOW 项的注意力，
+    以增广向量 u=n_t+c[0] 计算 logit，输出契约与 perplexity 相同。
+
+    python seqmodel.py sample-attn MODEL START SEED TEMPERATURE LENGTH
+    WINDOW：以同样的注意力增广隐状态采样，仅初始化一次种子随机源、不写
+    文件，输出契约与 sample 相同。
+
     参数数量、词法、文件读取、UTF-8/JSON 解析、模型/语料校验或非有限计算等
     任何失败均返回 2，stdout 为空，且 stderr 恰为 "error\\n"，不输出回溯。
     """
@@ -1526,6 +1776,9 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 5 and argv[1] == "train":
             _train(argv[2], argv[3], argv[4])
+        elif len(argv) == 5 and argv[1] == "perplexity-attn":
+            output = _perplexity_attn(argv[2], argv[3], argv[4])
+            sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 7 and argv[1] == "sample":
             output = _sample(argv[2], argv[3], argv[4], argv[5], argv[6])
             sys.stdout.buffer.write(output.encode("utf-8"))
@@ -1533,13 +1786,20 @@ def main(argv):
             output = _sample_anneal(argv[2], argv[3], argv[4], argv[5],
                                     argv[6], argv[7])
             sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 8 and argv[1] == "sample-attn":
+            output = _sample_attn(argv[2], argv[3], argv[4], argv[5],
+                                  argv[6], argv[7])
+            sys.stdout.buffer.write(output.encode("utf-8"))
         else:
             raise ValueError(
                 "usage: seqmodel.py perplexity MODEL CORPUS | "
                 "seqmodel.py train MODEL CORPUS OUT | "
                 "seqmodel.py sample MODEL START SEED TEMPERATURE LENGTH | "
                 "seqmodel.py sample-anneal MODEL START SEED START_T END_T "
-                "LENGTH")
+                "LENGTH | "
+                "seqmodel.py perplexity-attn MODEL CORPUS WINDOW | "
+                "seqmodel.py sample-attn MODEL START SEED TEMPERATURE "
+                "LENGTH WINDOW")
     except Exception:
         sys.stderr.buffer.write(b"error\n")
         return 2
