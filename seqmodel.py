@@ -10,8 +10,10 @@
 TypeError。
 """
 
+import json
 import math
 import random
+import sys
 
 
 def _is_f(value):
@@ -907,3 +909,218 @@ class LSTMCell(object):
         dh0 = [float(v) for v in ph]
         dc0 = [float(v) for v in pc]
         return dxs, dh0, dc0, dW, db
+
+
+# 模型 JSON 顶层唯一允许的键及其出现顺序。
+_MODEL_KEYS = ["version", "vocab", "Wxh", "Whh", "bh", "Why", "by", "h0"]
+
+
+def _load_perplexity_model(path):
+    """读取并校验 perplexity 模型文件，返回解包后的八元组。
+
+    文件须为 UTF-8 编码的 JSON 对象，顶层键恰为
+    version、vocab、Wxh、Whh、bh、Why、by、h0 且按此顺序出现（重复或多余
+    均非法）：version 的 type 恰为 int 且值为 1；vocab 为非空列表，每项
+    是恰含一个码点的 str，元素唯一且按码点严格升序；其余六项为 F 列表，
+    形状依次为 H×V、H×H、H、V×H、V、H，其中 H>0、V=len(vocab)。
+    任何读取、UTF-8、JSON 或校验失败均抛 ValueError（或 OSError）。
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+    # 先按严格 UTF-8 解码，再交由 json 解析（object_pairs_hook 保留键序与
+    # 重复键，root 非对象时不会得到 (key, value) 二元组列表）。
+    text = raw.decode("utf-8")
+    pairs = json.loads(text, object_pairs_hook=list)
+    if type(pairs) is not list or len(pairs) != len(_MODEL_KEYS):
+        raise ValueError("model must be a JSON object with exactly 8 keys")
+    for pair, key in zip(pairs, _MODEL_KEYS):
+        if type(pair) is not tuple or len(pair) != 2 or pair[0] != key:
+            raise ValueError("model keys must be exactly %r in order"
+                             % _MODEL_KEYS)
+    model = dict(pairs)
+
+    version = model["version"]
+    if type(version) is not int or version != 1:
+        raise ValueError("version must be exactly int 1, got %r" % (version,))
+
+    vocab = model["vocab"]
+    if type(vocab) is not list or len(vocab) == 0:
+        raise ValueError("vocab must be a non-empty list")
+    for ch in vocab:
+        # len(str) 按码点计数，组合字符序列等多码点串在此被拒。
+        if type(ch) is not str or len(ch) != 1:
+            raise ValueError("vocab entries must be single-codepoint strings, "
+                             "got %r" % (ch,))
+    if len(set(vocab)) != len(vocab) or vocab != sorted(vocab):
+        raise ValueError("vocab entries must be unique and sorted by codepoint")
+    V = len(vocab)
+
+    Wxh = model["Wxh"]
+    if type(Wxh) is not list or len(Wxh) == 0:
+        raise ValueError("Wxh must be a non-empty list of rows")
+    H = len(Wxh)
+    for row in Wxh:
+        if type(row) is not list or len(row) != V:
+            raise ValueError("Wxh must be a list of shape H×%d" % V)
+        for v in row:
+            if not _is_f(v):
+                raise ValueError("Wxh entries must be finite numbers, got %r"
+                                 % (v,))
+
+    Whh = model["Whh"]
+    if type(Whh) is not list or len(Whh) != H:
+        raise ValueError("Whh must be a list of shape %d×%d" % (H, H))
+    for row in Whh:
+        if type(row) is not list or len(row) != H:
+            raise ValueError("Whh must be a list of shape %d×%d" % (H, H))
+        for v in row:
+            if not _is_f(v):
+                raise ValueError("Whh entries must be finite numbers, got %r"
+                                 % (v,))
+
+    bh = model["bh"]
+    if type(bh) is not list or len(bh) != H:
+        raise ValueError("bh must be a list of length %d" % H)
+    for v in bh:
+        if not _is_f(v):
+            raise ValueError("bh entries must be finite numbers, got %r" % (v,))
+
+    Why = model["Why"]
+    if type(Why) is not list or len(Why) != V:
+        raise ValueError("Why must be a list of shape %d×H" % V)
+    for row in Why:
+        if type(row) is not list or len(row) != H:
+            raise ValueError("Why must be a list of shape %d×%d" % (V, H))
+        for v in row:
+            if not _is_f(v):
+                raise ValueError("Why entries must be finite numbers, got %r"
+                                 % (v,))
+
+    by = model["by"]
+    if type(by) is not list or len(by) != V:
+        raise ValueError("by must be a list of length %d" % V)
+    for v in by:
+        if not _is_f(v):
+            raise ValueError("by entries must be finite numbers, got %r" % (v,))
+
+    h0 = model["h0"]
+    if type(h0) is not list or len(h0) != H:
+        raise ValueError("h0 must be a list of length %d" % H)
+    for v in h0:
+        if not _is_f(v):
+            raise ValueError("h0 entries must be finite numbers, got %r" % (v,))
+
+    return vocab, Wxh, Whh, bh, Why, by, h0
+
+
+def _perplexity(model_path, corpus_path):
+    """计算 RNN 语言模型在给定语料上的困惑度，返回待写出的字符串。
+
+    语料按二进制读取后以严格 UTF-8 解码为全文码点序列（含换行，不做任何
+    换行符转换）；不足 2 个码点或出现 vocab 表外字符均失败。置 h=h0、
+    L=0.0、T=len(CORPUS)-1，t 升序（x、y 为当前、下一字符索引）：
+        n_i = tanh(bh_i + Wxh_i,x + Σ_j Whh_i,j*h_j)
+        z_k = by_k + Σ_j Why_k,j*n_j
+        m=max(z)，d 从 0.0 依 k 累加 exp(z_k-m)
+        L += m + log(d) - z_y，随后 h=n
+    仿射累加自 float 偏置起，n 先加 Wxh_i,x 再依 j 升序加 Whh，z 依 j
+    升序加 Why。任一中间量非有限（含最终 exp(L/T) 溢出）均抛 ValueError。
+    成功返回 format(exp(L/T), '.17g') + '\\n'。
+    """
+    vocab, Wxh, Whh, bh, Why, by, h0 = _load_perplexity_model(model_path)
+    V = len(vocab)
+    H = len(bh)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    h = h0
+    L = 0.0
+    T = len(ids) - 1
+    for t in range(T):
+        x = ids[t]
+        y = ids[t + 1]
+
+        # n_i = tanh(bh_i + Wxh_i,x + Σ_j Whh_i,j*h_j)：累加器自 float
+        # 偏置起，先加 Wxh，再依 j 升序加 Whh*h。
+        n = [0.0] * H
+        for i in range(H):
+            acc = float(bh[i])
+            acc += Wxh[i][x]
+            if not math.isfinite(acc):
+                raise ValueError("hidden affine accumulated non-finitely")
+            wh_row = Whh[i]
+            for j in range(H):
+                acc += wh_row[j] * h[j]
+                if not math.isfinite(acc):
+                    raise ValueError("hidden affine accumulated non-finitely")
+            ni = math.tanh(acc)
+            if not math.isfinite(ni):
+                raise ValueError("tanh produced a non-finite value")
+            n[i] = ni
+
+        # z_k = by_k + Σ_j Why_k,j*n_j，依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(H):
+                acc += why_row[j] * n[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # log-sum-exp：m=max(z)，d 从 0.0 依 k 升序累加 exp(z_k-m)。
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        d = 0.0
+        for k in range(V):
+            d += math.exp(z[k] - m)
+            if not math.isfinite(d):
+                raise ValueError("softmax denominator accumulated non-finitely")
+
+        step = m + math.log(d) - z[y]
+        if not math.isfinite(step):
+            raise ValueError("cross-entropy step is non-finite")
+        L += step
+        if not math.isfinite(L):
+            raise ValueError("total cross-entropy accumulated non-finitely")
+        h = n
+
+    perplexity = math.exp(L / T)
+    if not math.isfinite(perplexity):
+        raise ValueError("perplexity is non-finite")
+    return format(perplexity, ".17g") + "\n"
+
+
+def main(argv):
+    """命令行入口：python seqmodel.py perplexity MODEL CORPUS。
+
+    成功时 stdout 恰为 format(exp(L/T), '.17g') + '\\n' 并返回 0；参数、
+    文件读取、UTF-8/JSON 解析、模型/语料校验或非有限计算等任何失败均返回
+    2，且 stderr 恰为 "error\\n"，不输出回溯。
+    """
+    try:
+        if len(argv) != 4 or argv[1] != "perplexity":
+            raise ValueError("usage: seqmodel.py perplexity MODEL CORPUS")
+        output = _perplexity(argv[2], argv[3])
+        sys.stdout.buffer.write(output.encode("ascii"))
+    except Exception:
+        sys.stderr.buffer.write(b"error\n")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
