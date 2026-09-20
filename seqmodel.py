@@ -344,3 +344,88 @@ class LSTMCell(object):
             "W": [[float(v) for v in row] for row in W],
         }
         return [float(v) for v in h], [float(v) for v in c], cache
+
+    _CACHE_KEYS = ("x", "h_prev", "c_prev", "z", "i", "f", "o", "g",
+                   "c", "h", "W")
+
+    def backward(self, dh, dc, cache):
+        """单步反向传播，返回 (dx, dh_prev, dc_prev, dW, db)。
+
+        dh、dc 须为长度 H 的 F 列表；cache 须为 dict，恰含 forward
+        缓存的 11 个有序键（x、h_prev、c_prev、z、i、f、o、g、c、h、W），
+        各值的列表类型、形状与 F 规则与 forward 契约一致，任一非法抛
+        ValueError。中间量出现非有限值同样抛 ValueError。
+
+        逐元素计算（变量取 cache 同名值）：
+            D = dc + dh*o*(1 - tanh(c)^2)
+            dc_prev = D*f
+            da = [D*g*i*(1-i) | D*c_prev*f*(1-f) | dh*tanh(c)*o*(1-o)
+                  | D*i*(1-g^2)]
+        对每个 j 以 0.0 起、按 k=0..4H-1 升序累加 dz[j] += W[k][j]*da[k]；
+        dx = dz[:I]，dh_prev = dz[I:]，dW[k][j] = da[k]*z[j]，db[k] = da[k]。
+
+        五项返回值形状依次为 I、H、H、4H×(I+H)、4H，均为全新 float
+        列表（dW 逐层新建）；不修改或复用 dh、dc、cache 及其内容。
+        """
+        I, H = self.I, self.H
+        dh = _check_vector(dh, H, "dh")
+        dc = _check_vector(dc, H, "dc")
+
+        if type(cache) is not dict or list(cache.keys()) != list(
+                self._CACHE_KEYS):
+            raise ValueError("cache must be a dict with exactly the keys "
+                             "%s in order" % (list(self._CACHE_KEYS),))
+        _check_vector(cache["x"], I, "cache['x']")
+        _check_vector(cache["h_prev"], H, "cache['h_prev']")
+        c_prev = _check_vector(cache["c_prev"], H, "cache['c_prev']")
+        z = _check_vector(cache["z"], I + H, "cache['z']")
+        i_gate = _check_vector(cache["i"], H, "cache['i']")
+        f_gate = _check_vector(cache["f"], H, "cache['f']")
+        o_gate = _check_vector(cache["o"], H, "cache['o']")
+        g_gate = _check_vector(cache["g"], H, "cache['g']")
+        c = _check_vector(cache["c"], H, "cache['c']")
+        _check_vector(cache["h"], H, "cache['h']")
+        W = _check_matrix(cache["W"], 4 * H, I + H, "cache['W']")
+
+        def _finite(value, name):
+            if not math.isfinite(value):
+                raise ValueError("%s became non-finite" % name)
+            return value
+
+        D = [0.0] * H
+        dc_prev = [0.0] * H
+        da = [0.0] * (4 * H)
+        for k in range(H):
+            tanh_c = math.tanh(float(c[k]))
+            Dv = float(dc[k]) + float(dh[k]) * float(o_gate[k]) * (
+                1.0 - tanh_c * tanh_c)
+            D[k] = _finite(Dv, "D")
+            dc_prev[k] = _finite(D[k] * float(f_gate[k]), "dc_prev")
+            da[k] = _finite(D[k] * float(g_gate[k]) * float(i_gate[k]) * (
+                1.0 - float(i_gate[k])), "da")
+            da[H + k] = _finite(D[k] * float(c_prev[k]) * float(
+                f_gate[k]) * (1.0 - float(f_gate[k])), "da")
+            da[2 * H + k] = _finite(float(dh[k]) * tanh_c * float(
+                o_gate[k]) * (1.0 - float(o_gate[k])), "da")
+            gv = float(g_gate[k])
+            da[3 * H + k] = _finite(D[k] * float(i_gate[k]) * (
+                1.0 - gv * gv), "da")
+
+        # dz[j] = Σ_k W[k][j]*da[k]，对每个 j 按 k 升序累加
+        dz = [0.0] * (I + H)
+        for j in range(I + H):
+            acc = 0.0
+            for k in range(4 * H):
+                acc += float(W[k][j]) * da[k]
+            dz[j] = _finite(acc, "dz")
+
+        dW = [[0.0] * (I + H) for _ in range(4 * H)]
+        for k in range(4 * H):
+            row = dW[k]
+            for j in range(I + H):
+                row[j] = _finite(da[k] * float(z[j]), "dW")
+
+        dx = [float(v) for v in dz[:I]]
+        dh_prev = [float(v) for v in dz[I:]]
+        db = [float(v) for v in da]
+        return dx, dh_prev, [float(v) for v in dc_prev], dW, db
