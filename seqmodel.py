@@ -1320,8 +1320,6 @@ def _sample(model_path, start, seed_text, temperature_text, length_text):
     运算非有限均抛 ValueError。成功返回 LENGTH 个码点再加一个 LF。
     """
     vocab, Wxh, Whh, bh, Why, by, h0 = _load_perplexity_model(model_path)
-    V = len(vocab)
-    H = len(bh)
 
     # START：恰为词表内的一个码点。
     if type(start) is not str or len(start) != 1 or start not in vocab:
@@ -1342,12 +1340,31 @@ def _sample(model_path, start, seed_text, temperature_text, length_text):
         raise ValueError("LENGTH must match 0|[1-9][0-9]*")
     length = int(length_text)
 
+    return _sample_loop(vocab, Wxh, Whh, bh, Why, by, h0, seed,
+                        vocab.index(start), length, lambda t: temperature)
+
+
+def _sample_loop(vocab, Wxh, Whh, bh, Why, by, h0, seed, start_index,
+                 length, temperature_at):
+    """sample 与 sample-anneal 共用的采样循环，返回待写出的字符串。
+
+    整次调用仅初始化一次 r=random.Random(seed)；置 h=h0、x=start_index。
+    t 自 0 升序循环 length 次：先令 temperature=temperature_at(t)，再按
+    _perplexity 的公式、下标及累加顺序由 x、h 计算 n 与 logit z；依 k
+    升序令 a_k=z_k/temperature、m=max(a)、e_k=exp(a_k-m)，d 自 0.0 累加
+    e_k。令 u=r.random()*d，自 0.0 依 k 升序累加 e_k，选择首个累计值严格
+    大于 u 的字符 k（无则取词表末项）；追加 vocab[k]，再令 h=n、x=k。任一
+    运算非有限均抛 ValueError。返回 length 个码点再加一个 LF。
+    """
+    V = len(vocab)
+    H = len(bh)
     rng = random.Random(seed)
     h = h0
-    x = vocab.index(start)
+    x = start_index
     out = []
 
-    for _ in range(length):
+    for t in range(length):
+        temperature = temperature_at(t)
         # n_i = tanh(bh_i + Wxh_i,x + Σ_j Whh_i,j*h_j)，与 _perplexity
         # 相同的起点、下标与累加顺序。
         n = [0.0] * H
@@ -1425,6 +1442,63 @@ def _sample(model_path, start, seed_text, temperature_text, length_text):
     return "".join(out) + "\n"
 
 
+def _sample_anneal(model_path, start, seed_text, start_t_text, end_t_text,
+                   length_text):
+    """以线性退火温度从 RNN 语言模型采样 LENGTH 个码点，返回待写出的字符串。
+
+    MODEL、START、SEED、LENGTH 的校验与 _sample 完全一致。START_T、END_T
+    各经 float() 解析，结果须有限且严格大于 0，否则抛 ValueError。整次
+    调用仅初始化一次 random.Random(int(SEED))。
+
+    LENGTH 为 0 时不计算温度；为 1 时仅用 START_T；否则 t 自 0 升序，第
+    t 步温度严格按 Python 表达式 START_T+(END_T-START_T)*t/(LENGTH-1)
+    求值，结果非有限即抛 ValueError。每步以该温度替换 _sample 的固定温度，
+    隐藏态、logit、稳定 softmax 与按词表升序累计抽样的公式及运算顺序均与
+    _sample 相同，生成后继续更新同一 h 和 x。成功返回 LENGTH 个码点再加
+    一个 LF。
+    """
+    vocab, Wxh, Whh, bh, Why, by, h0 = _load_perplexity_model(model_path)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # START_T、END_T：float() 可解析且有限、严格大于 0。
+    start_t = float(start_t_text)
+    if not math.isfinite(start_t) or start_t <= 0.0:
+        raise ValueError("START_T must be a finite positive float")
+    end_t = float(end_t_text)
+    if not math.isfinite(end_t) or end_t <= 0.0:
+        raise ValueError("END_T must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    if length == 1:
+        # 仅用 START_T，不求值退火表达式。
+        def temperature_at(t):
+            return start_t
+    elif length >= 2:
+        def temperature_at(t):
+            # 严格按 START_T+(END_T-START_T)*t/(LENGTH-1) 的运算顺序求值。
+            temp = start_t + (end_t - start_t) * t / (length - 1)
+            if not math.isfinite(temp):
+                raise ValueError("annealed temperature became non-finite")
+            return temp
+    else:
+        temperature_at = None  # LENGTH 为 0：循环不执行，不计算温度。
+
+    return _sample_loop(vocab, Wxh, Whh, bh, Why, by, h0, seed,
+                        vocab.index(start), length, temperature_at)
+
+
 def main(argv):
     """命令行入口：perplexity、train 与 sample 三个子命令。
 
@@ -1438,6 +1512,11 @@ def main(argv):
     stdout 恰为 LENGTH 个采样码点的 UTF-8 编码再加一个 LF（LENGTH 为 0 时
     仅 LF），不写任何文件，返回 0。
 
+    python seqmodel.py sample-anneal MODEL START SEED START_T END_T LENGTH：
+    以线性退火温度采样，第 t 步温度为
+    START_T+(END_T-START_T)*t/(LENGTH-1)（LENGTH 为 1 时仅用 START_T，
+    为 0 时不计算温度）；输出契约与 sample 相同。
+
     参数数量、词法、文件读取、UTF-8/JSON 解析、模型/语料校验或非有限计算等
     任何失败均返回 2，stdout 为空，且 stderr 恰为 "error\\n"，不输出回溯。
     """
@@ -1450,11 +1529,17 @@ def main(argv):
         elif len(argv) == 7 and argv[1] == "sample":
             output = _sample(argv[2], argv[3], argv[4], argv[5], argv[6])
             sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 8 and argv[1] == "sample-anneal":
+            output = _sample_anneal(argv[2], argv[3], argv[4], argv[5],
+                                    argv[6], argv[7])
+            sys.stdout.buffer.write(output.encode("utf-8"))
         else:
             raise ValueError(
                 "usage: seqmodel.py perplexity MODEL CORPUS | "
                 "seqmodel.py train MODEL CORPUS OUT | "
-                "seqmodel.py sample MODEL START SEED TEMPERATURE LENGTH")
+                "seqmodel.py sample MODEL START SEED TEMPERATURE LENGTH | "
+                "seqmodel.py sample-anneal MODEL START SEED START_T END_T "
+                "LENGTH")
     except Exception:
         sys.stderr.buffer.write(b"error\n")
         return 2
