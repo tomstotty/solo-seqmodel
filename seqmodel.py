@@ -1,6 +1,6 @@
 """seqmodel: 从零实现的序列建模库（仅 Python 标准库，离线）。
 
-本模块提供确定性的 VanillaRNN 与 LSTMCell：
+本模块提供确定性的 VanillaRNN、LSTMCell 与缩放点积 attention：
 
     h_t = tanh(Wxh @ x_t + Whh @ h_{t-1} + bh)
 
@@ -144,6 +144,171 @@ def clip_gradients(dWxh, dWhh, dbh, max_norm):
     clipped_dWhh = [[float(v) * scale for v in row] for row in dWhh]
     clipped_dbh = [float(v) * scale for v in dbh]
     return clipped_dWxh, clipped_dWhh, clipped_dbh, global_norm
+
+
+def attention(q, k, v, mask=None):
+    """缩放点积注意力，返回 (c, w)，不修改或复用任何输入。
+
+    q、k、v 须分别为非空 Tq×D、Tk×D、Tk×Dv 的 F 列表矩阵，D、Dv>0；
+    mask 须为 None 或 Tq×Tk 的列表矩阵且元素 type 恰为 bool
+    （True 参与、False 屏蔽），None 等价全 True。某行全 False 抛
+    ValueError。
+
+    对每个 (i, j)，s[i][j] 从 0.0 按 d 升序累加 q[i][d]*k[j][d]，
+    再除以 sqrt(D)。每行只在 True 位以 exp(s - max(s)) 计算 softmax，
+    False 位权重为 0.0，分母按 j 升序从 0.0 累加；c[i][a] 从 0.0 按
+    j 升序累加 w[i][j]*v[j][a]。返回 Tq×Dv 的 c 与 Tq×Tk 的 w，元素
+    均为 float，所有行逐层新建。任一容器、形状、元素或 mask 校验失败，
+    或任一乘加、除法、指数、归一化、输出产生非有限值，均抛 ValueError；
+    实参数量错误沿用 Python 自带的 TypeError。相同输入结果确定。
+    """
+    # q：非空 Tq×D 的 F 列表矩阵，D>0，首行长度确定 D。
+    if type(q) is not list or len(q) == 0:
+        raise ValueError("q must be a non-empty list")
+    Tq = len(q)
+    first_row = q[0]
+    if type(first_row) is not list or len(first_row) == 0:
+        raise ValueError("q rows must be non-empty lists")
+    D = len(first_row)
+    for x in first_row:
+        if not _is_f(x):
+            raise ValueError("q entries must be finite numbers, got %r"
+                             % (x,))
+    for row in q[1:]:
+        if type(row) is not list or len(row) != D:
+            raise ValueError("q must be a rectangular list of shape Tq×%d"
+                             % D)
+        for x in row:
+            if not _is_f(x):
+                raise ValueError("q entries must be finite numbers, got %r"
+                                 % (x,))
+
+    # k：非空 Tk×D 的 F 列表矩阵，与 q 共享 D。
+    if type(k) is not list or len(k) == 0:
+        raise ValueError("k must be a non-empty list")
+    Tk = len(k)
+    for row in k:
+        if type(row) is not list or len(row) != D:
+            raise ValueError("k must be a list of shape Tk×%d" % D)
+        for x in row:
+            if not _is_f(x):
+                raise ValueError("k entries must be finite numbers, got %r"
+                                 % (x,))
+
+    # v：Tk×Dv 的 F 列表矩阵，Dv>0，与 k 共享 Tk。
+    if type(v) is not list or len(v) != Tk or Tk == 0:
+        raise ValueError("v must be a list with exactly %d rows" % Tk)
+    first_row = v[0]
+    if type(first_row) is not list or len(first_row) == 0:
+        raise ValueError("v rows must be non-empty lists")
+    Dv = len(first_row)
+    for x in first_row:
+        if not _is_f(x):
+            raise ValueError("v entries must be finite numbers, got %r"
+                             % (x,))
+    for row in v[1:]:
+        if type(row) is not list or len(row) != Dv:
+            raise ValueError("v must be a rectangular list of shape %d×%d"
+                             % (Tk, Dv))
+        for x in row:
+            if not _is_f(x):
+                raise ValueError("v entries must be finite numbers, got %r"
+                                 % (x,))
+
+    # mask：None 或 Tq×Tk 的列表矩阵，元素 type 恰为 bool。
+    if mask is None:
+        active = [[True] * Tk for _ in range(Tq)]
+    else:
+        if type(mask) is not list or len(mask) != Tq:
+            raise ValueError("mask must be a list of shape %d×%d"
+                             % (Tq, Tk))
+        active = []
+        for row in mask:
+            if type(row) is not list or len(row) != Tk:
+                raise ValueError("mask must be a list of shape %d×%d"
+                                 % (Tq, Tk))
+            for m in row:
+                if type(m) is not bool:
+                    raise ValueError("mask entries must be exactly bool, "
+                                     "got %r" % (m,))
+            active.append(list(row))
+        # 全屏蔽行在此提前判定（s 计算前）。
+        for i in range(Tq):
+            if not any(active[i]):
+                raise ValueError("mask row %d is entirely False" % i)
+
+    scale = math.sqrt(float(D))
+
+    w = []
+    c = []
+    for i in range(Tq):
+        qi = q[i]
+
+        # s[i][j] 从 0.0 按 d 升序累加点积，再除 sqrt(D)。
+        s_row = [0.0] * Tk
+        for j in range(Tk):
+            kj = k[j]
+            acc = 0.0
+            for d in range(D):
+                acc += qi[d] * kj[d]
+                if not math.isfinite(acc):
+                    raise ValueError(
+                        "score dot product accumulated to a non-finite value")
+            sval = acc / scale
+            if not math.isfinite(sval):
+                raise ValueError("score became non-finite after scaling")
+            s_row[j] = sval
+
+        # 行最大值只在 True 位取，保证至少一个 True 参与 softmax。
+        m = None
+        for j in range(Tk):
+            if active[i][j]:
+                sj = s_row[j]
+                if m is None or sj > m:
+                    m = sj
+
+        # e = exp(s - m) 仅在 True 位计算；分母按 j 升序从 0.0 累加。
+        e_row = [0.0] * Tk
+        denom = 0.0
+        for j in range(Tk):
+            if active[i][j]:
+                try:
+                    ev = math.exp(s_row[j] - m)
+                except OverflowError:
+                    raise ValueError("softmax exp overflowed")
+                if not math.isfinite(ev):
+                    raise ValueError("softmax exp became non-finite")
+                e_row[j] = ev
+                denom += ev
+                if not math.isfinite(denom):
+                    raise ValueError(
+                        "softmax denominator accumulated to a non-finite value")
+
+        # False 位权重保持 0.0；归一化后须有限。
+        w_row = [0.0] * Tk
+        for j in range(Tk):
+            if active[i][j]:
+                wv = e_row[j] / denom
+                if not math.isfinite(wv):
+                    raise ValueError("attention weight became non-finite")
+                w_row[j] = wv
+        w.append(w_row)
+
+        # c[i][a] 从 0.0 按 j 升序累加 w[i][j]*v[j][a]。
+        c_row = [0.0] * Dv
+        for a in range(Dv):
+            acc = 0.0
+            for j in range(Tk):
+                wv = w_row[j]
+                if wv != 0.0:
+                    acc += wv * v[j][a]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "context accumulated to a non-finite value")
+            c_row[a] = acc
+        c.append(c_row)
+
+    return c, w
 
 
 class VanillaRNN(object):
