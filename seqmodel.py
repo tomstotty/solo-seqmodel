@@ -475,6 +475,74 @@ def attention_backward(q, k, v, dc, mask=None):
     return dq, dk, dv
 
 
+def attention_context_backward(n, memory, du):
+    """注意力上下文原语 u_i = n_i + attention([n], memory, memory)[0][i]
+    的反向传播，返回 (dn, dmemory)，不修改或复用任何输入。
+
+    n 须为非空 H 长 F 列表（H 由其长度确定）；memory 须为非空 T×H 的 F
+    列表矩阵（T>0，每行长度恰为 H）；du 须为 H 长 F 列表。任一容器、形状
+    或元素校验失败抛 ValueError；实参数量错误沿用 Python 自带的 TypeError。
+
+    令
+        (dq, dk, dv) = attention_backward([n], memory, memory, [du], None)
+    按 i 升序计算 dn[i] = float(du[i]) + dq[0][i]；按 t、i 升序计算
+    dmemory[t][i] = dk[t][i] + dv[t][i]。任一结果非有限抛 ValueError。
+    返回 H 长 dn 与 T×H 的 dmemory，均为逐层新建的 float 列表。
+    """
+    # n：非空 H 长 F 列表，H 由首参长度确定。
+    if type(n) is not list or len(n) == 0:
+        raise ValueError("n must be a non-empty list")
+    H = len(n)
+    for v in n:
+        if not _is_f(v):
+            raise ValueError("n entries must be finite numbers, got %r"
+                             % (v,))
+
+    # memory：非空 T×H 的 F 列表矩阵。
+    if type(memory) is not list or len(memory) == 0:
+        raise ValueError("memory must be a non-empty list")
+    T = len(memory)
+    for row in memory:
+        if type(row) is not list or len(row) != H:
+            raise ValueError("memory must be a list of shape %d×%d"
+                             % (T, H))
+        for v in row:
+            if not _is_f(v):
+                raise ValueError(
+                    "memory entries must be finite numbers, got %r" % (v,))
+
+    # du：H 长 F 列表。
+    if type(du) is not list or len(du) != H:
+        raise ValueError("du must be a list of length %d" % H)
+    for v in du:
+        if not _is_f(v):
+            raise ValueError("du entries must be finite numbers, got %r"
+                             % (v,))
+
+    dq, dk, dv = attention_backward([n], memory, memory, [du], None)
+
+    # dn[i] = float(du[i]) + dq[0][i]，i 升序；结果须有限。
+    dq0 = dq[0]
+    dn = [0.0] * H
+    for i in range(H):
+        val = float(du[i]) + dq0[i]
+        if not math.isfinite(val):
+            raise ValueError("dn became non-finite")
+        dn[i] = val
+
+    # dmemory[t][i] = dk[t][i] + dv[t][i]，t、i 升序；结果须有限。
+    dmemory = [[0.0] * H for _ in range(T)]
+    for t in range(T):
+        dkt, dvt, drow = dk[t], dv[t], dmemory[t]
+        for i in range(H):
+            val = dkt[i] + dvt[i]
+            if not math.isfinite(val):
+                raise ValueError("dmemory became non-finite")
+            drow[i] = val
+
+    return dn, dmemory
+
+
 class VanillaRNN(object):
     """单隐藏层 Vanilla RNN，参数 Wxh/Whh/bh 初始化为全 0.0。
 
@@ -1306,6 +1374,49 @@ _NONNEG_INT_RE = re.compile(r"\A(?:0|[1-9][0-9]*)\Z")
 _WINDOW_RE = re.compile(r"\A[1-9][0-9]*\Z")
 
 
+def _dec_sub_le(a, b):
+    """无界十进制正整数减法 str(int(a)-int(b))，调用方保证 a、b 为纯数字
+    串且 a>=b。全程按位运算，不把无界文本转为 int，故不受 Python 整数串
+    转换位数上限影响。
+    """
+    da = [ord(ch) - 48 for ch in a]
+    db = [ord(ch) - 48 for ch in b]
+    out = []
+    borrow = 0
+    ia, ib = len(da) - 1, len(db) - 1
+    while ia >= 0:
+        digit = da[ia] - (db[ib] if ib >= 0 else 0) - borrow
+        if digit < 0:
+            digit += 10
+            borrow = 1
+        else:
+            borrow = 0
+        out.append(digit)
+        ia -= 1
+        ib -= 1
+    while len(out) > 1 and out[-1] == 0:
+        out.pop()
+    return "".join(chr(d + 48) for d in reversed(out))
+
+
+def _window_tail(values, window_text):
+    """返回 values 末尾恰 min(WINDOW, len(values)) 项的浅拷贝。
+
+    window_text 已整串匹配 [1-9][0-9]*，位数任意（含超过 Python 整数串
+    转换位数上限者）；比较仅按位数及同长度字典序进行，绝不把无界文本转为
+    int。需要截断时，截断起点以字符串十进制减法求出；该起点严格小于真实
+    列表长度（物理上不可能达到转换上限），故仅对这一有界结果取 int。
+    """
+    n = len(values)
+    n_text = str(n)
+    w_digits, n_digits = len(window_text), len(n_text)
+    if w_digits > n_digits or (w_digits == n_digits
+                               and window_text >= n_text):
+        return list(values)
+    start = int(_dec_sub_le(n_text, window_text))
+    return list(values[start:])
+
+
 def _sample(model_path, start, seed_text, temperature_text, length_text):
     """从 RNN 语言模型采样 LENGTH 个码点，返回待写出的字符串。
 
@@ -1580,7 +1691,6 @@ def _perplexity_attn(model_path, corpus_path, window_text):
     """
     if not _WINDOW_RE.match(window_text):
         raise ValueError("WINDOW must match [1-9][0-9]*")
-    window = int(window_text)
 
     vocab, Wxh, Whh, bh, Why, by, h0 = _load_perplexity_model(model_path)
     V = len(vocab)
@@ -1610,7 +1720,7 @@ def _perplexity_attn(model_path, corpus_path, window_text):
         y = ids[t + 1]
 
         n = _rnn_n(Wxh, Whh, bh, x, h)
-        M_t = memory[-window:] if len(memory) > window else list(memory)
+        M_t = _window_tail(memory, window_text)
         u = _attn_context(n, M_t)
 
         # logit 仅以 u 替代原隐状态；下标与累加顺序同 _perplexity。
@@ -1659,7 +1769,6 @@ def _sample_attn(model_path, start, seed_text, temperature_text, length_text,
     """
     if not _WINDOW_RE.match(window_text):
         raise ValueError("WINDOW must match [1-9][0-9]*")
-    window = int(window_text)
 
     vocab, Wxh, Whh, bh, Why, by, h0 = _load_perplexity_model(model_path)
     V = len(vocab)
@@ -1692,7 +1801,7 @@ def _sample_attn(model_path, start, seed_text, temperature_text, length_text,
 
     for _t in range(length):
         n = _rnn_n(Wxh, Whh, bh, x, h)
-        M_t = memory[-window:] if len(memory) > window else list(memory)
+        M_t = _window_tail(memory, window_text)
         u = _attn_context(n, M_t)
 
         # logit 仅以 u 替代原隐状态；下标与累加顺序同 _sample_loop。
