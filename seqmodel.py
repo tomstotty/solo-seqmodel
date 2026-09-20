@@ -146,21 +146,12 @@ def clip_gradients(dWxh, dWhh, dbh, max_norm):
     return clipped_dWxh, clipped_dWhh, clipped_dbh, global_norm
 
 
-def attention(q, k, v, mask=None):
-    """缩放点积注意力，返回 (c, w)，不修改或复用任何输入。
+def _attention_check(q, k, v, mask):
+    """attention 与 attention_backward 共用的契约校验。
 
-    q、k、v 须分别为非空 Tq×D、Tk×D、Tk×Dv 的 F 列表矩阵，D、Dv>0；
-    mask 须为 None 或 Tq×Tk 的列表矩阵且元素 type 恰为 bool
-    （True 参与、False 屏蔽），None 等价全 True。某行全 False 抛
-    ValueError。
-
-    对每个 (i, j)，s[i][j] 从 0.0 按 d 升序累加 q[i][d]*k[j][d]，
-    再除以 sqrt(D)。每行只在 True 位以 exp(s - max(s)) 计算 softmax，
-    False 位权重为 0.0，分母按 j 升序从 0.0 累加；c[i][a] 从 0.0 按
-    j 升序累加 w[i][j]*v[j][a]。返回 Tq×Dv 的 c 与 Tq×Tk 的 w，元素
-    均为 float，所有行逐层新建。任一容器、形状、元素或 mask 校验失败，
-    或任一乘加、除法、指数、归一化、输出产生非有限值，均抛 ValueError；
-    实参数量错误沿用 Python 自带的 TypeError。相同输入结果确定。
+    仅做形状、元素与 mask 校验（保持 attention 原有校验与错误信息不变），
+    不复制 q、k、v（调用方仍按原值参与“先乘后加”，以保留大整数精确乘积）。
+    返回 (Tq, Tk, D, Dv, active)；active 为逐行新建的 bool 矩阵。
     """
     # q：非空 Tq×D 的 F 列表矩阵，D>0，首行长度确定 D。
     if type(q) is not list or len(q) == 0:
@@ -237,10 +228,19 @@ def attention(q, k, v, mask=None):
             if not any(active[i]):
                 raise ValueError("mask row %d is entirely False" % i)
 
-    scale = math.sqrt(float(D))
+    return Tq, Tk, D, Dv, active
 
+
+def _attention_weights(q, k, active, Tq, Tk, D):
+    """按前向语义由 q、k 重算 softmax 权重 w，返回 (w, sqrt(D))。
+
+    对每个 (i, j)，s[i][j] 从 0.0 按 d 升序累加 q[i][d]*k[j][d]（按原值
+    先乘后加），再除以 sqrt(D)；每行只在 True 位以 exp(s - max(s)) 计算
+    softmax，False 位为 0.0，分母按 j 升序从 0.0 累加。w 逐层新建、元素
+    均为 float。任一算术溢出或非有限结果抛 ValueError。
+    """
+    scale = math.sqrt(float(D))
     w = []
-    c = []
     for i in range(Tq):
         qi = q[i]
 
@@ -250,7 +250,14 @@ def attention(q, k, v, mask=None):
             kj = k[j]
             acc = 0.0
             for d in range(D):
-                acc += qi[d] * kj[d]
+                # 先按原值相乘（int*int 保持精确整数乘积）再加到浮点累加器；
+                # 合法 F 大整数在此转换溢出时改抛 ValueError，而非泄漏
+                # OverflowError。
+                try:
+                    acc += qi[d] * kj[d]
+                except OverflowError:
+                    raise ValueError(
+                        "score dot product accumulated to a non-finite value")
                 if not math.isfinite(acc):
                     raise ValueError(
                         "score dot product accumulated to a non-finite value")
@@ -294,6 +301,32 @@ def attention(q, k, v, mask=None):
                 w_row[j] = wv
         w.append(w_row)
 
+    return w, scale
+
+
+def attention(q, k, v, mask=None):
+    """缩放点积注意力，返回 (c, w)，不修改或复用任何输入。
+
+    q、k、v 须分别为非空 Tq×D、Tk×D、Tk×Dv 的 F 列表矩阵，D、Dv>0；
+    mask 须为 None 或 Tq×Tk 的列表矩阵且元素 type 恰为 bool
+    （True 参与、False 屏蔽），None 等价全 True。某行全 False 抛
+    ValueError。
+
+    对每个 (i, j)，s[i][j] 从 0.0 按 d 升序累加 q[i][d]*k[j][d]，
+    再除以 sqrt(D)。每行只在 True 位以 exp(s - max(s)) 计算 softmax，
+    False 位权重为 0.0，分母按 j 升序从 0.0 累加；c[i][a] 从 0.0 按
+    j 升序累加 w[i][j]*v[j][a]。返回 Tq×Dv 的 c 与 Tq×Tk 的 w，元素
+    均为 float，所有行逐层新建。任一容器、形状、元素或 mask 校验失败，
+    或任一乘加、除法、指数、归一化、输出产生非有限值，均抛 ValueError；
+    实参数量错误沿用 Python 自带的 TypeError。相同输入结果确定。
+    """
+    Tq, Tk, D, Dv, active = _attention_check(q, k, v, mask)
+    w, _scale = _attention_weights(q, k, active, Tq, Tk, D)
+
+    c = []
+    for i in range(Tq):
+        w_row = w[i]
+
         # c[i][a] 从 0.0 按 j 升序累加 w[i][j]*v[j][a]。
         c_row = [0.0] * Dv
         for a in range(Dv):
@@ -301,7 +334,12 @@ def attention(q, k, v, mask=None):
             for j in range(Tk):
                 wv = w_row[j]
                 if wv != 0.0:
-                    acc += wv * v[j][a]
+                    # 同样按原值先乘后加；大整数转换溢出改抛 ValueError。
+                    try:
+                        acc += wv * v[j][a]
+                    except OverflowError:
+                        raise ValueError(
+                            "context accumulated to a non-finite value")
                     if not math.isfinite(acc):
                         raise ValueError(
                             "context accumulated to a non-finite value")
@@ -309,6 +347,129 @@ def attention(q, k, v, mask=None):
         c.append(c_row)
 
     return c, w
+
+
+def attention_backward(q, k, v, dc, mask=None):
+    """缩放点积注意力的反向传播，返回 (dq, dk, dv)，不修改或复用任何输入。
+
+    q、k、v、mask 完全沿用 attention 的契约；dc 须为 Tq×Dv 的 F 列表
+    矩阵（Tq、Dv 由 q、v 确定），否则抛 ValueError。实参数量错误沿用
+    Python 自带的 TypeError。
+
+    按同一前向语义重算 w（False 位为 0.0），随后：
+        dw[i][j] = Σ_a dc[i][a]*v[j][a]（mask False 位取 0.0）
+        r[i]     = Σ_j w[i][j]*dw[i][j]
+        ds[i][j] = w[i][j]*(dw[i][j] - r[i])/sqrt(D)（False 位取 0.0）
+        dq[i][d] = Σ_j ds[i][j]*k[j][d]
+        dk[j][d] = Σ_i ds[i][j]*q[i][d]
+        dv[j][a] = Σ_i w[i][j]*dc[i][a]
+    每个求和均自 0.0 起按其下标升序累加。返回形状依次为 Tq×D、Tk×D、
+    Tk×Dv，元素均为 float，所有列表逐层新建。任一中间量或输出溢出、非
+    有限均抛 ValueError；相同输入结果确定。
+    """
+    Tq, Tk, D, Dv, active = _attention_check(q, k, v, mask)
+
+    # dc：Tq×Dv 的 F 列表矩阵（逐行浅拷贝，读取用，不修改原输入）。
+    dcc = _check_matrix(dc, Tq, Dv, "dc")
+
+    # 按同一前向语义重算 w，并取得 sqrt(D)。
+    w, scale = _attention_weights(q, k, active, Tq, Tk, D)
+
+    # dw、r、ds 逐行计算；False 位 dw、ds 保持 0.0。
+    dw = [[0.0] * Tk for _ in range(Tq)]
+    ds = [[0.0] * Tk for _ in range(Tq)]
+    r = [0.0] * Tq
+    for i in range(Tq):
+        dci = dcc[i]
+        wi = w[i]
+        dwi = dw[i]
+        dsi = ds[i]
+
+        # dw[i][j] = Σ_a dc[i][a]*v[j][a]，a 升序，仅 True 位。
+        for j in range(Tk):
+            if active[i][j]:
+                vj = v[j]
+                acc = 0.0
+                for a in range(Dv):
+                    try:
+                        acc += dci[a] * vj[a]
+                    except OverflowError:
+                        raise ValueError(
+                            "dw accumulated to a non-finite value")
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "dw accumulated to a non-finite value")
+                dwi[j] = acc
+
+        # r[i] = Σ_j w[i][j]*dw[i][j]，j 升序（False 位 w 为 0.0）。
+        racc = 0.0
+        for j in range(Tk):
+            try:
+                racc += wi[j] * dwi[j]
+            except OverflowError:
+                raise ValueError("r accumulated to a non-finite value")
+            if not math.isfinite(racc):
+                raise ValueError("r accumulated to a non-finite value")
+        r[i] = racc
+
+        # ds[i][j] = w[i][j]*(dw[i][j] - r[i])/sqrt(D)，仅 True 位。
+        for j in range(Tk):
+            if active[i][j]:
+                try:
+                    val = wi[j] * (dwi[j] - racc) / scale
+                except OverflowError:
+                    raise ValueError("ds became non-finite")
+                if not math.isfinite(val):
+                    raise ValueError("ds became non-finite")
+                dsi[j] = val
+
+    # dq[i][d] = Σ_j ds[i][j]*k[j][d]，每个 (i,d) 独立按 j 升序累加。
+    dq = [[0.0] * D for _ in range(Tq)]
+    for i in range(Tq):
+        dsi = ds[i]
+        dqi = dq[i]
+        for d in range(D):
+            acc = 0.0
+            for j in range(Tk):
+                try:
+                    acc += dsi[j] * k[j][d]
+                except OverflowError:
+                    raise ValueError("dq accumulated to a non-finite value")
+                if not math.isfinite(acc):
+                    raise ValueError("dq accumulated to a non-finite value")
+            dqi[d] = acc
+
+    # dk[j][d] = Σ_i ds[i][j]*q[i][d]，每个 (j,d) 独立按 i 升序累加。
+    dk = [[0.0] * D for _ in range(Tk)]
+    for j in range(Tk):
+        dkj = dk[j]
+        for d in range(D):
+            acc = 0.0
+            for i in range(Tq):
+                try:
+                    acc += ds[i][j] * q[i][d]
+                except OverflowError:
+                    raise ValueError("dk accumulated to a non-finite value")
+                if not math.isfinite(acc):
+                    raise ValueError("dk accumulated to a non-finite value")
+            dkj[d] = acc
+
+    # dv[j][a] = Σ_i w[i][j]*dc[i][a]，每个 (j,a) 独立按 i 升序累加。
+    dv = [[0.0] * Dv for _ in range(Tk)]
+    for j in range(Tk):
+        dvj = dv[j]
+        for a in range(Dv):
+            acc = 0.0
+            for i in range(Tq):
+                try:
+                    acc += w[i][j] * dcc[i][a]
+                except OverflowError:
+                    raise ValueError("dv accumulated to a non-finite value")
+                if not math.isfinite(acc):
+                    raise ValueError("dv accumulated to a non-finite value")
+            dvj[a] = acc
+
+    return dq, dk, dv
 
 
 class VanillaRNN(object):
