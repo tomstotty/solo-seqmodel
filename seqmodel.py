@@ -4,12 +4,15 @@
 
     h_t = tanh(Wxh @ x_t + Whh @ h_{t-1} + bh)
 
+以及标准 LSTM 单元 LSTMCell（i、f、o、g 四门，稳定 sigmoid）。
+
 数值约定：标量类型 F 指 type(x) 为 int 或 float、非 bool 且 math.isfinite。
 任何非 F 元素或形状错误都抛出 ValueError；参数个数错误沿用 Python 自带的
 TypeError。
 """
 
 import math
+import random
 
 
 def _is_f(value):
@@ -249,3 +252,128 @@ class VanillaRNN(object):
 
         dh0 = dh_next
         return dxs, dWxh, dWhh, dbh, dh0
+
+
+class LSTMCell(object):
+    """单步标准 LSTM 单元。
+
+    W 形状 4H×(I+H)，b 形状 4H；按连续 H 段依次为输入门 i、遗忘门 f、
+    输出门 o、候选值 g：
+
+        z = [x; h_prev]
+        a = W @ z + b
+        i, f, o = sigmoid(a 的前三段)，g = tanh(a 的第四段)
+        c = f * c_prev + i * g
+        h = o * tanh(c)
+
+    权重按 random.Random(seed) 以均匀分布 U(-q, q) 初始化，
+    q = 1/sqrt(I+H)，偏置全 0.0；同种子初始化结果确定且相同。
+    """
+
+    def __init__(self, I, H, seed=0):
+        if type(I) is not int or I <= 0:
+            raise ValueError("I must be a positive integer")
+        if type(H) is not int or H <= 0:
+            raise ValueError("H must be a positive integer")
+        if type(seed) is not int:
+            raise ValueError("seed must be an integer")
+        self.I = I
+        self.H = H
+
+        r = random.Random(seed)
+        q = 1.0 / math.sqrt(I + H)
+        cols = I + H
+        W = []
+        for _ in range(4 * H):
+            row = []
+            for _ in range(cols):
+                row.append(float((2 * r.random() - 1) * q))
+            W.append(row)
+        self.W = W
+        self.b = [0.0] * (4 * H)
+
+    def forward(self, x, h_prev, c_prev):
+        """单步前向，返回 (h, c, cache)。
+
+        x、h_prev、c_prev 须分别为长度 I、H、H 的 F 列表；self.W、self.b
+        仍须分别满足 4H×(I+H)、4H 的 F 形状，否则 ValueError。任何中间量
+        非有限也抛 ValueError。cache 为 dict，键依次为
+        x、h_prev、c_prev、z、i、f、o、g、c、h、W；各向量均为全新 float
+        列表，W 为二维 float 深拷贝，不修改或复用任何输入及属性。
+        """
+        I, H = self.I, self.H
+        cols = I + H
+
+        x = [float(v) for v in _check_vector(x, I, "x")]
+        h_prev = [float(v) for v in _check_vector(h_prev, H, "h_prev")]
+        c_prev = [float(v) for v in _check_vector(c_prev, H, "c_prev")]
+        W = [[float(v) for v in row]
+             for row in _check_matrix(self.W, 4 * H, cols, "W")]
+        b = [float(v) for v in _check_vector(self.b, 4 * H, "b")]
+
+        z = x + h_prev
+
+        # a[k] = b[k] + Σ_j W[k][j] * z[j]，按列序累加。
+        a = [0.0] * (4 * H)
+        for k in range(4 * H):
+            acc = b[k]
+            Wk = W[k]
+            for j in range(cols):
+                acc += Wk[j] * z[j]
+            if not math.isfinite(acc):
+                raise ValueError("non-finite intermediate at pre-activation %d"
+                                 % k)
+            a[k] = acc
+
+        def _sigmoid(v):
+            # 稳定 sigmoid：v>=0 与 v<0 两个分支都只对非正数取 exp。
+            if v >= 0:
+                return 1.0 / (1.0 + math.exp(-v))
+            ev = math.exp(v)
+            return ev / (1.0 + ev)
+
+        i = [0.0] * H
+        f = [0.0] * H
+        o = [0.0] * H
+        g = [0.0] * H
+        for k in range(H):
+            iv = _sigmoid(a[k])
+            fv = _sigmoid(a[H + k])
+            ov = _sigmoid(a[2 * H + k])
+            gv = math.tanh(a[3 * H + k])
+            if not (math.isfinite(iv) and math.isfinite(fv)
+                    and math.isfinite(ov) and math.isfinite(gv)):
+                raise ValueError("non-finite gate value at index %d" % k)
+            i[k] = iv
+            f[k] = fv
+            o[k] = ov
+            g[k] = gv
+
+        c = [0.0] * H
+        for k in range(H):
+            cv = f[k] * c_prev[k] + i[k] * g[k]
+            if not math.isfinite(cv):
+                raise ValueError("non-finite cell state at index %d" % k)
+            c[k] = cv
+
+        h = [0.0] * H
+        for k in range(H):
+            hv = o[k] * math.tanh(c[k])
+            if not math.isfinite(hv):
+                raise ValueError("non-finite hidden state at index %d" % k)
+            h[k] = hv
+
+        cache = {
+            "x": list(x),
+            "h_prev": list(h_prev),
+            "c_prev": list(c_prev),
+            "z": list(z),
+            "i": list(i),
+            "f": list(f),
+            "o": list(o),
+            "g": list(g),
+            "c": list(c),
+            "h": list(h),
+            "W": [[v for v in row] for row in W],
+        }
+        return h, c, cache
