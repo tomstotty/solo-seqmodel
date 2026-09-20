@@ -1425,8 +1425,145 @@ def _sample(model_path, start, seed_text, temperature_text, length_text):
     return "".join(out) + "\n"
 
 
+def _sample_anneal(model_path, start, seed_text, start_t_text, end_t_text,
+                   length_text):
+    """从 START_T 到 END_T 线性退火采样 LENGTH 个码点，返回待写出的字符串。
+
+    MODEL、START、SEED、LENGTH 的词法与取值校验与 _sample 完全一致；
+    START_T、END_T 各经 float() 解析，结果须有限且严格大于 0，否则抛
+    ValueError。
+
+    整次调用仅初始化一次 r=random.Random(int(SEED))，置 h=h0、x=START
+    索引。LENGTH 为 0 时不计算任何温度；为 1 时唯一一步温度即 START_T；
+    否则 t 自 0 升序，第 t 步（0≤t<LENGTH）温度严格按 Python 表达式
+        START_T+(END_T-START_T)*t/(LENGTH-1)
+    求值（首步恰为 START_T、末步恰为 END_T），温度非有限即抛 ValueError。
+    每步以该温度替换 _sample 的固定温度，隐状态、logit、稳定 softmax 与
+    按词表升序累计抽样的公式、下标及运算顺序与 _sample 完全一致；生成
+    码点后继续更新同一 h=n、x=k。任一中间量非有限均抛 ValueError。成功
+    返回 LENGTH 个码点再加一个 LF。
+    """
+    vocab, Wxh, Whh, bh, Why, by, h0 = _load_perplexity_model(model_path)
+    V = len(vocab)
+    H = len(bh)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # START_T/END_T：float() 可解析且有限、严格大于 0；inf/nan/0/负数失败。
+    start_t = float(start_t_text)
+    if not math.isfinite(start_t) or start_t <= 0.0:
+        raise ValueError("START_T must be a finite positive float")
+    end_t = float(end_t_text)
+    if not math.isfinite(end_t) or end_t <= 0.0:
+        raise ValueError("END_T must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    # 整次命令仅初始化一次随机源。
+    rng = random.Random(seed)
+    h = h0
+    x = vocab.index(start)
+    out = []
+
+    for t in range(length):
+        # 每步温度：LENGTH 为 1 时仅用 START_T；否则严格按
+        # START_T+(END_T-START_T)*t/(LENGTH-1) 求值。
+        if length == 1:
+            temperature = start_t
+        else:
+            temperature = start_t + (end_t - start_t) * t / (length - 1)
+        if not math.isfinite(temperature):
+            raise ValueError("annealing temperature became non-finite")
+
+        # n_i = tanh(bh_i + Wxh_i,x + Σ_j Whh_i,j*h_j)，与 _sample
+        # 相同的起点、下标与累加顺序。
+        n = [0.0] * H
+        for i in range(H):
+            acc = float(bh[i])
+            acc += Wxh[i][x]
+            if not math.isfinite(acc):
+                raise ValueError("hidden affine accumulated non-finitely")
+            wh_row = Whh[i]
+            for j in range(H):
+                acc += wh_row[j] * h[j]
+                if not math.isfinite(acc):
+                    raise ValueError("hidden affine accumulated non-finitely")
+            ni = math.tanh(acc)
+            if not math.isfinite(ni):
+                raise ValueError("tanh produced a non-finite value")
+            n[i] = ni
+
+        # z_k = by_k + Σ_j Why_k,j*n_j，依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(H):
+                acc += why_row[j] * n[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # u=r.random()*d；自 0.0 依 k 升序累加 e_k，选首个累计值严格大于
+        # u 者；无则取词表末项。
+        u = rng.random() * d
+        if not math.isfinite(u):
+            raise ValueError("sample threshold became non-finite")
+        chosen = V - 1
+        cum = 0.0
+        for k in range(V):
+            cum += e[k]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > u:
+                chosen = k
+                break
+
+        out.append(vocab[chosen])
+        h = n
+        x = chosen
+
+    return "".join(out) + "\n"
+
+
 def main(argv):
-    """命令行入口：perplexity、train 与 sample 三个子命令。
+    """命令行入口：perplexity、train、sample 与 sample-anneal 四个子命令。
 
     python seqmodel.py perplexity MODEL CORPUS：成功时 stdout 恰为
     format(exp(L/T), '.17g') + '\\n' 并返回 0。
@@ -1437,6 +1574,10 @@ def main(argv):
     python seqmodel.py sample MODEL START SEED TEMPERATURE LENGTH：成功时
     stdout 恰为 LENGTH 个采样码点的 UTF-8 编码再加一个 LF（LENGTH 为 0 时
     仅 LF），不写任何文件，返回 0。
+
+    python seqmodel.py sample-anneal MODEL START SEED START_T END_T LENGTH：
+    温度自 START_T 至 END_T 随步线性退火，其余公式、校验与输出约定同
+    sample，不写任何文件，成功返回 0。
 
     参数数量、词法、文件读取、UTF-8/JSON 解析、模型/语料校验或非有限计算等
     任何失败均返回 2，stdout 为空，且 stderr 恰为 "error\\n"，不输出回溯。
@@ -1450,11 +1591,17 @@ def main(argv):
         elif len(argv) == 7 and argv[1] == "sample":
             output = _sample(argv[2], argv[3], argv[4], argv[5], argv[6])
             sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 8 and argv[1] == "sample-anneal":
+            output = _sample_anneal(argv[2], argv[3], argv[4], argv[5],
+                                    argv[6], argv[7])
+            sys.stdout.buffer.write(output.encode("utf-8"))
         else:
             raise ValueError(
                 "usage: seqmodel.py perplexity MODEL CORPUS | "
                 "seqmodel.py train MODEL CORPUS OUT | "
-                "seqmodel.py sample MODEL START SEED TEMPERATURE LENGTH")
+                "seqmodel.py sample MODEL START SEED TEMPERATURE LENGTH | "
+                "seqmodel.py sample-anneal MODEL START SEED START_T END_T "
+                "LENGTH")
     except Exception:
         sys.stderr.buffer.write(b"error\n")
         return 2
