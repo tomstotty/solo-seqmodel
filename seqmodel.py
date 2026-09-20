@@ -1,6 +1,6 @@
 """seqmodel: 从零实现的序列建模库（仅 Python 标准库，离线）。
 
-本模块提供确定性的 VanillaRNN 与 LSTMCell：
+本模块提供确定性的 VanillaRNN、LSTMCell 与缩放点积注意力 attention：
 
     h_t = tanh(Wxh @ x_t + Whh @ h_{t-1} + bh)
 
@@ -144,6 +144,136 @@ def clip_gradients(dWxh, dWhh, dbh, max_norm):
     clipped_dWhh = [[float(v) * scale for v in row] for row in dWhh]
     clipped_dbh = [float(v) * scale for v in dbh]
     return clipped_dWxh, clipped_dWhh, clipped_dbh, global_norm
+
+
+def _check_rect_matrix(values, name):
+    """校验 values 为非空矩形 F 列表的列表，返回 (逐行浅拷贝, 行数, 列数)。"""
+    if type(values) is not list or len(values) == 0:
+        raise ValueError("%s must be a non-empty list of rows" % name)
+    first = values[0]
+    if type(first) is not list or len(first) == 0:
+        raise ValueError("%s rows must be non-empty lists" % name)
+    cols = len(first)
+    checked = []
+    for row in values:
+        if type(row) is not list or len(row) != cols:
+            raise ValueError("%s must be a rectangular list with %d columns"
+                             % (name, cols))
+        for v in row:
+            if not _is_f(v):
+                raise ValueError("%s entries must be finite numbers, got %r"
+                                 % (name, v))
+        checked.append(list(row))
+    return checked, len(checked), cols
+
+
+def attention(q, k, v, mask=None):
+    """缩放点积注意力，返回 (c, w)，不修改或复用任何输入。
+
+    q、k、v 须分别为非空的 Tq×D、Tk×D、Tk×Dv 的 F 列表矩阵（D、Dv>0，
+    共享维度须一致）；mask 为 None（等价全 True）或 Tq×Tk 的列表矩阵，
+    其元素 type 恰为 bool，True 参与、False 屏蔽，某行全 False 抛
+    ValueError。容器非 list、空矩阵、非矩形、共享维度不符、元素非 F、
+    mask 类型/形状不符，或任一乘加、除法、指数、归一化、输出产生非
+    有限值，均抛 ValueError；参数个数错误沿用 Python 自带的 TypeError。
+
+    对每个 (i, j)，从 0.0 按 d 升序累加 q[i][d]*k[j][d] 再除以 sqrt(D)
+    得 s；每行只在 True 位以 exp(s-max(s)) 计算 softmax，False 位 w 为
+    0.0，分母按 j 升序从 0.0 累加；c[i][a] 从 0.0 按 j 升序累加
+    w[i][j]*v[j][a]。返回 (Tq×Dv 的 c, Tq×Tk 的 w)，元素均为 float，
+    所有行逐层新建；相同输入结果确定。
+    """
+    q, tq, d = _check_rect_matrix(q, "q")
+    k, tk, dk = _check_rect_matrix(k, "k")
+    if dk != d:
+        raise ValueError("q and k must share the same depth, got %d and %d"
+                         % (d, dk))
+    v, tv, dv = _check_rect_matrix(v, "v")
+    if tv != tk:
+        raise ValueError("k and v must share the same length, got %d and %d"
+                         % (tk, tv))
+
+    if mask is None:
+        mask = [[True] * tk for _ in range(tq)]
+    else:
+        if type(mask) is not list or len(mask) != tq:
+            raise ValueError("mask must be None or a list of shape %d×%d"
+                             % (tq, tk))
+        checked_mask = []
+        for row in mask:
+            if type(row) is not list or len(row) != tk:
+                raise ValueError("mask must be None or a list of shape %d×%d"
+                                 % (tq, tk))
+            for m in row:
+                if type(m) is not bool:
+                    raise ValueError("mask entries must be bool, got %r"
+                                     % (m,))
+            checked_mask.append(list(row))
+        mask = checked_mask
+    for row in mask:
+        if not any(row):
+            raise ValueError("mask row must not be all False")
+
+    scale = math.sqrt(d)
+    c = []
+    w = []
+    for i in range(tq):
+        q_row = q[i]
+        mask_row = mask[i]
+
+        # s[i][j]：从 0.0 按 d 升序累加 q[i][d]*k[j][d]，再除以 sqrt(D)。
+        s_row = [0.0] * tk
+        for j in range(tk):
+            k_row = k[j]
+            acc = 0.0
+            for dd in range(d):
+                acc += float(q_row[dd]) * float(k_row[dd])
+                if not math.isfinite(acc):
+                    raise ValueError(
+                        "score accumulated to a non-finite value")
+            s = acc / scale
+            if not math.isfinite(s):
+                raise ValueError("score became non-finite after scaling")
+            s_row[j] = s
+
+        # 只在 True 位求 max 与 exp(s-max)，分母按 j 升序从 0.0 累加。
+        row_max = None
+        for j in range(tk):
+            if mask_row[j] and (row_max is None or s_row[j] > row_max):
+                row_max = s_row[j]
+        w_row = [0.0] * tk
+        denom = 0.0
+        for j in range(tk):
+            if mask_row[j]:
+                e = math.exp(s_row[j] - row_max)
+                if not math.isfinite(e):
+                    raise ValueError("softmax exp produced a non-finite value")
+                w_row[j] = e
+                denom += e
+                if not math.isfinite(denom):
+                    raise ValueError(
+                        "softmax denominator became non-finite")
+        for j in range(tk):
+            if mask_row[j]:
+                wv = w_row[j] / denom
+                if not math.isfinite(wv):
+                    raise ValueError("softmax weight became non-finite")
+                w_row[j] = wv
+        w.append(w_row)
+
+        # c[i][a]：从 0.0 按 j 升序累加 w[i][j]*v[j][a]。
+        c_row = [0.0] * dv
+        for a in range(dv):
+            acc = 0.0
+            for j in range(tk):
+                acc += w_row[j] * float(v[j][a])
+                if not math.isfinite(acc):
+                    raise ValueError(
+                        "output accumulated to a non-finite value")
+            c_row[a] = acc
+        c.append(c_row)
+
+    return c, w
 
 
 class VanillaRNN(object):
