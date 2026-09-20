@@ -1841,6 +1841,220 @@ def _sample_attn(model_path, start, seed_text, temperature_text, length_text,
     return "".join(out) + "\n"
 
 
+def _train_attn(model_path, corpus_path, out_path, window_text):
+    """对带注意力上下文的模型做一次全语料 SGD 更新并把新模型写入 OUT。
+
+    MODEL、CORPUS、OUT 完全沿用 train 的读取、形状、F、UTF-8、词表、语料
+    与写出契约；WINDOW 整串匹配 [1-9][0-9]*（任意位数均合法，不转 int），
+    否则抛 ValueError。
+
+    前向严格复用 perplexity-attn 的 N-1 步：t 升序依次以 _rnn_n 求 n_t，
+    M_t 取记忆 [h0, n_0, ..., n_{t-1}] 末尾至多 WINDOW 项（从旧到新），
+    以 attention 上下文加残差得 u_t，logit 仅以 u_t 替代原隐状态，稳定
+    softmax 的下标与累加顺序不变。令 g_t = p_t - onehot(y_t)，按 t 升序
+    累加 dWhy += g_t⊗u_t、dby += g_t，并按 k 升序自 0.0 求
+    du_t = Whyᵀg_t。随后置零 dhs，按 t 降序调用
+    attention_context_backward(n_t, M_t, du_t)：按 i 升序把 dn 加至
+    dhs[t]，再按 M_t 从旧到新、i 升序把 dmemory 各行映射到 h0 或对应的
+    先前 n 并累加（h0 的梯度丢弃），任一累加非有限即抛 ValueError。最后
+    以同一 RNN 前向缓存调用 VanillaRNN.backward(dhs)，按 train 既定的
+    dWxh、dWhh、dbh、dWhy、dby 组序求全局范数、超过 5.0 统一缩放，五组
+    参数减去 0.1 倍梯度，h0 不变。任一中间量或结果非有限均抛 ValueError。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    vocab, Wxh, Whh, bh, Why, by, h0 = _load_perplexity_model(model_path)
+    V = len(vocab)
+    H = len(bh)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    T = len(ids) - 1
+
+    # 当前字符的 one-hot 输入序列（即 RNN 前向缓存的 xs）。
+    xs = []
+    for t in range(T):
+        row = [0.0] * V
+        row[ids[t]] = 1.0
+        xs.append(row)
+
+    dWhy = [[0.0] * H for _ in range(V)]
+    dby = [0.0] * V
+
+    # 前向严格复用 perplexity-attn：t 升序逐步求 n_t、M_t、u_t 与 logit；
+    # h0 保留模型原值，使首步 Whh*h 与 perplexity-attn 同为“原值先乘后加”。
+    ns = []
+    ms = []
+    dus = []
+    memory = [h0]
+    h = h0
+    for t in range(T):
+        y = ids[t + 1]
+
+        n = _rnn_n(Wxh, Whh, bh, ids[t], h)
+        M_t = _window_tail(memory, window_text)
+        u = _attn_context(n, M_t)
+
+        # logit 仅以 u 替代原隐状态；下标与累加顺序同 perplexity-attn。
+        z = _output_logits(Why, by, u)
+
+        # softmax：m=max(z)，d 从 0.0 依 k 升序累加 exp(z_k-m)。
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            ev = math.exp(z[k] - m)
+            if not math.isfinite(ev):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ev
+            d += ev
+            if not math.isfinite(d):
+                raise ValueError("softmax denominator accumulated non-finitely")
+
+        # g = p - onehot(y)。
+        g = [0.0] * V
+        for k in range(V):
+            gk = e[k] / d
+            if k == y:
+                gk -= 1.0
+            if not math.isfinite(gk):
+                raise ValueError("output gradient became non-finite")
+            g[k] = gk
+
+        # 按 t 升序累加 dWhy += g⊗u、dby += g。
+        for k in range(V):
+            gk = g[k]
+            dby[k] += gk
+            if not math.isfinite(dby[k]):
+                raise ValueError("dby accumulated to a non-finite value")
+            dw_row = dWhy[k]
+            for j in range(H):
+                dw_row[j] += gk * u[j]
+                if not math.isfinite(dw_row[j]):
+                    raise ValueError("dWhy accumulated to a non-finite value")
+
+        # du = Whyᵀg：每个 j 独立以 0.0 起按 k 升序累加。
+        du = [0.0] * H
+        for j in range(H):
+            acc = 0.0
+            for k in range(V):
+                acc += Why[k][j] * g[k]
+                if not math.isfinite(acc):
+                    raise ValueError("du accumulated to a non-finite value")
+            du[j] = acc
+
+        ns.append(n)
+        ms.append(M_t)
+        dus.append(du)
+        h = n
+        memory.append([float(v) for v in n])
+
+    # 置零 dhs，按 t 降序做注意力上下文反向。
+    dhs = [[0.0] * H for _ in range(T)]
+    for t in range(T - 1, -1, -1):
+        dn, dmemory = attention_context_backward(ns[t], ms[t], dus[t])
+
+        # 按 i 升序把 dn 加至 dhs[t]。
+        dh_row = dhs[t]
+        for i in range(H):
+            dh_row[i] += dn[i]
+            if not math.isfinite(dh_row[i]):
+                raise ValueError("dhs accumulated to a non-finite value")
+
+        # 再按 M_t 从旧到新、i 升序把 dmemory 映射到 h0 或对应先前 n 并
+        # 累加；h0 的梯度丢弃。步 t 的记忆为 [h0, n_0, ..., n_{t-1}]，
+        # 全局下标 g 对应 h0（g==0）或 n_{g-1}。
+        start = (t + 1) - len(ms[t])
+        for r in range(len(ms[t])):
+            g_idx = start + r
+            if g_idx == 0:
+                continue
+            dh_row = dhs[g_idx - 1]
+            dm_row = dmemory[r]
+            for i in range(H):
+                dh_row[i] += dm_row[i]
+                if not math.isfinite(dh_row[i]):
+                    raise ValueError("dhs accumulated to a non-finite value")
+
+    # 以同一 RNN 前向缓存（xs、h0 与前向算得的 n_t）调用 backward。
+    rnn = VanillaRNN(V, H)
+    rnn.Wxh = [list(row) for row in Wxh]
+    rnn.Whh = [list(row) for row in Whh]
+    rnn.bh = list(bh)
+    rnn._cache = {"xs": xs, "h0": list(h0),
+                  "hs": [list(row) for row in ns]}
+    _dxs, dWxh, dWhh, dbh, _dh0 = rnn.backward(dhs)
+
+    # 依 dWxh、dWhh、dbh、dWhy、dby 行序累加平方和求全局范数。
+    sum_sq = 0.0
+    for group in (dWxh, dWhh, dbh, dWhy, dby):
+        if type(group[0]) is list:
+            for row in group:
+                for v in row:
+                    if not math.isfinite(v):
+                        raise ValueError("gradient is non-finite")
+                    sum_sq += v * v
+                    if not math.isfinite(sum_sq):
+                        raise ValueError(
+                            "global norm accumulated to a non-finite value")
+        else:
+            for v in group:
+                if not math.isfinite(v):
+                    raise ValueError("gradient is non-finite")
+                sum_sq += v * v
+                if not math.isfinite(sum_sq):
+                    raise ValueError(
+                        "global norm accumulated to a non-finite value")
+
+    global_norm = math.sqrt(sum_sq)
+    scale = 5.0 / global_norm if global_norm > 5.0 else 1.0
+
+    # 五组参数减 0.1 倍（裁剪后的）梯度；h0 不变。结果非有限即失败。
+    def _updated(old, grad):
+        value = float(old) - 0.1 * (grad * scale)
+        if not math.isfinite(value):
+            raise ValueError("updated parameter became non-finite")
+        return value
+
+    new_Wxh = [[_updated(Wxh[i][j], dWxh[i][j]) for j in range(V)]
+               for i in range(H)]
+    new_Whh = [[_updated(Whh[i][j], dWhh[i][j]) for j in range(H)]
+               for i in range(H)]
+    new_bh = [_updated(bh[i], dbh[i]) for i in range(H)]
+    new_Why = [[_updated(Why[k][j], dWhy[k][j]) for j in range(H)]
+               for k in range(V)]
+    new_by = [_updated(by[k], dby[k]) for k in range(V)]
+
+    obj = {
+        "version": 1,
+        "vocab": vocab,
+        "Wxh": new_Wxh,
+        "Whh": new_Whh,
+        "bh": new_bh,
+        "Why": new_Why,
+        "by": new_by,
+        "h0": [float(v) for v in h0],
+    }
+    text = json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+    with open(out_path, "wb") as f:
+        f.write(text.encode("utf-8"))
+
+
 def main(argv):
     """命令行入口：perplexity、train 与 sample 三个子命令。
 
@@ -1869,6 +2083,12 @@ def main(argv):
     与 sample 相同，整次仅初始化一次随机源、不写文件。WINDOW 整串匹配
     [1-9][0-9]*。
 
+    python seqmodel.py train-attn MODEL CORPUS OUT WINDOW：前向严格复用
+    perplexity-attn 的 n_t、M_t、u_t 与 logit 顺序，反向经
+    attention_context_backward 把上下文梯度映射回各步隐状态（h0 梯度
+    丢弃），再以同一 RNN 前向缓存调用 VanillaRNN.backward；裁剪、0.1
+    学习率更新五组参数（h0 不变）与 OUT 写出契约均与 train 相同。
+
     参数数量、词法、文件读取、UTF-8/JSON 解析、模型/语料校验或非有限计算等
     任何失败均返回 2，stdout 为空，且 stderr 恰为 "error\\n"，不输出回溯。
     """
@@ -1892,6 +2112,8 @@ def main(argv):
             output = _sample_attn(argv[2], argv[3], argv[4], argv[5],
                                   argv[6], argv[7])
             sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 6 and argv[1] == "train-attn":
+            _train_attn(argv[2], argv[3], argv[4], argv[5])
         else:
             raise ValueError(
                 "usage: seqmodel.py perplexity MODEL CORPUS | "
