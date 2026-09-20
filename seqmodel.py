@@ -10,8 +10,10 @@
 TypeError。
 """
 
+import json
 import math
 import random
+import sys
 
 
 def _is_f(value):
@@ -907,3 +909,205 @@ class LSTMCell(object):
         dh0 = [float(v) for v in ph]
         dc0 = [float(v) for v in pc]
         return dxs, dh0, dc0, dW, db
+
+
+def _fail():
+    """统一的命令行失败出口：stderr 恰为 error\\n，退出码 2。"""
+    sys.stderr.write("error\n")
+    raise SystemExit(2)
+
+
+def _is_model_f(value):
+    """模型参数的 F 判定（同本模块约定）：type 为 int/float（不含 bool）、
+    float(value) 成功且 math.isfinite 为真。"""
+    if type(value) is not int and type(value) is not float:
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
+def _require_f_vector(values, size):
+    if type(values) is not list or len(values) != size:
+        raise ValueError("bad vector shape")
+    for v in values:
+        if not _is_model_f(v):
+            raise ValueError("bad vector entry")
+
+
+def _require_f_matrix(values, rows, cols):
+    if type(values) is not list or len(values) != rows:
+        raise ValueError("bad matrix shape")
+    for row in values:
+        if type(row) is not list or len(row) != cols:
+            raise ValueError("bad matrix shape")
+        for v in row:
+            if not _is_model_f(v):
+                raise ValueError("bad matrix entry")
+
+
+def _compute_perplexity(model, corpus):
+    """校验并按规定的累加顺序计算困惑度；任何问题抛 ValueError。"""
+    # 顶层须为 JSON 对象，且键恰为给定 8 个、严格按序出现。
+    if type(model) is not dict:
+        raise ValueError("model must be a JSON object")
+    expected_keys = ["version", "vocab", "Wxh", "Whh", "bh",
+                     "Why", "by", "h0"]
+    if list(model.keys()) != expected_keys:
+        raise ValueError("model keys mismatch")
+
+    # version：type 恰为 int 且值为 1（bool 不算 int）。
+    if type(model["version"]) is not int or model["version"] != 1:
+        raise ValueError("bad version")
+
+    # vocab：非空 list，元素均为恰含单码点的 str，唯一且按码点升序。
+    vocab = model["vocab"]
+    if type(vocab) is not list or len(vocab) == 0:
+        raise ValueError("vocab must be a non-empty list")
+    V = len(vocab)
+    prev_cp = None
+    for tok in vocab:
+        if type(tok) is not str or len(tok) != 1:
+            raise ValueError("vocab entries must be single-codepoint strings")
+        cp = ord(tok)
+        if prev_cp is not None and cp <= prev_cp:
+            raise ValueError("vocab must be sorted by codepoint and unique")
+        prev_cp = cp
+    if len(set(vocab)) != V:
+        raise ValueError("vocab entries must be unique")
+
+    # H 由 Wxh 的行数确定，H>0；六个参数形状依次为
+    # H×V、H×H、H、V×H、V、H，元素均为 F。
+    Wxh = model["Wxh"]
+    if type(Wxh) is not list or len(Wxh) == 0:
+        raise ValueError("Wxh must be a non-empty list")
+    H = len(Wxh)
+    _require_f_matrix(Wxh, H, V)
+    _require_f_matrix(model["Whh"], H, H)
+    _require_f_vector(model["bh"], H)
+    _require_f_matrix(model["Why"], V, H)
+    _require_f_vector(model["by"], V)
+    _require_f_vector(model["h0"], H)
+
+    Whh = model["Whh"]
+    bh = model["bh"]
+    Why = model["Why"]
+    by = model["by"]
+    h0 = model["h0"]
+
+    # CORPUS 为全文码点序列；不足 2 码点或含表外字符即失败。
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+    index = {ch: k for k, ch in enumerate(vocab)}
+    seq = []
+    for ch in corpus:
+        k = index.get(ch)
+        if k is None:
+            raise ValueError("corpus contains an out-of-vocabulary character")
+        seq.append(k)
+    T = len(seq) - 1
+
+    L = 0.0
+    h = h0
+    for t in range(T):
+        x = seq[t]
+        y = seq[t + 1]
+
+        # n_i = tanh(bh_i + Wxh_i,x + Σ_j Whh_i,j*h_j)：
+        # 累加器自 float(bh_i) 起，先加 Wxh，再依 j 升序加 Whh*h。
+        n = [0.0] * H
+        for i in range(H):
+            acc = float(bh[i])
+            acc += Wxh[i][x]
+            wh_row = Whh[i]
+            for j in range(H):
+                acc += wh_row[j] * h[j]
+            if not math.isfinite(acc):
+                raise ValueError("hidden pre-activation non-finite")
+            ni = math.tanh(acc)
+            if not math.isfinite(ni):
+                raise ValueError("hidden state non-finite")
+            n[i] = ni
+
+        # z_k = by_k + Σ_j Why_k,j*n_j：自 float(by_k) 起依 j 升序累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(H):
+                acc += why_row[j] * n[j]
+            if not math.isfinite(acc):
+                raise ValueError("logit non-finite")
+            z[k] = acc
+
+        m = max(z)
+        d = 0.0
+        for k in range(V):
+            try:
+                ev = math.exp(z[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ev):
+                raise ValueError("softmax exp non-finite")
+            d += ev
+            if not math.isfinite(d):
+                raise ValueError("softmax denominator non-finite")
+
+        try:
+            step = m + math.log(d) - z[y]
+        except OverflowError:
+            raise ValueError("cross-entropy step overflowed")
+        if not math.isfinite(step):
+            raise ValueError("cross-entropy step non-finite")
+        L += step
+        if not math.isfinite(L):
+            raise ValueError("total loss non-finite")
+
+        h = n
+
+    try:
+        result = math.exp(L / T)
+    except OverflowError:
+        raise ValueError("perplexity overflowed")
+    if not math.isfinite(result):
+        raise ValueError("perplexity non-finite")
+    return result
+
+
+def _json_object_no_duplicates(pairs):
+    """json object_pairs_hook：重复键即拒绝，否则保持插入序的 dict。"""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key: %r" % (key,))
+        result[key] = value
+    return result
+
+
+def _cli_perplexity(model_path, corpus_path):
+    """perplexity MODEL CORPUS：任何失败均经 _fail 以退出码 2 结束。"""
+    try:
+        # newline="" 关闭换行转换，确保逐码点即 UTF-8 解码结果（含换行）。
+        with open(model_path, "r", encoding="utf-8", newline="") as f:
+            model_text = f.read()
+        with open(corpus_path, "r", encoding="utf-8", newline="") as f:
+            corpus_text = f.read()
+        model = json.loads(
+            model_text, object_pairs_hook=_json_object_no_duplicates)
+        perplexity = _compute_perplexity(model, corpus_text)
+    except SystemExit:
+        raise
+    except Exception:
+        _fail()
+    sys.stdout.write(format(perplexity, ".17g") + "\n")
+
+
+def main(argv):
+    if len(argv) != 4 or argv[1] != "perplexity":
+        _fail()
+    _cli_perplexity(argv[2], argv[3])
+
+
+if __name__ == "__main__":
+    main(sys.argv)
