@@ -45,6 +45,93 @@ def _check_vector(values, size, name):
     return list(values)
 
 
+def clip_gradients(dWxh, dWhh, dbh, max_norm):
+    """对 RNN 梯度做全局范数裁剪，返回四元组而不修改任何输入。
+
+    dbh 须为非空 F 列表，其长度确定 H；dWxh 须为恰有 H 行的列表，
+    每行均为长度相同且大于零的 F 列表，首行长度确定 I；dWhh 须为
+    H×H 的 F 列表；max_norm 须为正数 F。任一校验失败抛 ValueError。
+
+    按 dWxh 逐行、dWhh 逐行、dbh 的顺序以 float 累加平方和：
+        global_norm = sqrt(sum_sq)
+    若 global_norm > max_norm，三组元素统一乘 max_norm / global_norm；
+    否则缩放因子为 1.0（零范数也不除零）。返回
+        (clipped_dWxh, clipped_dWhh, clipped_dbh, global_norm)
+    global_norm 为裁剪前的 float 范数；前三项保持原形状、元素均为 float，
+    且逐层新建列表，不修改或复用输入列表。
+    """
+    def _is_grad_f(value):
+        # 与 F 一致，但 int 一律视为有限（任意大的整数也有限）。
+        if type(value) is int:
+            return True
+        return type(value) is float and math.isfinite(value)
+
+    def _require_f(value, name):
+        if not _is_grad_f(value):
+            raise ValueError("%s entries must be finite numbers, got %r"
+                             % (name, value))
+
+    if type(dbh) is not list or len(dbh) == 0:
+        raise ValueError("dbh must be a non-empty list")
+    H = len(dbh)
+    for v in dbh:
+        _require_f(v, "dbh")
+
+    if type(dWxh) is not list or len(dWxh) != H:
+        raise ValueError("dWxh must be a list with exactly %d rows" % H)
+    first_row = dWxh[0]
+    if type(first_row) is not list or len(first_row) == 0:
+        raise ValueError("dWxh rows must be non-empty lists")
+    I = len(first_row)
+    for v in first_row:
+        _require_f(v, "dWxh")
+    for row in dWxh[1:]:
+        if type(row) is not list or len(row) != I:
+            raise ValueError("dWxh must be a rectangular list of shape %d×%d"
+                             % (H, I))
+        for v in row:
+            _require_f(v, "dWxh")
+
+    if type(dWhh) is not list or len(dWhh) != H:
+        raise ValueError("dWhh must be a list of shape %d×%d" % (H, H))
+    for row in dWhh:
+        if type(row) is not list or len(row) != H:
+            raise ValueError("dWhh must be a list of shape %d×%d" % (H, H))
+        for v in row:
+            _require_f(v, "dWhh")
+
+    if not _is_grad_f(max_norm) or max_norm <= 0:
+        raise ValueError("max_norm must be a finite positive number, got %r"
+                         % (max_norm,))
+
+    sum_sq = 0.0
+    try:
+        for matrix in (dWxh, dWhh):
+            for row in matrix:
+                for v in row:
+                    fv = float(v)
+                    sum_sq += fv * fv
+                    if not math.isfinite(sum_sq):
+                        raise ValueError(
+                            "global norm accumulated to a non-finite value")
+        for v in dbh:
+            fv = float(v)
+            sum_sq += fv * fv
+            if not math.isfinite(sum_sq):
+                raise ValueError(
+                    "global norm accumulated to a non-finite value")
+    except OverflowError:
+        raise ValueError("global norm accumulated to a non-finite value")
+
+    global_norm = math.sqrt(sum_sq)
+    scale = max_norm / global_norm if global_norm > max_norm else 1.0
+
+    clipped_dWxh = [[float(v) * scale for v in row] for row in dWxh]
+    clipped_dWhh = [[float(v) * scale for v in row] for row in dWhh]
+    clipped_dbh = [float(v) * scale for v in dbh]
+    return clipped_dWxh, clipped_dWhh, clipped_dbh, global_norm
+
+
 class VanillaRNN(object):
     """单隐藏层 Vanilla RNN，参数 Wxh/Whh/bh 初始化为全 0.0。
 
