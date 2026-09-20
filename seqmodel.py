@@ -1,6 +1,6 @@
 """seqmodel: 从零实现的序列建模库（仅 Python 标准库，离线）。
 
-本模块提供确定性的 VanillaRNN：
+本模块提供确定性的 VanillaRNN 与 LSTMCell：
 
     h_t = tanh(Wxh @ x_t + Whh @ h_{t-1} + bh)
 
@@ -10,6 +10,7 @@ TypeError。
 """
 
 import math
+import random
 
 
 def _is_f(value):
@@ -249,3 +250,97 @@ class VanillaRNN(object):
 
         dh0 = dh_next
         return dxs, dWxh, dWhh, dbh, dh0
+
+
+class LSTMCell(object):
+    """单步 LSTM 单元，参数 W/b 由 seed 确定性初始化。
+
+    W 形状 4H×(I+H)，b 形状 4H。以 r = random.Random(seed)、
+    q = 1/sqrt(I+H)，按 W 行列序令每项为 float((2*r.random()-1)*q)，
+    b 初始化为全 0.0。
+    """
+
+    def __init__(self, I, H, seed=0):
+        if type(I) is not int or type(H) is not int or I <= 0 or H <= 0:
+            raise ValueError("I and H must be positive integers")
+        if type(seed) is not int:
+            raise ValueError("seed must be an integer")
+        self.I = I
+        self.H = H
+        r = random.Random(seed)
+        q = 1.0 / math.sqrt(I + H)
+        self.W = [[float((2 * r.random() - 1) * q)
+                   for _ in range(I + H)] for _ in range(4 * H)]
+        self.b = [0.0] * (4 * H)
+
+    @staticmethod
+    def _sigmoid(v):
+        """数值稳定的 sigmoid。"""
+        if v >= 0:
+            return 1.0 / (1.0 + math.exp(-v))
+        ev = math.exp(v)
+        return ev / (1.0 + ev)
+
+    def forward(self, x, h_prev, c_prev):
+        """单步前向传播，返回 (h, c, cache)。
+
+        x、h_prev、c_prev 须分别为长度 I、H、H 的 F 列表；self.W、self.b
+        须仍满足 4H×(I+H)、4H 的形状且元素均为 F，否则抛 ValueError。
+        中间量出现非有限值同样抛 ValueError。返回的 h、c 为新的 float
+        列表；cache 为 dict，键按 x、h_prev、c_prev、z、i、f、o、g、c、
+        h、W 顺序插入，向量值均为新的 float 列表，W 为二维 float 深拷贝；
+        返回对象不复用或修改输入及属性。
+        """
+        I, H = self.I, self.H
+        x = _check_vector(x, I, "x")
+        h_prev = _check_vector(h_prev, H, "h_prev")
+        c_prev = _check_vector(c_prev, H, "c_prev")
+        W = _check_matrix(self.W, 4 * H, I + H, "W")
+        b = _check_vector(self.b, 4 * H, "b")
+
+        z = x + h_prev
+
+        # a[k] = b[k] + Σ_j W[k][j]*z[j]，按列序累加
+        a = [0.0] * (4 * H)
+        for k in range(4 * H):
+            acc = float(b[k])
+            row = W[k]
+            for j in range(I + H):
+                acc += float(row[j]) * float(z[j])
+            if not math.isfinite(acc):
+                raise ValueError("pre-activation accumulated to a "
+                                 "non-finite value")
+            a[k] = acc
+
+        # 连续 H 段依次解释为 i、f、o、g
+        i_gate = [self._sigmoid(a[k]) for k in range(0, H)]
+        f_gate = [self._sigmoid(a[k]) for k in range(H, 2 * H)]
+        o_gate = [self._sigmoid(a[k]) for k in range(2 * H, 3 * H)]
+        g_gate = [math.tanh(a[k]) for k in range(3 * H, 4 * H)]
+
+        c = [0.0] * H
+        h = [0.0] * H
+        for k in range(H):
+            cv = f_gate[k] * float(c_prev[k]) + i_gate[k] * g_gate[k]
+            if not math.isfinite(cv):
+                raise ValueError("cell state became non-finite")
+            c[k] = cv
+            hv = o_gate[k] * math.tanh(cv)
+            if not math.isfinite(hv):
+                raise ValueError("hidden state became non-finite")
+            h[k] = hv
+
+        cache = {
+            "x": [float(v) for v in x],
+            "h_prev": [float(v) for v in h_prev],
+            "c_prev": [float(v) for v in c_prev],
+            "z": [float(v) for v in z],
+            "i": [float(v) for v in i_gate],
+            "f": [float(v) for v in f_gate],
+            "o": [float(v) for v in o_gate],
+            "g": [float(v) for v in g_gate],
+            "c": [float(v) for v in c],
+            "h": [float(v) for v in h],
+            "W": [[float(v) for v in row] for row in W],
+        }
+        return [float(v) for v in h], [float(v) for v in c], cache
