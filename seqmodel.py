@@ -1104,18 +1104,201 @@ def _perplexity(model_path, corpus_path):
     return format(perplexity, ".17g") + "\n"
 
 
-def main(argv):
-    """命令行入口：python seqmodel.py perplexity MODEL CORPUS。
+def _train(model_path, corpus_path, out_path):
+    """对模型做一次全语料 SGD 更新并把新模型写入 OUT。
 
-    成功时 stdout 恰为 format(exp(L/T), '.17g') + '\\n' 并返回 0；参数、
-    文件读取、UTF-8/JSON 解析、模型/语料校验或非有限计算等任何失败均返回
-    2，且 stderr 恰为 "error\\n"，不输出回溯。
+    MODEL、CORPUS 完全沿用 perplexity 的读取、形状、F、UTF-8、词表及语料
+    契约。以当前字符的 one-hot 向量和 h0 调用装入参数的 VanillaRNN.forward
+    得到 N-1 步隐状态；标签为下一字符，按 _perplexity 的顺序计算各步
+    logit 与 softmax。令 g = p - onehot(y)，按 t 升序累加
+    dWhy += g⊗h、dby += g，并按 k 升序计算 dhs = Whyᵀg，随后调用
+    backward(dhs) 得到 dWxh、dWhh、dbh。依 dWxh、dWhh、dbh、dWhy、dby
+    行序求全局范数，超过 5.0 即统一缩放至 5.0；五组参数减去 0.1 倍梯度，
+    h0 不变。任一中间量或结果非有限均抛 ValueError。
+
+    OUT 复用 perplexity 模型的八个键、键序与形状，数组元素均转为 float；
+    文件内容恰为 json.dumps(obj, ensure_ascii=True,
+    separators=(',', ':'), allow_nan=False) 的 UTF-8 编码再加一个 LF，
+    负零保留为 -0.0。
+    """
+    vocab, Wxh, Whh, bh, Why, by, h0 = _load_perplexity_model(model_path)
+    V = len(vocab)
+    H = len(bh)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    T = len(ids) - 1
+
+    # 当前字符的 one-hot 输入序列。
+    xs = []
+    for t in range(T):
+        row = [0.0] * V
+        row[ids[t]] = 1.0
+        xs.append(row)
+
+    rnn = VanillaRNN(V, H)
+    rnn.Wxh = [list(row) for row in Wxh]
+    rnn.Whh = [list(row) for row in Whh]
+    rnn.bh = list(bh)
+    hs = rnn.forward(xs, h0)
+
+    dWhy = [[0.0] * H for _ in range(V)]
+    dby = [0.0] * V
+    dhs = [[0.0] * H for _ in range(T)]
+
+    for t in range(T):
+        n = hs[t]
+        y = ids[t + 1]
+
+        # logit：与 _perplexity 相同，自 float 偏置起依 j 升序累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(H):
+                acc += why_row[j] * n[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # softmax：m=max(z)，d 从 0.0 依 k 升序累加 exp(z_k-m)。
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            ev = math.exp(z[k] - m)
+            if not math.isfinite(ev):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ev
+            d += ev
+            if not math.isfinite(d):
+                raise ValueError("softmax denominator accumulated non-finitely")
+
+        # g = p - onehot(y)。
+        g = [0.0] * V
+        for k in range(V):
+            gk = e[k] / d
+            if k == y:
+                gk -= 1.0
+            if not math.isfinite(gk):
+                raise ValueError("output gradient became non-finite")
+            g[k] = gk
+
+        # 按 t 升序累加 dWhy += g⊗h、dby += g。
+        for k in range(V):
+            gk = g[k]
+            dby[k] += gk
+            if not math.isfinite(dby[k]):
+                raise ValueError("dby accumulated to a non-finite value")
+            dw_row = dWhy[k]
+            for j in range(H):
+                dw_row[j] += gk * n[j]
+                if not math.isfinite(dw_row[j]):
+                    raise ValueError("dWhy accumulated to a non-finite value")
+
+        # dhs = Whyᵀg：每个 j 独立以 0.0 起按 k 升序累加。
+        dh_row = dhs[t]
+        for j in range(H):
+            acc = 0.0
+            for k in range(V):
+                acc += Why[k][j] * g[k]
+                if not math.isfinite(acc):
+                    raise ValueError("dhs accumulated to a non-finite value")
+            dh_row[j] = acc
+
+    _dxs, dWxh, dWhh, dbh, _dh0 = rnn.backward(dhs)
+
+    # 依 dWxh、dWhh、dbh、dWhy、dby 行序累加平方和求全局范数。
+    sum_sq = 0.0
+    for group in (dWxh, dWhh, dbh, dWhy, dby):
+        if type(group[0]) is list:
+            for row in group:
+                for v in row:
+                    if not math.isfinite(v):
+                        raise ValueError("gradient is non-finite")
+                    sum_sq += v * v
+                    if not math.isfinite(sum_sq):
+                        raise ValueError(
+                            "global norm accumulated to a non-finite value")
+        else:
+            for v in group:
+                if not math.isfinite(v):
+                    raise ValueError("gradient is non-finite")
+                sum_sq += v * v
+                if not math.isfinite(sum_sq):
+                    raise ValueError(
+                        "global norm accumulated to a non-finite value")
+
+    global_norm = math.sqrt(sum_sq)
+    scale = 5.0 / global_norm if global_norm > 5.0 else 1.0
+
+    # 五组参数减 0.1 倍（裁剪后的）梯度；h0 不变。结果非有限即失败。
+    def _updated(old, grad):
+        value = float(old) - 0.1 * (grad * scale)
+        if not math.isfinite(value):
+            raise ValueError("updated parameter became non-finite")
+        return value
+
+    new_Wxh = [[_updated(Wxh[i][j], dWxh[i][j]) for j in range(V)]
+               for i in range(H)]
+    new_Whh = [[_updated(Whh[i][j], dWhh[i][j]) for j in range(H)]
+               for i in range(H)]
+    new_bh = [_updated(bh[i], dbh[i]) for i in range(H)]
+    new_Why = [[_updated(Why[k][j], dWhy[k][j]) for j in range(H)]
+               for k in range(V)]
+    new_by = [_updated(by[k], dby[k]) for k in range(V)]
+
+    obj = {
+        "version": 1,
+        "vocab": vocab,
+        "Wxh": new_Wxh,
+        "Whh": new_Whh,
+        "bh": new_bh,
+        "Why": new_Why,
+        "by": new_by,
+        "h0": [float(v) for v in h0],
+    }
+    text = json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+    with open(out_path, "wb") as f:
+        f.write(text.encode("utf-8"))
+
+
+def main(argv):
+    """命令行入口：perplexity 与 train 两个子命令。
+
+    python seqmodel.py perplexity MODEL CORPUS：成功时 stdout 恰为
+    format(exp(L/T), '.17g') + '\\n' 并返回 0。
+
+    python seqmodel.py train MODEL CORPUS OUT：对模型做一次全语料 SGD
+    并写出新模型，成功时 stdout 为空并返回 0。
+
+    参数、文件读取、UTF-8/JSON 解析、模型/语料校验或非有限计算等任何失败
+    均返回 2，stdout 为空，且 stderr 恰为 "error\\n"，不输出回溯。
     """
     try:
-        if len(argv) != 4 or argv[1] != "perplexity":
-            raise ValueError("usage: seqmodel.py perplexity MODEL CORPUS")
-        output = _perplexity(argv[2], argv[3])
-        sys.stdout.buffer.write(output.encode("ascii"))
+        if len(argv) == 4 and argv[1] == "perplexity":
+            output = _perplexity(argv[2], argv[3])
+            sys.stdout.buffer.write(output.encode("ascii"))
+        elif len(argv) == 5 and argv[1] == "train":
+            _train(argv[2], argv[3], argv[4])
+        else:
+            raise ValueError(
+                "usage: seqmodel.py perplexity MODEL CORPUS | "
+                "seqmodel.py train MODEL CORPUS OUT")
     except Exception:
         sys.stderr.buffer.write(b"error\n")
         return 2
