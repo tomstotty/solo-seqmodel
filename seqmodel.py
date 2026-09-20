@@ -45,6 +45,56 @@ def _check_vector(values, size, name):
     return list(values)
 
 
+def clip_gradients(dWxh, dWhh, dbh, max_norm):
+    """按全局范数裁剪梯度，返回 (clipped_dWxh, clipped_dWhh, dbh, global_norm)。
+
+    dbh 须为非空 F 列表，其长度确定 H；dWxh 须为恰有 H 行的列表，每行均为
+    长度相同且大于零的 F 列表，首行长度确定 I；dWhh 须为 H×H 的 F 列表。
+    max_norm 须为 F 且大于 0。任一不满足均抛 ValueError。
+
+    按 dWxh 逐行、dWhh 逐行、dbh 的顺序以 float 累加平方和，中间和一旦
+    非有限即抛 ValueError。global_norm 为裁剪前范数；若超过 max_norm，
+    全部元素统一乘 max_norm/global_norm，否则缩放因子为 1.0（零范数不
+    除零）。返回的三个梯度均为逐层新建列表，元素一律为 float，不修改输入。
+    """
+    if type(dbh) is not list or len(dbh) == 0:
+        raise ValueError("dbh must be a non-empty list")
+    H = len(dbh)
+    dbh = _check_vector(dbh, H, "dbh")
+
+    if type(dWxh) is not list or len(dWxh) != H:
+        raise ValueError("dWxh must be a list with exactly %d rows" % H)
+    if type(dWxh[0]) is not list or len(dWxh[0]) == 0:
+        raise ValueError("dWxh rows must be non-empty lists")
+    I = len(dWxh[0])
+    dWxh = _check_matrix(dWxh, H, I, "dWxh")
+
+    dWhh = _check_matrix(dWhh, H, H, "dWhh")
+
+    if not _is_f(max_norm) or max_norm <= 0:
+        raise ValueError("max_norm must be a positive finite number")
+
+    sum_sq = 0.0
+    for matrix in (dWxh, dWhh):
+        for row in matrix:
+            for v in row:
+                sum_sq += float(v) * float(v)
+                if not math.isfinite(sum_sq):
+                    raise ValueError("sum of squares became non-finite")
+    for v in dbh:
+        sum_sq += float(v) * float(v)
+        if not math.isfinite(sum_sq):
+            raise ValueError("sum of squares became non-finite")
+
+    global_norm = math.sqrt(sum_sq)
+    scale = max_norm / global_norm if global_norm > max_norm else 1.0
+
+    clipped_dWxh = [[float(v) * scale for v in row] for row in dWxh]
+    clipped_dWhh = [[float(v) * scale for v in row] for row in dWhh]
+    clipped_dbh = [float(v) * scale for v in dbh]
+    return clipped_dWxh, clipped_dWhh, clipped_dbh, global_norm
+
+
 class VanillaRNN(object):
     """单隐藏层 Vanilla RNN，参数 Wxh/Whh/bh 初始化为全 0.0。
 
