@@ -2411,6 +2411,109 @@ def _perplexity_lstm_attn(model_path, corpus_path, window_text):
     return format(perplexity, ".17g") + "\n"
 
 
+def _eval_windows(model_path, corpus_path, windows_text):
+    """对若干注意力窗口逐一评估 LSTM 困惑度，返回待写出的 JSON 行文本。
+
+    MODEL、CORPUS 完全沿用 perplexity-lstm-attn 的读取、形状、F、严格
+    UTF-8、词表及语料至少 2 码点契约。WINDOWS 为逗号分隔的非空窗口列表：
+    各项均须整串匹配 [1-9][0-9]*（空项非法，任意位数均合法，不转 int），
+    安全截取沿用 perplexity-lstm-attn，重复项按序保留，否则抛 ValueError。
+
+    每项窗口独立评估：置 h=h0、c=c0、memory=[h0]，按 t 升序以与
+    _perplexity_lstm_attn 完全相同的单窗口计算（one-hot 输入、
+    LSTMCell.forward、M 截取、注意力上下文、Why/by logit、稳定
+    log-sum-exp）累加总负对数似然 L，T=len(CORPUS)-1。任一运算非有限
+    （含最终 exp(L/T) 溢出）均抛 ValueError。
+
+    每个窗口独占一个 JSON 行，键序恰为 window,steps,total_logprob,
+    perplexity，值依次为原窗口 str、int T、format(-L,'.17g')、
+    format(exp(L/T),'.17g')。每行恰由 json.dumps(obj,ensure_ascii=True,
+    separators=(',',':'),allow_nan=False)+'\\n' 生成，各行直接拼接，末行
+    保留 LF；全部行计算完毕后方才返回，失败时不产生任何部分输出。
+    """
+    windows = windows_text.split(",")
+    for window_text in windows:
+        if not _WINDOW_RE.match(window_text):
+            raise ValueError("each WINDOWS item must match [1-9][0-9]*")
+
+    vocab, W, b, Why, by, h0, c0 = _load_perplexity_lstm_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    T = len(ids) - 1
+    lines = []
+    for window_text in windows:
+        # 每个窗口独立重置状态；单窗口计算与 _perplexity_lstm_attn 相同。
+        memory = [h0]
+        h = list(h0)
+        c = list(c0)
+        L = 0.0
+        for t in range(T):
+            y = ids[t + 1]
+
+            x = [0.0] * V
+            x[ids[t]] = 1.0
+
+            h, c = cell.forward(x, h, c)[:2]
+
+            M = _window_tail(memory, window_text)
+            u = _attn_context(h, M)
+
+            z = _output_logits(Why, by, u)
+
+            m = max(z)
+            if not math.isfinite(m):
+                raise ValueError("logit maximum is non-finite")
+            d = 0.0
+            for k in range(V):
+                d += math.exp(z[k] - m)
+                if not math.isfinite(d):
+                    raise ValueError(
+                        "softmax denominator accumulated non-finitely")
+
+            step = m + math.log(d) - z[y]
+            if not math.isfinite(step):
+                raise ValueError("cross-entropy step is non-finite")
+            L += step
+            if not math.isfinite(L):
+                raise ValueError(
+                    "total cross-entropy accumulated non-finitely")
+
+            memory.append([float(v) for v in h])
+
+        perplexity = math.exp(L / T)
+        if not math.isfinite(perplexity):
+            raise ValueError("perplexity is non-finite")
+
+        obj = {
+            "window": window_text,
+            "steps": T,
+            "total_logprob": format(-L, ".17g"),
+            "perplexity": format(perplexity, ".17g"),
+        }
+        lines.append(json.dumps(obj, ensure_ascii=True,
+                                separators=(",", ":"), allow_nan=False))
+
+    return "\n".join(lines) + "\n"
+
+
 def _perplexity_lstm_attn_trace(model_path, corpus_path, window_text):
     """perplexity-lstm-attn 的逐步负对数似然轨迹，返回待写出的字符串。
 
@@ -4883,6 +4986,16 @@ def main(argv):
     为键/值调用 attention，用 h 与首行上下文之和作为 logit 隐状态，随后向
     memory 追加 h 的 float 副本；输出契约与 perplexity 相同，不写文件。
 
+    python seqmodel.py eval-windows MODEL CORPUS WINDOWS：MODEL、CORPUS
+    及单窗口计算沿用 perplexity-lstm-attn。WINDOWS 为逗号分隔的非空窗口
+    列表；各项匹配 [1-9][0-9]*，空项非法，超长项按既有规则安全截取，
+    重复项按序保留。每项均以 h=h0、c=c0、memory=[h0] 重置；设
+    T=语料码点数-1，L 为按 t 升序所得总负对数似然。stdout 依次输出
+    JSON 行，键序 window,steps,total_logprob,perplexity，类型/值为原
+    窗口 str、T(int)、format(-L,'.17g')、format(exp(L/T),'.17g')。
+    每行恰由 json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n' 生成 UTF-8 字节，末行保留 LF，不写文件。
+
     python seqmodel.py perplexity-lstm-attn-trace MODEL CORPUS WINDOW：
     MODEL、CORPUS、WINDOW 的校验与逐步计算均沿用 perplexity-lstm-attn。
     令 T=语料码点数-1；按 t 升序计算 loss=m+log(d)-z_y，L 从 0.0 依序
@@ -5113,6 +5226,9 @@ def main(argv):
         elif len(argv) == 5 and argv[1] == "perplexity-lstm-attn":
             output = _perplexity_lstm_attn(argv[2], argv[3], argv[4])
             sys.stdout.buffer.write(output.encode("ascii"))
+        elif len(argv) == 5 and argv[1] == "eval-windows":
+            output = _eval_windows(argv[2], argv[3], argv[4])
+            sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 5 and argv[1] == "perplexity-lstm-attn-trace":
             output = _perplexity_lstm_attn_trace(argv[2], argv[3], argv[4])
             sys.stdout.buffer.write(output.encode("utf-8"))
