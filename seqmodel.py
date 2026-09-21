@@ -2033,6 +2033,130 @@ def _sample_lstm(model_path, start, seed_text, temperature_text, length_text):
     return "".join(out) + "\n"
 
 
+def _sample_lstm_anneal(model_path, start, seed_text, start_t_text,
+                        end_t_text, length_text):
+    """以线性退火温度从 LSTM 语言模型采样 LENGTH 个码点，返回待写出的字符串。
+
+    MODEL、START、SEED、LENGTH 的校验与 _sample_lstm 完全一致。START_T、
+    END_T 各经 float() 解析，结果须有限且严格大于 0，否则抛 ValueError。
+    整次调用仅初始化一次 r=random.Random(int(SEED))，不写任何文件。
+
+    LENGTH 为 0 时不计算温度；为 1 时仅用 START_T；否则 t 自 0 升序，第
+    t 步温度严格按 Python 表达式 START_T+(END_T-START_T)*t/(LENGTH-1)
+    求值，结果非有限或不大于 0 即抛 ValueError。置 h=h0、c=c0、x=START
+    索引，每步以 x 的 V 长 one-hot 调用装入 W、b 的 LSTMCell.forward(x, h,
+    c)，取前两项更新 h、c；logit、温度缩放、稳定 softmax、随机阈值、k 升序
+    累计与选中规则逐项沿用 _sample_lstm；追加 vocab[k] 并令 x=k。任一中间
+    量非有限均抛 ValueError。成功返回 LENGTH 个码点再加一个 LF。
+    """
+    vocab, W, b, Why, by, h0, c0 = _load_perplexity_lstm_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # START_T、END_T：float() 可解析且有限、严格大于 0。
+    start_t = float(start_t_text)
+    if not math.isfinite(start_t) or start_t <= 0.0:
+        raise ValueError("START_T must be a finite positive float")
+    end_t = float(end_t_text)
+    if not math.isfinite(end_t) or end_t <= 0.0:
+        raise ValueError("END_T must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    if length == 1:
+        # 仅用 START_T，不求值退火表达式。
+        def temperature_at(t):
+            return start_t
+    elif length >= 2:
+        def temperature_at(t):
+            # 严格按 START_T+(END_T-START_T)*t/(LENGTH-1) 的运算顺序求值。
+            temp = start_t + (end_t - start_t) * t / (length - 1)
+            if not math.isfinite(temp) or temp <= 0.0:
+                raise ValueError(
+                    "annealed temperature became non-finite or non-positive")
+            return temp
+    else:
+        temperature_at = None  # LENGTH 为 0：循环不执行，不计算温度。
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    rng = random.Random(seed)
+    h = list(h0)
+    c = list(c0)
+    x = vocab.index(start)
+    out = []
+
+    for t in range(length):
+        temperature = temperature_at(t)
+        # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+        xvec = [0.0] * V
+        xvec[x] = 1.0
+        h, c = cell.forward(xvec, h, c)[:2]
+
+        # z_k = by_k + Σ_j Why_k,j*h_j，依 j 升序自 float 偏置累加。
+        z = _output_logits(Why, by, h)
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # u=r.random()*d；自 0.0 依 k 升序累加 e_k，选首个累计值严格大于
+        # u 者；无则取词表末项。
+        u = rng.random() * d
+        if not math.isfinite(u):
+            raise ValueError("sample threshold became non-finite")
+        chosen = V - 1
+        cum = 0.0
+        for k in range(V):
+            cum += e[k]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > u:
+                chosen = k
+                break
+
+        out.append(vocab[chosen])
+        x = chosen
+
+    return "".join(out) + "\n"
+
+
 def _rnn_n(Wxh, Whh, bh, x, h):
     """按 _perplexity 的公式、下标与累加顺序由 x、h 计算新隐状态 n。
 
@@ -2562,6 +2686,13 @@ def main(argv):
     START_T+(END_T-START_T)*t/(LENGTH-1)（LENGTH 为 1 时仅用 START_T，
     为 0 时不计算温度）；输出契约与 sample 相同。
 
+    python seqmodel.py sample-lstm-anneal MODEL START SEED START_T END_T
+    LENGTH：以线性退火温度从 version 2 的 LSTM 模型采样，每步以 h0、c0
+    为初态、x 的 V 长 one-hot 调用装入 W、b 的 LSTMCell.forward 推进
+    h、c，logit、稳定 softmax 与抽样规则同 sample-lstm，温度退火规则同
+    sample-anneal；整次仅初始化一次随机源；输出契约与 sample 相同，不写
+    任何文件。
+
     python seqmodel.py perplexity-attn MODEL CORPUS WINDOW：每步先按
     perplexity 的 RNN 公式求 n_t，再以记忆 [h0, n_0, ..., n_{t-1}] 末尾
     至多 WINDOW 项（从旧到新）为键/值调用 attention，用 n_t 与首行上下
@@ -2603,6 +2734,10 @@ def main(argv):
         elif len(argv) == 8 and argv[1] == "sample-anneal":
             output = _sample_anneal(argv[2], argv[3], argv[4], argv[5],
                                     argv[6], argv[7])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 8 and argv[1] == "sample-lstm-anneal":
+            output = _sample_lstm_anneal(argv[2], argv[3], argv[4], argv[5],
+                                         argv[6], argv[7])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 5 and argv[1] == "perplexity-attn":
             output = _perplexity_attn(argv[2], argv[3], argv[4])
