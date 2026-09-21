@@ -2411,6 +2411,97 @@ def _perplexity_lstm_attn(model_path, corpus_path, window_text):
     return format(perplexity, ".17g") + "\n"
 
 
+def _perplexity_lstm_attn_trace(model_path, corpus_path, window_text):
+    """perplexity-lstm-attn 的逐步 trace，返回待写出的 JSON 字符串。
+
+    MODEL、CORPUS、WINDOW 的读取、解析、校验与逐步计算完全沿用
+    _perplexity_lstm_attn；T=语料码点数-1，按 t 升序计算
+    loss=m+log(d)-z_y，L 自 0.0 依序累加。构造顶层键序恰为
+    version,items,total_nll,perplexity 的 dict：version 为 int 1；items
+    为 T 长列表，第 t 项键序恰为 t,target,nll，值依次为 int t、下一单码点
+    str、format(loss,'.17g')；total_nll、perplexity 依次为
+    format(L,'.17g')、format(exp(L/T),'.17g')。返回
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),allow_nan=False)
+    再加一个 LF；任一非有限计算均抛 ValueError。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    vocab, W, b, Why, by, h0, c0 = _load_perplexity_lstm_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    # 与 _perplexity_lstm_attn 相同：h0 保留模型原值，attention 不修改其
+    # 输入，故直接共享行即可。
+    memory = [h0]
+    h = list(h0)
+    c = list(c0)
+    L = 0.0
+    T = len(ids) - 1
+    items = [None] * T
+    for t in range(T):
+        y = ids[t + 1]
+
+        # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c = cell.forward(x, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        u = _attn_context(h, M)
+
+        # z_k = by_k + Σ_j Why_k,j*u_j，依 j 升序自 float 偏置累加。
+        z = _output_logits(Why, by, u)
+
+        # log-sum-exp：m=max(z)，d 从 0.0 依 k 升序累加 exp(z_k-m)。
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        d = 0.0
+        for k in range(V):
+            d += math.exp(z[k] - m)
+            if not math.isfinite(d):
+                raise ValueError("softmax denominator accumulated non-finitely")
+
+        step = m + math.log(d) - z[y]
+        if not math.isfinite(step):
+            raise ValueError("cross-entropy step is non-finite")
+        L += step
+        if not math.isfinite(L):
+            raise ValueError("total cross-entropy accumulated non-finitely")
+
+        items[t] = {"t": t, "target": corpus[t + 1],
+                    "nll": format(step, ".17g")}
+        memory.append([float(v) for v in h])
+
+    total_nll = format(L, ".17g")
+    perplexity = math.exp(L / T)
+    if not math.isfinite(perplexity):
+        raise ValueError("perplexity is non-finite")
+    obj = {"version": 1, "items": items, "total_nll": total_nll,
+           "perplexity": format(perplexity, ".17g")}
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+
+
 def _sample_attn(model_path, start, seed_text, temperature_text, length_text,
                  window_text):
     """带注意力上下文从 RNN 语言模型采样 LENGTH 个码点，返回待写出的字符串。
@@ -4423,6 +4514,9 @@ def main(argv):
         elif len(argv) == 5 and argv[1] == "perplexity-lstm-attn":
             output = _perplexity_lstm_attn(argv[2], argv[3], argv[4])
             sys.stdout.buffer.write(output.encode("ascii"))
+        elif len(argv) == 5 and argv[1] == "perplexity-lstm-attn-trace":
+            output = _perplexity_lstm_attn_trace(argv[2], argv[3], argv[4])
+            sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 6 and argv[1] == "train-attn":
             _train_attn(argv[2], argv[3], argv[4], argv[5])
         elif len(argv) == 6 and argv[1] == "train-lstm-attn":
