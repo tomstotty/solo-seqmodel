@@ -2321,6 +2321,96 @@ def _perplexity_attn(model_path, corpus_path, window_text):
     return format(perplexity, ".17g") + "\n"
 
 
+def _perplexity_lstm_attn(model_path, corpus_path, window_text):
+    """LSTM 加注意力上下文的困惑度，返回待写出的字符串。
+
+    MODEL、CORPUS 完全沿用 perplexity-lstm version 2 的八键顺序、F、形状、
+    严格 UTF-8、词表及语料至少 2 码点契约；WINDOW 整串匹配 [1-9][0-9]*
+    （任意位数均合法，不转 int），词法与安全截取规则完全沿用
+    perplexity-attn，否则抛 ValueError。
+
+    置 h=h0、c=c0、L=0.0、T=len(CORPUS)-1、memory=[h0]，t 升序（y 为下一
+    字符索引）：以当前字符的 V 长 one-hot 为 x，调用装入 W、b 的
+    LSTMCell.forward(x, h, c)，取前两项更新 h、c；M_t 取 memory 末尾至多
+    WINDOW 项（顺序从旧到新），以 attention([h], M_t, M_t, None) 返回首项
+    ctx，按 i 升序令 u_i = h_i + ctx[0][i]。logit 仅以 u 替代
+    perplexity-lstm 中的 h，Why/by 仿射、稳定 log-sum-exp 与负对数似然
+    累加顺序均与 perplexity-lstm 相同；随后把 h 的 float 副本追加进
+    memory。任一运算非有限（含最终 exp(L/T) 溢出）均抛 ValueError。成功
+    返回 format(exp(L/T), '.17g') + '\\n'。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    vocab, W, b, Why, by, h0, c0 = _load_perplexity_lstm_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    # memory 初值为 h0 原值（与 _perplexity_attn 相同），每步预测后压入该步
+    # h 的 float 副本；attention 不修改其输入，故首步可直接共享 h0 行。
+    memory = [h0]
+    h = list(h0)
+    c = list(c0)
+    L = 0.0
+    T = len(ids) - 1
+    for t in range(T):
+        y = ids[t + 1]
+
+        # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+        h, c = cell.forward(x, h, c)[:2]
+
+        # M_t 取记忆末尾至多 WINDOW 项（旧到新），u_i = h_i + 注意力首行
+        # 上下文 ctx[0][i]，按 i 升序。
+        M_t = _window_tail(memory, window_text)
+        u = _attn_context(h, M_t)
+
+        # logit 仅以 u 替代 h；下标与累加顺序同 perplexity-lstm。
+        z = _output_logits(Why, by, u)
+
+        # log-sum-exp：m=max(z)，d 从 0.0 依 k 升序累加 exp(z_k-m)。
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        d = 0.0
+        for k in range(V):
+            d += math.exp(z[k] - m)
+            if not math.isfinite(d):
+                raise ValueError("softmax denominator accumulated non-finitely")
+
+        step = m + math.log(d) - z[y]
+        if not math.isfinite(step):
+            raise ValueError("cross-entropy step is non-finite")
+        L += step
+        if not math.isfinite(L):
+            raise ValueError("total cross-entropy accumulated non-finitely")
+
+        memory.append([float(v) for v in h])
+
+    perplexity = math.exp(L / T)
+    if not math.isfinite(perplexity):
+        raise ValueError("perplexity is non-finite")
+    return format(perplexity, ".17g") + "\n"
+
+
 def _sample_attn(model_path, start, seed_text, temperature_text, length_text,
                  window_text):
     """带注意力上下文从 RNN 语言模型采样 LENGTH 个码点，返回待写出的字符串。
@@ -2698,6 +2788,15 @@ def main(argv):
     至多 WINDOW 项（从旧到新）为键/值调用 attention，用 n_t 与首行上下
     文之和作为 logit 隐状态，随后 h=n_t；输出契约与 perplexity 相同。
 
+    python seqmodel.py perplexity-lstm-attn MODEL CORPUS WINDOW：MODEL 为
+    version 2 的 LSTM 模型（八键顺序、F、形状、严格 UTF-8、词表与语料契约
+    同 perplexity-lstm），WINDOW 词法与安全截取规则同 perplexity-attn。
+    置 h=h0、c=c0、memory=[h0]，t 升序以当前字符的 V 长 one-hot 调用装入
+    W、b 的 LSTMCell.forward 更新 h、c；取 memory 末尾至多 WINDOW 项
+    （旧到新）为键/值调用 attention([h], M, M, None)，以 h 与首行上下文
+    之和 u 替代 h 计算 Why/by logit、稳定 log-sum-exp 与负对数似然，随后
+    把 h 的 float 副本压入 memory；输出契约与 perplexity 相同，不写文件。
+
     python seqmodel.py sample-attn MODEL START SEED TEMPERATURE LENGTH
     WINDOW：以同样的注意力上下文替换 logit 隐状态，softmax 与抽样契约
     与 sample 相同，整次仅初始化一次随机源、不写文件。WINDOW 整串匹配
@@ -2721,6 +2820,9 @@ def main(argv):
             _train(argv[2], argv[3], argv[4])
         elif len(argv) == 4 and argv[1] == "perplexity-lstm":
             output = _perplexity_lstm(argv[2], argv[3])
+            sys.stdout.buffer.write(output.encode("ascii"))
+        elif len(argv) == 5 and argv[1] == "perplexity-lstm-attn":
+            output = _perplexity_lstm_attn(argv[2], argv[3], argv[4])
             sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 5 and argv[1] == "train-lstm":
             _train_lstm(argv[2], argv[3], argv[4])
