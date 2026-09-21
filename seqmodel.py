@@ -2974,6 +2974,104 @@ def _sample_lstm_attn(model_path, start, seed_text, temperature_text,
     return "".join(out) + "\n"
 
 
+def _score_lstm_attn(model_path, start, text, temperature_text, window_text):
+    """确定性地对给定候选 TEXT 打总对数概率分，返回待写出的字符串。
+
+    MODEL、START、TEMPERATURE、WINDOW 的读取、词法、形状与 F 校验完全沿用
+    _sample_lstm_attn；本命令无 SEED、无随机源且不写任何文件。TEXT 为可空
+    Unicode 字符串，其每个码点都须在词表中，否则抛 ValueError。
+
+    置 h=h0、c=c0、x=START 索引、memory=[h0]、total=0.0。按 t 升序遍历
+    TEXT：每步沿用 _sample_lstm_attn 的 LSTM 推进与窗口注意力得到 u，按原
+    顺序计算 a[k]=z[k]/TEMPERATURE、m=max(a)、e[k]=exp(a[k]-m)，d 从 0.0
+    按 k 升序累加 e[k]；不抽样，令 y 为 TEXT[t] 的词表索引，
+    lp=a[y]-m-math.log(d)，total 按 t 升序累加 lp，置 x=y，并向 memory 追
+    加 h 的 float 副本。任一计算非有限即抛 ValueError。成功返回
+    format(total, '.17g') + '\\n'；TEXT 为空时 total 为 0.0，输出 "0\\n"。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    vocab, W, b, Why, by, h0, c0 = _load_perplexity_lstm_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # TEXT：可空 Unicode 字符串，每个码点都须在词表中（按码点迭代）。
+    if type(text) is not str or any(ch not in vocab for ch in text):
+        raise ValueError("TEXT must be a possibly-empty string of in-vocab "
+                         "codepoints")
+
+    # TEMPERATURE：float() 可解析且有限、严格大于 0。
+    temperature = float(temperature_text)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite positive float")
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    memory = [h0]
+    h = list(h0)
+    c = list(c0)
+    x = vocab.index(start)
+    total = 0.0
+
+    for ch in text:
+        # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+        xvec = [0.0] * V
+        xvec[x] = 1.0
+        h, c = cell.forward(xvec, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        u = _attn_context(h, M)
+
+        # logit 仅以 u 替代 h；下标与累加顺序同 _sample_lstm_attn。
+        z = _output_logits(Why, by, u)
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        ld = math.log(d)
+        if not math.isfinite(ld):
+            raise ValueError("log softmax denominator became non-finite")
+        y = vocab.index(ch)
+        lp = a[y] - m - ld
+        if not math.isfinite(lp):
+            raise ValueError("log probability became non-finite")
+        total += lp
+        if not math.isfinite(total):
+            raise ValueError("total log probability accumulated non-finitely")
+
+        x = y
+        memory.append([float(v) for v in h])
+
+    return format(total, ".17g") + "\n"
+
+
 def _sample_lstm_attn_anneal(model_path, start, seed_text, start_t_text,
                              end_t_text, length_text, window_text):
     """以线性退火温度、带注意力上下文从 LSTM 语言模型采样 LENGTH 个码点。
@@ -4941,6 +5039,19 @@ def main(argv):
     allow_nan=False)+'\\n' 生成，各行直接拼接且末行保留 LF，不输出额外
     空白。LENGTH 为 0 时唯一一行恰为 {"text":"","score":"0"}\\n。
 
+    python seqmodel.py score-lstm-attn MODEL START TEXT TEMPERATURE WINDOW：
+    确定性地为指定候选 TEXT 打总对数概率分，无 SEED、无随机源且不写文件。
+    MODEL、START、TEMPERATURE、WINDOW 沿用 sample-lstm-attn；TEXT 为可空
+    Unicode 字符串，每个码点都须在词表中，否则失败。置 h=h0、c=c0、
+    x=START 索引、memory=[h0]、total=0.0，按 t 升序遍历 TEXT：每步以 x 的
+    V 长 one-hot 推进 h、c，经窗口注意力得到 u，按原顺序计算
+    a[k]=z[k]/TEMPERATURE、m=max(a)、e[k]=exp(a[k]-m)，d 从 0.0 按 k 升序
+    累加 e[k]；不抽样，令 y 为 TEXT[t] 索引，
+    lp=a[y]-m-math.log(d)，total 按 t 升序累加 lp，置 x=y，memory 追加 h
+    的 float 副本；任一计算非有限即失败。成功时 stdout 恰为
+    format(total,'.17g')+'\\n' 的 ASCII 字节（TEXT 为空时为 "0\\n"），
+    stderr 为空、返回 0；相同输入逐字节一致。
+
     python seqmodel.py train-attn MODEL CORPUS OUT WINDOW：前向严格复用
     perplexity-attn 的 n_t、M_t、u_t 与 logit 顺序；反向令
     g_t = p_t-onehot(y_t)，按 t 升序累加 dWhy、dby（以 u_t 为隐状态），
@@ -5015,6 +5126,10 @@ def main(argv):
             output = _sample_lstm_attn(argv[2], argv[3], argv[4], argv[5],
                                        argv[6], argv[7])
             sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 7 and argv[1] == "score-lstm-attn":
+            output = _score_lstm_attn(argv[2], argv[3], argv[4], argv[5],
+                                      argv[6])
+            sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 9 and argv[1] == "sample-lstm-attn-anneal":
             output = _sample_lstm_attn_anneal(argv[2], argv[3], argv[4],
                                               argv[5], argv[6], argv[7],
