@@ -2644,6 +2644,137 @@ def _window_sensitivity_lstm_attn(model_path, corpus_path, short_text,
     return "".join(line + "\n" for line in lines)
 
 
+def _compare_lstm_attn(model_a_path, model_b_path, corpus_path,
+                       window_text):
+    """两模型在同一语料、同一窗口上的逐步负对数似然之差（B 减 A）。
+
+    MODEL_A、MODEL_B 各自沿用 perplexity-lstm-attn 的 version 2 八键、
+    F、形状与严格 UTF-8 契约；两者 vocab 须逐项同序相等，H 可不同。
+    CORPUS 沿用 perplexity-lstm-attn 的严格 UTF-8、词表（以共同 vocab
+    为准）及至少 2 码点契约；WINDOW 沿用其 [1-9][0-9]* 词法及任意位数
+    安全截取。
+
+    两条轨道各自从自身的 h0、c0、memory=[h0] 重置，单步的状态推进、
+    注意力、logit 与稳定 log-sum-exp 与 perplexity-lstm-attn 完全相同；
+    令 T=语料码点数-1，第 t 步 A、B 的单步负对数似然依次为 a、b，
+    d=b-a，D 从 0.0 按 t 升序累加 d。任一计算非有限（含 d 或 D）均
+    抛 ValueError。
+
+    stdout 先写 T 个 JSON 项行，每行键序恰为
+    t,target,a_nll,b_nll,delta，值依次为 int t、下一单码点 str、
+    format(a,'.17g')、format(b,'.17g')、format(d,'.17g') 字符串；再写
+    唯一汇总行，键序恰为 steps,total_delta，值依次为 int T、
+    format(D,'.17g') 字符串。每行恰由 json.dumps(obj,ensure_ascii=True,
+    separators=(',',':'),allow_nan=False)+'\\n' 生成，各行直接拼接，
+    末行保留 LF。全部行先完整构造再返回，故失败时不产生任何部分输出，
+    不写文件。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    (vocab_a, W_a, b_a, Why_a, by_a, h0_a,
+     c0_a) = _load_perplexity_lstm_model(model_a_path)
+    (vocab_b, W_b, b_b, Why_b, by_b, h0_b,
+     c0_b) = _load_perplexity_lstm_model(model_b_path)
+    if vocab_a != vocab_b:
+        raise ValueError("the two models must have identical vocabs in the "
+                         "same order")
+    vocab = vocab_a
+    V = len(vocab)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    cell_a = LSTMCell(V, len(h0_a))
+    cell_a.W = [list(row) for row in W_a]
+    cell_a.b = list(b_a)
+    cell_b = LSTMCell(V, len(h0_b))
+    cell_b.W = [list(row) for row in W_b]
+    cell_b.b = list(b_b)
+
+    def _step_nll(cell, Why, by, h, c, memory, t):
+        """perplexity-lstm-attn 单步：推进状态并返回 (nll, h, c, memory)。"""
+        y = ids[t + 1]
+
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c = cell.forward(x, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        u = _attn_context(h, M)
+
+        z = _output_logits(Why, by, u)
+
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        d = 0.0
+        for k in range(V):
+            d += math.exp(z[k] - m)
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        nll = m + math.log(d) - z[y]
+        if not math.isfinite(nll):
+            raise ValueError("cross-entropy step is non-finite")
+
+        memory.append([float(v) for v in h])
+        return nll, h, c, memory
+
+    # 两轨各自从自身的 h0、c0、memory=[h0] 独立重置。
+    memory_a = [h0_a]
+    h_a = list(h0_a)
+    c_a = list(c0_a)
+    memory_b = [h0_b]
+    h_b = list(h0_b)
+    c_b = list(c0_b)
+    D = 0.0
+    T = len(ids) - 1
+    lines = []
+    for t in range(T):
+        nll_a, h_a, c_a, memory_a = _step_nll(
+            cell_a, Why_a, by_a, h_a, c_a, memory_a, t)
+        nll_b, h_b, c_b, memory_b = _step_nll(
+            cell_b, Why_b, by_b, h_b, c_b, memory_b, t)
+
+        delta = nll_b - nll_a
+        if not math.isfinite(delta):
+            raise ValueError("per-step delta is non-finite")
+        D += delta
+        if not math.isfinite(D):
+            raise ValueError("total delta accumulated non-finitely")
+
+        lines.append(json.dumps(
+            {
+                "t": t,
+                "target": corpus[t + 1],
+                "a_nll": format(nll_a, ".17g"),
+                "b_nll": format(nll_b, ".17g"),
+                "delta": format(delta, ".17g"),
+            },
+            ensure_ascii=True, separators=(",", ":"), allow_nan=False))
+
+    lines.append(json.dumps(
+        {
+            "steps": T,
+            "total_delta": format(D, ".17g"),
+        },
+        ensure_ascii=True, separators=(",", ":"), allow_nan=False))
+    return "".join(line + "\n" for line in lines)
+
+
 def _perplexity_lstm_attn_trace(model_path, corpus_path, window_text):
     """perplexity-lstm-attn 的逐步负对数似然轨迹，返回待写出的字符串。
 
@@ -5155,6 +5286,23 @@ def main(argv):
     生成的 UTF-8 字节组成，末行保留 LF；失败时不输出任何部分行，
     不写文件。
 
+    python seqmodel.py compare-lstm-attn MODEL_A MODEL_B CORPUS WINDOW：
+    MODEL_A、MODEL_B 各自沿用 perplexity-lstm-attn 的 version 2 八键、
+    F、形状与严格 UTF-8 契约，两者 vocab 须逐项同序相等，H 可不同；
+    CORPUS 沿用其严格 UTF-8、词表及至少 2 码点契约；WINDOW 沿用其
+    [1-9][0-9]* 词法及任意位数安全截取。两轨各从自身 h0、c0、
+    memory=[h0] 重置，状态推进、注意力、logit 与稳定 log-sum-exp 均沿
+    用 perplexity-lstm-attn。令 T=语料码点数-1，第 t 步两轨 NLL 依次为
+    a、b，d=b-a，total_delta 从 0.0 按 t 升序累加 d；任一计算非有限即
+    失败。stdout 先写 T 个 JSON 项行，键序
+    t,target,a_nll,b_nll,delta，值依次为 int t、下一单码点 str、
+    format(a,'.17g')、format(b,'.17g')、format(d,'.17g')；再写唯一汇总
+    行，键序 steps,total_delta，值依次为 int T 与
+    format(total_delta,'.17g')。每行恰由 json.dumps(obj,
+    ensure_ascii=True,separators=(',',':'),allow_nan=False)+'\\n'
+    生成的 UTF-8 字节组成，末行保留 LF；失败时不输出任何部分行，
+    不写文件。
+
     python seqmodel.py sample-attn MODEL START SEED TEMPERATURE LENGTH
     WINDOW：以同样的注意力上下文替换 logit 隐状态，softmax 与抽样契约
     与 sample 相同，整次仅初始化一次随机源、不写文件。WINDOW 整串匹配
@@ -5382,6 +5530,10 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 6 and argv[1] == "window-sensitivity-lstm-attn":
             output = _window_sensitivity_lstm_attn(
+                argv[2], argv[3], argv[4], argv[5])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 6 and argv[1] == "compare-lstm-attn":
+            output = _compare_lstm_attn(
                 argv[2], argv[3], argv[4], argv[5])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 5 and argv[1] == "lstm-attn-weights":
