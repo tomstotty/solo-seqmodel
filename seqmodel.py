@@ -1553,6 +1553,183 @@ def _train(model_path, corpus_path, out_path):
         f.write(text.encode("utf-8"))
 
 
+def _train_lstm(model_path, corpus_path, out_path):
+    """对 LSTM 模型做一次全语料 SGD 更新并把新模型写入 OUT。
+
+    MODEL、CORPUS 完全沿用 perplexity-lstm version 2 的八键、F、严格
+    UTF-8、形状、词表及语料至少 2 码点契约。置 h=h0、c=c0，t 升序：以
+    当前字符的 V 长 one-hot 为 x，调用装入 W、b 的 LSTMCell.forward
+    (x, h, c)，以返回的前两项更新 h、c 并缓存 cache；输出层 logit、
+    softmax、g=p-onehot(y)、dWhy += g⊗h、dby += g 与 dhs = Whyᵀg 的
+    公式与累加顺序完全沿用 train，仅隐状态换为 LSTM 的 h。随后调用
+    backward_sequence(dhs, caches) 取得整条序列的 dW、db。
+
+    依 dW、db、dWhy、dby 行序求全局范数，超过 5.0 即统一缩放至 5.0；四组
+    参数减去 0.1 倍梯度，h0、c0 不变。任一中间量或结果非有限均抛
+    ValueError。
+
+    OUT 复用 perplexity-lstm 模型的八个键、键序与形状（version 恰为
+    int 2），数组元素均转为 float；文件内容恰为 json.dumps(obj,
+    ensure_ascii=True, separators=(',', ':'), allow_nan=False) 的 UTF-8
+    编码再加一个 LF，负零保留为 -0.0。
+    """
+    vocab, W, b, Why, by, h0, c0 = _load_perplexity_lstm_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    T = len(ids) - 1
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    # t 升序以 (h0, c0) 为初态逐步前向，缓存每一步的隐状态与 cache。
+    hs = []
+    caches = []
+    h = list(h0)
+    c = list(c0)
+    for t in range(T):
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+        h, c, cache = cell.forward(x, h, c)
+        hs.append(h)
+        caches.append(cache)
+
+    dWhy = [[0.0] * H for _ in range(V)]
+    dby = [0.0] * V
+    dhs = [[0.0] * H for _ in range(T)]
+
+    for t in range(T):
+        n = hs[t]
+        y = ids[t + 1]
+
+        # logit：与 train 相同，自 float 偏置起依 j 升序累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(H):
+                acc += why_row[j] * n[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # softmax：m=max(z)，d 从 0.0 依 k 升序累加 exp(z_k-m)。
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            ev = math.exp(z[k] - m)
+            if not math.isfinite(ev):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ev
+            d += ev
+            if not math.isfinite(d):
+                raise ValueError("softmax denominator accumulated non-finitely")
+
+        # g = p - onehot(y)。
+        g = [0.0] * V
+        for k in range(V):
+            gk = e[k] / d
+            if k == y:
+                gk -= 1.0
+            if not math.isfinite(gk):
+                raise ValueError("output gradient became non-finite")
+            g[k] = gk
+
+        # 按 t 升序累加 dWhy += g⊗h、dby += g。
+        for k in range(V):
+            gk = g[k]
+            dby[k] += gk
+            if not math.isfinite(dby[k]):
+                raise ValueError("dby accumulated to a non-finite value")
+            dw_row = dWhy[k]
+            for j in range(H):
+                dw_row[j] += gk * n[j]
+                if not math.isfinite(dw_row[j]):
+                    raise ValueError("dWhy accumulated to a non-finite value")
+
+        # dhs = Whyᵀg：每个 j 独立以 0.0 起按 k 升序累加。
+        dh_row = dhs[t]
+        for j in range(H):
+            acc = 0.0
+            for k in range(V):
+                acc += Why[k][j] * g[k]
+                if not math.isfinite(acc):
+                    raise ValueError("dhs accumulated to a non-finite value")
+            dh_row[j] = acc
+
+    _dxs, _dh0, _dc0, dW, db = cell.backward_sequence(dhs, caches)
+
+    # 依 dW、db、dWhy、dby 行序累加平方和求全局范数。
+    sum_sq = 0.0
+    for group in (dW, db, dWhy, dby):
+        if type(group[0]) is list:
+            for row in group:
+                for v in row:
+                    if not math.isfinite(v):
+                        raise ValueError("gradient is non-finite")
+                    sum_sq += v * v
+                    if not math.isfinite(sum_sq):
+                        raise ValueError(
+                            "global norm accumulated to a non-finite value")
+        else:
+            for v in group:
+                if not math.isfinite(v):
+                    raise ValueError("gradient is non-finite")
+                sum_sq += v * v
+                if not math.isfinite(sum_sq):
+                    raise ValueError(
+                        "global norm accumulated to a non-finite value")
+
+    global_norm = math.sqrt(sum_sq)
+    scale = 5.0 / global_norm if global_norm > 5.0 else 1.0
+
+    # 四组参数减 0.1 倍（裁剪后的）梯度；h0、c0 不变。结果非有限即失败。
+    def _updated(old, grad):
+        value = float(old) - 0.1 * (grad * scale)
+        if not math.isfinite(value):
+            raise ValueError("updated parameter became non-finite")
+        return value
+
+    new_W = [[_updated(W[k][j], dW[k][j]) for j in range(V + H)]
+             for k in range(4 * H)]
+    new_b = [_updated(b[k], db[k]) for k in range(4 * H)]
+    new_Why = [[_updated(Why[k][j], dWhy[k][j]) for j in range(H)]
+               for k in range(V)]
+    new_by = [_updated(by[k], dby[k]) for k in range(V)]
+
+    obj = {
+        "version": 2,
+        "vocab": vocab,
+        "W": new_W,
+        "b": new_b,
+        "Why": new_Why,
+        "by": new_by,
+        "h0": [float(v) for v in h0],
+        "c0": [float(v) for v in c0],
+    }
+    text = json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+    with open(out_path, "wb") as f:
+        f.write(text.encode("utf-8"))
+
+
 _INT_RE = re.compile(r"\A(?:0|-?[1-9][0-9]*)\Z")
 _NONNEG_INT_RE = re.compile(r"\A(?:0|[1-9][0-9]*)\Z")
 _WINDOW_RE = re.compile(r"\A[1-9][0-9]*\Z")
@@ -2258,6 +2435,14 @@ def main(argv):
     LSTMCell.forward 逐步推进隐状态与细胞状态，logit 与 log-sum-exp 规则
     同 perplexity；输出契约与 perplexity 相同，不写任何文件。
 
+    python seqmodel.py train-lstm MODEL CORPUS OUT：对 version 2 的 LSTM
+    模型做一次全语料 SGD 并写出新模型。t 升序以 (h0, c0) 为初态调用装入
+    W、b 的 LSTMCell.forward 并缓存；输出层 g、dWhy、dby、dhs 沿用 train
+    的公式与累加顺序（隐状态换为 LSTM 的 h），再以 backward_sequence 取得
+    dW、db；梯度组序为 dW、db、dWhy、dby，全局范数、5.0 裁剪与 0.1 更新
+    规则同 train，仅更新 W、b、Why、by，h0、c0 不变。成功时 stdout 为空
+    并返回 0。
+
     python seqmodel.py sample MODEL START SEED TEMPERATURE LENGTH：成功时
     stdout 恰为 LENGTH 个采样码点的 UTF-8 编码再加一个 LF（LENGTH 为 0 时
     仅 LF），不写任何文件，返回 0。
@@ -2296,6 +2481,8 @@ def main(argv):
         elif len(argv) == 4 and argv[1] == "perplexity-lstm":
             output = _perplexity_lstm(argv[2], argv[3])
             sys.stdout.buffer.write(output.encode("ascii"))
+        elif len(argv) == 5 and argv[1] == "train-lstm":
+            _train_lstm(argv[2], argv[3], argv[4])
         elif len(argv) == 7 and argv[1] == "sample":
             output = _sample(argv[2], argv[3], argv[4], argv[5], argv[6])
             sys.stdout.buffer.write(output.encode("utf-8"))
