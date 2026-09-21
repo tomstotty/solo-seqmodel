@@ -1199,6 +1199,188 @@ def _perplexity(model_path, corpus_path):
     return format(perplexity, ".17g") + "\n"
 
 
+# LSTM 模型 JSON 顶层唯一允许的键及其出现顺序。
+_LSTM_MODEL_KEYS = ["version", "vocab", "W", "b", "Why", "by", "h0", "c0"]
+
+
+def _load_perplexity_lstm_model(path):
+    """读取并校验 perplexity-lstm 模型文件，返回解包后的七元组。
+
+    文件须为 UTF-8 编码的 JSON 对象，顶层键恰为
+    version、vocab、W、b、Why、by、h0、c0 且按此顺序出现（重复或多余
+    均非法）：version 的 type 恰为 int 且值为 2；vocab 为非空列表，每项
+    是恰含一个码点的 str，元素唯一且按码点严格升序；其余六项为 F 列表，
+    形状依次为 4H×(V+H)、4H、V×H、V、H、H，其中 V=len(vocab)、
+    H=len(h0)>0。任何读取、UTF-8、JSON 或校验失败均抛 ValueError
+    （或 OSError）。
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+    # 先按严格 UTF-8 解码，再交由 json 解析（object_pairs_hook 保留键序与
+    # 重复键，root 非对象时不会得到 (key, value) 二元组列表）。
+    text = raw.decode("utf-8")
+    pairs = json.loads(text, object_pairs_hook=list)
+    if type(pairs) is not list or len(pairs) != len(_LSTM_MODEL_KEYS):
+        raise ValueError("model must be a JSON object with exactly 8 keys")
+    for pair, key in zip(pairs, _LSTM_MODEL_KEYS):
+        if type(pair) is not tuple or len(pair) != 2 or pair[0] != key:
+            raise ValueError("model keys must be exactly %r in order"
+                             % _LSTM_MODEL_KEYS)
+    model = dict(pairs)
+
+    version = model["version"]
+    if type(version) is not int or version != 2:
+        raise ValueError("version must be exactly int 2, got %r" % (version,))
+
+    vocab = model["vocab"]
+    if type(vocab) is not list or len(vocab) == 0:
+        raise ValueError("vocab must be a non-empty list")
+    for ch in vocab:
+        # len(str) 按码点计数，组合字符序列等多码点串在此被拒。
+        if type(ch) is not str or len(ch) != 1:
+            raise ValueError("vocab entries must be single-codepoint strings, "
+                             "got %r" % (ch,))
+    if len(set(vocab)) != len(vocab) or vocab != sorted(vocab):
+        raise ValueError("vocab entries must be unique and sorted by codepoint")
+    V = len(vocab)
+
+    h0 = model["h0"]
+    if type(h0) is not list or len(h0) == 0:
+        raise ValueError("h0 must be a non-empty list")
+    H = len(h0)
+    for v in h0:
+        if not _is_f(v):
+            raise ValueError("h0 entries must be finite numbers, got %r" % (v,))
+
+    W = model["W"]
+    if type(W) is not list or len(W) != 4 * H:
+        raise ValueError("W must be a list of shape %d×%d" % (4 * H, V + H))
+    for row in W:
+        if type(row) is not list or len(row) != V + H:
+            raise ValueError("W must be a list of shape %d×%d" % (4 * H, V + H))
+        for v in row:
+            if not _is_f(v):
+                raise ValueError("W entries must be finite numbers, got %r"
+                                 % (v,))
+
+    b = model["b"]
+    if type(b) is not list or len(b) != 4 * H:
+        raise ValueError("b must be a list of length %d" % (4 * H))
+    for v in b:
+        if not _is_f(v):
+            raise ValueError("b entries must be finite numbers, got %r" % (v,))
+
+    Why = model["Why"]
+    if type(Why) is not list or len(Why) != V:
+        raise ValueError("Why must be a list of shape %d×H" % V)
+    for row in Why:
+        if type(row) is not list or len(row) != H:
+            raise ValueError("Why must be a list of shape %d×%d" % (V, H))
+        for v in row:
+            if not _is_f(v):
+                raise ValueError("Why entries must be finite numbers, got %r"
+                                 % (v,))
+
+    by = model["by"]
+    if type(by) is not list or len(by) != V:
+        raise ValueError("by must be a list of length %d" % V)
+    for v in by:
+        if not _is_f(v):
+            raise ValueError("by entries must be finite numbers, got %r" % (v,))
+
+    c0 = model["c0"]
+    if type(c0) is not list or len(c0) != H:
+        raise ValueError("c0 must be a list of length %d" % H)
+    for v in c0:
+        if not _is_f(v):
+            raise ValueError("c0 entries must be finite numbers, got %r" % (v,))
+
+    return vocab, W, b, Why, by, h0, c0
+
+
+def _perplexity_lstm(model_path, corpus_path):
+    """计算 LSTM 语言模型在给定语料上的困惑度，返回待写出的字符串。
+
+    语料按二进制读取后以严格 UTF-8 解码为全文码点序列（含换行，不做任何
+    换行符转换）；不足 2 个码点或出现 vocab 表外字符均失败。置 h=h0、
+    c=c0、L=0.0、T=len(CORPUS)-1，t 升序（x、y 为当前、下一字符索引）：
+    以当前字符的 V 长 one-hot 为输入，调用装入 W、b 的
+    LSTMCell.forward(x, h, c)，取返回前两项更新 h、c；随后按 perplexity
+    相同的下标、float 偏置与升序累加规则计算
+        z_k = by_k + Σ_j Why_k,j*h_j
+        m=max(z)，d 从 0.0 依 k 累加 exp(z_k-m)
+        L += m + log(d) - z_y
+    任一中间量非有限（含最终 exp(L/T) 溢出）均抛 ValueError。
+    成功返回 format(exp(L/T), '.17g') + '\\n'。
+    """
+    vocab, W, b, Why, by, h0, c0 = _load_perplexity_lstm_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    h = h0
+    c = c0
+    L = 0.0
+    T = len(ids) - 1
+    for t in range(T):
+        y = ids[t + 1]
+
+        # 当前字符的 V 长 one-hot 输入。
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c, _cache = cell.forward(x, h, c)
+
+        # z_k = by_k + Σ_j Why_k,j*h_j，依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(H):
+                acc += why_row[j] * h[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # log-sum-exp：m=max(z)，d 从 0.0 依 k 升序累加 exp(z_k-m)。
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        d = 0.0
+        for k in range(V):
+            d += math.exp(z[k] - m)
+            if not math.isfinite(d):
+                raise ValueError("softmax denominator accumulated non-finitely")
+
+        step = m + math.log(d) - z[y]
+        if not math.isfinite(step):
+            raise ValueError("cross-entropy step is non-finite")
+        L += step
+        if not math.isfinite(L):
+            raise ValueError("total cross-entropy accumulated non-finitely")
+
+    perplexity = math.exp(L / T)
+    if not math.isfinite(perplexity):
+        raise ValueError("perplexity is non-finite")
+    return format(perplexity, ".17g") + "\n"
+
+
 def _train(model_path, corpus_path, out_path):
     """对模型做一次全语料 SGD 更新并把新模型写入 OUT。
 
@@ -2098,6 +2280,10 @@ def main(argv):
     再以同一 RNN 前向缓存调用 VanillaRNN.backward，裁剪、更新与 train 相同，
     h0 不变。
 
+    python seqmodel.py perplexity-lstm MODEL CORPUS：以 LSTMCell 单步前向
+    （h、c 初值为模型的 h0、c0）替换 RNN 隐状态更新，logit、稳定 softmax
+    与交叉熵累加规则同 perplexity；输出契约与 perplexity 相同。
+
     参数数量、词法、文件读取、UTF-8/JSON 解析、模型/语料校验或非有限计算等
     任何失败均返回 2，stdout 为空，且 stderr 恰为 "error\\n"，不输出回溯。
     """
@@ -2117,6 +2303,9 @@ def main(argv):
         elif len(argv) == 5 and argv[1] == "perplexity-attn":
             output = _perplexity_attn(argv[2], argv[3], argv[4])
             sys.stdout.buffer.write(output.encode("ascii"))
+        elif len(argv) == 4 and argv[1] == "perplexity-lstm":
+            output = _perplexity_lstm(argv[2], argv[3])
+            sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 6 and argv[1] == "train-attn":
             _train_attn(argv[2], argv[3], argv[4], argv[5])
         elif len(argv) == 8 and argv[1] == "sample-attn":
@@ -2126,6 +2315,7 @@ def main(argv):
         else:
             raise ValueError(
                 "usage: seqmodel.py perplexity MODEL CORPUS | "
+                "seqmodel.py perplexity-lstm MODEL CORPUS | "
                 "seqmodel.py train MODEL CORPUS OUT | "
                 "seqmodel.py sample MODEL START SEED TEMPERATURE LENGTH | "
                 "seqmodel.py sample-anneal MODEL START SEED START_T END_T "
