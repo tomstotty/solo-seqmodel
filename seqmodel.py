@@ -3712,6 +3712,49 @@ def _beam_lstm_attn_topk_topp_nbest(model_path, start, start_t_text,
     return "\n".join(parts) + "\n"
 
 
+def _beam_lstm_attn_topk_topp_nbest_scored(
+        model_path, start, start_t_text, end_t_text, top_k_text, top_p_text,
+        beam_text, n_text, length_text, window_text):
+    """beam-lstm-attn-topk-topp-nbest-scored：输出前 N 个候选及累计分数。
+
+    除输出外，全部参数校验、逐轮搜索、候选裁剪、累计分数、索引元组决胜及
+    N 的超长十进制处理均严格沿用 beam-lstm-attn-topk-topp-nbest（进而沿用
+    beam-lstm-attn-topk-topp），无 SEED、无随机源且不写文件。
+
+    按最终束既有顺序取前 min(N, 束数) 项，每项独占一个 JSON 行，键序恰为
+    text,score：值分别为生成字符串与 format(score,'.17g') 字符串（负零恰
+    为 "-0"）。每行恰由
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n' 生成，各行直接拼接，末行保留 LF，不输出额外空
+    白。LENGTH 为 0 时最终仅初始束（文本为空串、分数 0.0），唯一一行恰为
+    '{"text":"","score":"0"}\\n'。
+    """
+    # N：整串匹配 [1-9][0-9]*（任意位数均合法，不预先转 int）。
+    if not _WINDOW_RE.match(n_text):
+        raise ValueError("N must match [1-9][0-9]*")
+
+    beams, _indices = _beam_lstm_attn_topk_topp_run(
+        model_path, start, start_t_text, end_t_text, top_k_text, top_p_text,
+        beam_text, length_text, window_text)
+
+    # 以十进制位数及同长度字典序与最终束数比较；仅当 N 较小时才转 int。
+    n_beams = len(beams)
+    limit_text = str(n_beams)
+    if len(n_text) < len(limit_text) or (
+            len(n_text) == len(limit_text) and n_text < limit_text):
+        keep = int(n_text)
+    else:
+        keep = n_beams
+
+    lines = []
+    for beam in beams[:keep]:
+        obj = {"text": beam[1], "score": format(beam[0], ".17g")}
+        lines.append(json.dumps(obj, ensure_ascii=True,
+                                separators=(",", ":"), allow_nan=False)
+                     + "\n")
+    return "".join(lines)
+
+
 def _train_attn(model_path, corpus_path, out_path, window_text):
     """带注意力上下文的一次全语料 SGD 更新并把新模型写入 OUT。
 
@@ -4096,6 +4139,16 @@ def main(argv):
     allow_nan=False)+'\\n' 序列化；各行直接拼接，末行保留 LF。LENGTH 为
     0 时最终仅初始束，故输出一个空字符串 JSON 行。
 
+    python seqmodel.py beam-lstm-attn-topk-topp-nbest-scored MODEL START
+    START_T END_T TOP_K TOP_P BEAM N LENGTH WINDOW：除输出外，全部校验、逐
+    轮搜索、候选裁剪、累计分数、索引元组决胜及 N 的超长十进制处理均沿用
+    beam-lstm-attn-topk-topp-nbest，无 SEED、无随机源且不写文件。按最终
+    束既有顺序取前 min(N, 束数) 项，每项一行 JSON 对象，键序恰为
+    text,score，score 为 format(score,'.17g') 字符串（负零为 "-0"）；每
+    行恰由 json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n' 生成，直接拼接且末行保留 LF。LENGTH 为 0 时唯
+    一一行恰为 '{"text":"","score":"0"}\\n'。
+
     python seqmodel.py train-attn MODEL CORPUS OUT WINDOW：前向严格复用
     perplexity-attn 的 n_t、M_t、u_t 与 logit 顺序；反向令
     g_t = p_t-onehot(y_t)，按 t 升序累加 dWhy、dby（以 u_t 为隐状态），
@@ -4179,6 +4232,12 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 12 and argv[1] == "beam-lstm-attn-topk-topp-nbest":
             output = _beam_lstm_attn_topk_topp_nbest(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                argv[8], argv[9], argv[10], argv[11])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif (len(argv) == 12 and argv[1]
+                == "beam-lstm-attn-topk-topp-nbest-scored"):
+            output = _beam_lstm_attn_topk_topp_nbest_scored(
                 argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
                 argv[8], argv[9], argv[10], argv[11])
             sys.stdout.buffer.write(output.encode("utf-8"))
