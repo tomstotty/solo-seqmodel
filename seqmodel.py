@@ -3449,10 +3449,10 @@ def _beam_lstm_attn(model_path, start, start_t_text, end_t_text,
     return beams[0][1] + "\n"
 
 
-def _beam_lstm_attn_topk_topp(model_path, start, start_t_text, end_t_text,
-                              top_k_text, top_p_text, beam_text, length_text,
-                              window_text):
-    """top-k 截断再 top-p 截取的确定性束搜索（带注意力上下文的 LSTM）。
+def _beam_lstm_attn_topk_topp_run(model_path, start, start_t_text, end_t_text,
+                                  top_k_text, top_p_text, beam_text,
+                                  length_text, window_text):
+    """top-k 截断再 top-p 截取的确定性束搜索核心，返回最终 (beams, indices)。
 
     除 TOP_K、TOP_P 及下述候选截取外，MODEL、START、LENGTH、WINDOW、LSTM
     状态、注意力记忆、Why/by logit、稳定 softmax、线性温度退火（LENGTH 为
@@ -3475,8 +3475,8 @@ def _beam_lstm_attn_topk_topp(model_path, start, start_t_text, end_t_text,
     a[k]-m-log(s)，文本追加 vocab[k]，置 x=k，memory 追加 h 的 float 副
     本。上述乘加、log 与分数非有限均抛 ValueError。全部子束按
     (-分数, 生成索引元组) 升序排列，保留前 min(BEAM, 候选数) 项；长度归
-    一化因子固定为 1。LENGTH 为 0 时仅输出 LF，否则输出最终首束文本加一
-    个 LF。相同输入输出逐字节相同。
+    一化因子固定为 1。搜索结束后返回 (beams, indices)：LENGTH 为 0 时仅
+    含初始束，beams[0][1] 为空串。相同输入结果逐字节确定。
     """
     if not _WINDOW_RE.match(window_text):
         raise ValueError("WINDOW must match [1-9][0-9]*")
@@ -3650,7 +3650,66 @@ def _beam_lstm_attn_topk_topp(model_path, start, start_t_text, end_t_text,
         beams = [children[i] for i in order[:keep]]
         indices = [child_indices[i] for i in order[:keep]]
 
+    return beams, indices
+
+
+def _beam_lstm_attn_topk_topp(model_path, start, start_t_text, end_t_text,
+                              top_k_text, top_p_text, beam_text, length_text,
+                              window_text):
+    """beam-lstm-attn-topk-topp：返回最终首束文本加一个 LF。
+
+    搜索过程（含全部校验、候选裁剪、累计分数与索引元组决胜）严格沿用
+    _beam_lstm_attn_topk_topp_run；LENGTH 为 0 时最终仅初始束，首束文本
+    为空串，故仅输出 LF。
+    """
+    beams, _indices = _beam_lstm_attn_topk_topp_run(
+        model_path, start, start_t_text, end_t_text, top_k_text, top_p_text,
+        beam_text, length_text, window_text)
     return beams[0][1] + "\n"
+
+
+def _beam_lstm_attn_topk_topp_nbest(model_path, start, start_t_text,
+                                    end_t_text, top_k_text, top_p_text,
+                                    beam_text, n_text, length_text,
+                                    window_text):
+    """beam-lstm-attn-topk-topp-nbest：输出最终束前 N 个候选（JSON 行）。
+
+    除 N 及输出外，全部参数校验与逐轮搜索行为严格沿用
+    beam-lstm-attn-topk-topp：候选裁剪、累计分数与索引元组决胜完全一致，
+    无 SEED、无随机源且不写文件。
+
+    N 整串匹配 [1-9][0-9]*（任意位数合法），否则抛 ValueError。最终束形
+    成后，先按十进制位数及同长度字典序比较 N 与最终束数：仅当 N 数学上
+    较小时才转 int 并取前 N 束（此时其位数不超过束数十进制位数，不触发
+    整数文本位数上限），否则取全部束；超长 N 文本不触发整数转换异常。
+
+    按最终束既有顺序，每个候选独占一个 JSON 行，其值仅为生成文本，恰以
+    json.dumps(text, ensure_ascii=True, separators=(',',':'),
+    allow_nan=False)+'\\n' 序列化；各行直接拼接，末行保留 LF。LENGTH 为 0
+    时最终仅初始束（文本为空串），故输出一个空字符串 JSON 行。
+    """
+    # N：整串匹配 [1-9][0-9]*（任意位数均合法，不预先转 int）。
+    if not _WINDOW_RE.match(n_text):
+        raise ValueError("N must match [1-9][0-9]*")
+
+    beams, _indices = _beam_lstm_attn_topk_topp_run(
+        model_path, start, start_t_text, end_t_text, top_k_text, top_p_text,
+        beam_text, length_text, window_text)
+
+    # 以十进制位数及同长度字典序与最终束数比较；仅当 N 较小时才转 int。
+    n_beams = len(beams)
+    limit_text = str(n_beams)
+    if len(n_text) < len(limit_text) or (
+            len(n_text) == len(limit_text) and n_text < limit_text):
+        keep = int(n_text)
+    else:
+        keep = n_beams
+
+    parts = []
+    for beam in beams[:keep]:
+        parts.append(json.dumps(beam[1], ensure_ascii=True,
+                                separators=(",", ":"), allow_nan=False))
+    return "\n".join(parts) + "\n"
 
 
 def _train_attn(model_path, corpus_path, out_path, window_text):
@@ -4025,6 +4084,18 @@ def main(argv):
     (-分数, 生成索引元组) 升序，保留前 min(BEAM, 候选数) 项。LENGTH 为
     0 时仅输出 LF，否则输出最终首束文本加 LF。
 
+    python seqmodel.py beam-lstm-attn-topk-topp-nbest MODEL START START_T
+    END_T TOP_K TOP_P BEAM N LENGTH WINDOW：除 N 及输出外，全部参数校验
+    与逐轮搜索行为严格沿用 beam-lstm-attn-topk-topp（候选裁剪、累计分数
+    与索引元组决胜一致），无 SEED、无随机源且不写文件。N 整串匹配
+    [1-9][0-9]*（任意位数合法）；最终束形成后，以十进制位数及同长字典
+    序比较 N 与最终束数，仅当 N 较小时才转 int 并取前 N 束，否则取全部，
+    超长 N 文本不得触发整数转换异常。按最终束既有顺序，每个候选独占一
+    个 JSON 行，其值仅为生成文本，恰用
+    json.dumps(text,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n' 序列化；各行直接拼接，末行保留 LF。LENGTH 为
+    0 时最终仅初始束，故输出一个空字符串 JSON 行。
+
     python seqmodel.py train-attn MODEL CORPUS OUT WINDOW：前向严格复用
     perplexity-attn 的 n_t、M_t、u_t 与 logit 顺序；反向令
     g_t = p_t-onehot(y_t)，按 t 升序累加 dWhy、dby（以 u_t 为隐状态），
@@ -4105,6 +4176,11 @@ def main(argv):
             output = _beam_lstm_attn_topk_topp(argv[2], argv[3], argv[4],
                                                argv[5], argv[6], argv[7],
                                                argv[8], argv[9], argv[10])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 12 and argv[1] == "beam-lstm-attn-topk-topp-nbest":
+            output = _beam_lstm_attn_topk_topp_nbest(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                argv[8], argv[9], argv[10], argv[11])
             sys.stdout.buffer.write(output.encode("utf-8"))
         else:
             raise ValueError(
