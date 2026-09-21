@@ -3315,10 +3315,16 @@ def _sample_lstm_attn_topk_scored(model_path, start, seed_text, start_t_text,
                       allow_nan=False) + "\n"
 
 
-def _sample_lstm_attn_topk_topp(model_path, start, seed_text, start_t_text,
-                                end_t_text, top_k_text, top_p_text,
-                                length_text, window_text):
-    """以线性退火温度、top-k 截断后再 top-p 截取、带注意力上下文采样。
+def _sample_lstm_attn_topk_topp_run(model_path, start, seed_text,
+                                    start_t_text, end_t_text, top_k_text,
+                                    top_p_text, length_text, window_text):
+    """sample-lstm-attn-top-k-top-p 与 -scored 共享的采样核心。
+
+    校验、状态推进、温度退火、top-k 截断后 top-p 前缀截取、随机源初始化
+    与消费、选索引规则及有限性失败契约均与 _sample_lstm_attn_topk_topp
+    文档一致。返回 (text, logprobs, total)：text 为生成字符串；logprobs
+    为每步选中索引 k 对应的 a[k]-m-log(s)（s 为最终前缀质量）；total 自
+    0.0 按 t 升序累加各 lp。任一 lp 或 total 非有限均抛 ValueError。
 
     除 TOP_K、TOP_P 及下述选样外，MODEL、START、SEED、LENGTH、WINDOW、
     LSTM 状态、注意力记忆、Why/by logit、稳定 softmax、线性温度退火
@@ -3339,7 +3345,7 @@ def _sample_lstm_attn_topk_topp(model_path, start, seed_text, start_t_text,
     u=r.random()*s，再按前缀序自 0.0 累加 e，选首个累计值严格大于 u 的
     索引；无则取前缀末项。其字符追加到输出并作为下一输入 x，随后向
     memory 追加 h 的 float 副本。任一新增乘法或累加非有限均抛
-    ValueError。成功返回 LENGTH 个码点再加一个 LF。
+    ValueError。
     """
     if not _WINDOW_RE.match(window_text):
         raise ValueError("WINDOW must match [1-9][0-9]*")
@@ -3413,6 +3419,8 @@ def _sample_lstm_attn_topk_topp(model_path, start, seed_text, start_t_text,
     c = list(c0)
     x = vocab.index(start)
     out = []
+    logprobs = []
+    total = 0.0
 
     for t in range(length):
         temperature = temperature_at(t)
@@ -3495,11 +3503,64 @@ def _sample_lstm_attn_topk_topp(model_path, start, seed_text, start_t_text,
                 chosen = idx
                 break
 
+        # 选中索引 k 后，以既有 a、m 与最终前缀质量 s 计算选中项对数概
+        # 率，total 自 0.0 按 t 升序累加；任一结果非有限即失败。
+        lp = a[chosen] - m - math.log(s)
+        if not math.isfinite(lp):
+            raise ValueError("selected log-prob became non-finite")
+        total += lp
+        if not math.isfinite(total):
+            raise ValueError("total log-prob accumulated non-finitely")
+        logprobs.append(lp)
+
         out.append(vocab[chosen])
         x = chosen
         memory.append([float(v) for v in h])
 
-    return "".join(out) + "\n"
+    return "".join(out), logprobs, total
+
+
+def _sample_lstm_attn_topk_topp(model_path, start, seed_text, start_t_text,
+                                end_t_text, top_k_text, top_p_text,
+                                length_text, window_text):
+    """sample-lstm-attn-top-k-top-p：成功返回 LENGTH 个码点再加一个 LF。
+
+    采样与校验全部沿用 _sample_lstm_attn_topk_topp_run，本包装仅取其生成
+    文本。
+    """
+    text, _logprobs, _total = _sample_lstm_attn_topk_topp_run(
+        model_path, start, seed_text, start_t_text, end_t_text, top_k_text,
+        top_p_text, length_text, window_text)
+    return text + "\n"
+
+
+def _sample_lstm_attn_topk_topp_scored(model_path, start, seed_text,
+                                       start_t_text, end_t_text, top_k_text,
+                                       top_p_text, length_text, window_text):
+    """sample-lstm-attn-top-k-top-p-scored：文本、逐步对数概率与累计值。
+
+    全部校验、状态推进、温度退火、top-k 截断后 top-p 前缀截取、随机源初
+    始化与消费、选索引规则及错误协议均沿用 sample-lstm-attn-top-k-top-p；
+    同参须消费相同随机序列并生成与原入口一致的 text。每步选中索引 k 后，
+    以既有 a、m 和最终前缀质量 s 计算 lp=a[k]-m-log(s)；total 从 0.0 按
+    t 升序累加 lp，任一结果非有限即失败。stdout 恰为单个 JSON 对象加
+    LF，键序 text,logprobs,total_logprob；text 为生成字符串（不含尾随
+    LF），logprobs 为 LENGTH 长字符串列表、第 t 项为
+    format(lp,'.17g')，total_logprob 为 format(total,'.17g')；LENGTH 为
+    0 时三值依次为 ""、[]、"0"。序列化恰用
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n'。不写文件。
+    """
+    text, logprobs, total = _sample_lstm_attn_topk_topp_run(
+        model_path, start, seed_text, start_t_text, end_t_text, top_k_text,
+        top_p_text, length_text, window_text)
+    obj = {
+        "text": text,
+        "logprobs": [format(lp, ".17g") for lp in logprobs],
+        "total_logprob": format(total, ".17g"),
+    }
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
 
 
 def _beam_lstm_attn(model_path, start, start_t_text, end_t_text,
@@ -4566,6 +4627,20 @@ def main(argv):
     引，无则取前缀末项，其字符作为下一输入；任一新增乘法或累加非有限
     即失败；输出契约与 sample 相同，不写文件。
 
+    python seqmodel.py sample-lstm-attn-top-k-top-p-scored MODEL START
+    SEED START_T END_T TOP_K TOP_P LENGTH WINDOW：全部校验、状态推进、
+    温度退火、top-k 后 top-p 截取、随机消费及错误协议均沿用
+    sample-lstm-attn-top-k-top-p；同参须消费相同随机序列并生成与原入
+    口一致的 text。每步选中索引 k 后，以既有 a、m 和最终前缀质量 s 计
+    算 lp=a[k]-m-log(s)；total 从 0.0 按 t 升序累加 lp，任一结果非有
+    限即失败。stdout 恰为单个 JSON 对象加 LF，键序
+    text,logprobs,total_logprob；text 为生成字符串（不含 LF），
+    logprobs 为 LENGTH 长字符串列表、第 t 项为 format(lp,'.17g')，
+    total_logprob 为 format(total,'.17g')；LENGTH 为 0 时三值依次为
+    ""、[]、"0"。序列化恰用 json.dumps(obj,ensure_ascii=True,
+    separators=(',',':'),allow_nan=False)+'\\n' 的 UTF-8 字节。返回
+    码、stderr 及不写文件行为均沿用原入口。
+
     python seqmodel.py beam-lstm-attn MODEL START START_T END_T BEAM LENGTH
     WINDOW：以线性退火温度、带注意力上下文从 version 2 的 LSTM 模型做确定
     性束搜索。除 BEAM 与确定性选束外，参数校验、LENGTH 的 0/1 语义、线性
@@ -4717,6 +4792,12 @@ def main(argv):
             output = _sample_lstm_attn_topk_topp(argv[2], argv[3], argv[4],
                                                  argv[5], argv[6], argv[7],
                                                  argv[8], argv[9], argv[10])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif (len(argv) == 11
+              and argv[1] == "sample-lstm-attn-top-k-top-p-scored"):
+            output = _sample_lstm_attn_topk_topp_scored(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                argv[8], argv[9], argv[10])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 9 and argv[1] == "beam-lstm-attn":
             output = _beam_lstm_attn(argv[2], argv[3], argv[4], argv[5],
