@@ -12,6 +12,7 @@ TypeError。
 
 import json
 import math
+import os
 import random
 import re
 import sys
@@ -2775,6 +2776,179 @@ def _compare_lstm_attn(model_a_path, model_b_path, corpus_path,
     return "".join(line + "\n" for line in lines)
 
 
+def _compare_suite(model_a_path, model_b_path, list_path):
+    """两模型在一组 (语料, 窗口) 上的逐步负对数似然之差（B 减 A）汇总。
+
+    MODEL_A、MODEL_B 的读取、vocab 逐项同序相等（H 可不同）契约，以及每
+    项的两轨独立状态重置与逐步 NLL 计算，完全沿用 compare-lstm-attn。
+
+    LIST 为严格 UTF-8 的 JSON 非空数组，每项恰为两个 str 组成的数组
+    [corpus, window]：corpus 须为非空相对路径，按 LIST 文件的父目录解析；
+    window 须整串匹配 [1-9][0-9]*（任意位数均合法，不转 int，安全截取沿
+    用 perplexity-lstm-attn）；重复项按序保留，否则抛 ValueError。
+
+    每项令 D=0.0，按 t 升序累加 b_nll-a_nll（任一计算非有限即抛
+    ValueError）；D 为正、负、零时该项 winner 依次为 "A"、"B"、"tie"。
+    G=0.0 并按清单项序累加各项 D，累加结果非有限即抛 ValueError。
+
+    stdout 恰为单个 JSON 对象加 LF，顶层键序恰为 items,summary。items 按
+    清单序，每项恰为 [corpus,window,steps,format(D,'.17g'),winner]：
+    corpus、window 为清单原文 str，steps 为 int T，winner 为上述 str。
+    summary 恰为 [groups,a_wins,b_wins,ties,format(G,'.17g'),winner]：
+    前四项为 int（groups 为清单项数，a_wins、b_wins、ties 为对应 winner
+    的项数），末项 winner 按 G 的正、负、零同样取 "A"、"B"、"tie"。
+    序列化恰用 json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n'。整个对象先完整构造再返回，故失败时不产生
+    任何部分输出，不写文件。
+    """
+    with open(list_path, "rb") as f:
+        suite = json.loads(f.read().decode("utf-8"))
+    if not isinstance(suite, list) or not suite:
+        raise ValueError("LIST must be a non-empty JSON array")
+    entries = []
+    for item in suite:
+        if (not isinstance(item, list) or len(item) != 2
+                or not isinstance(item[0], str)
+                or not isinstance(item[1], str)):
+            raise ValueError("each LIST item must be a [corpus, window] "
+                             "pair of strings")
+        corpus_text, window_text = item
+        if not corpus_text or os.path.isabs(corpus_text):
+            raise ValueError("each corpus must be a non-empty relative path")
+        if not _WINDOW_RE.match(window_text):
+            raise ValueError("each window must match [1-9][0-9]*")
+        entries.append((corpus_text, window_text))
+
+    (vocab_a, W_a, b_a, Why_a, by_a, h0_a,
+     c0_a) = _load_perplexity_lstm_model(model_a_path)
+    (vocab_b, W_b, b_b, Why_b, by_b, h0_b,
+     c0_b) = _load_perplexity_lstm_model(model_b_path)
+    if vocab_a != vocab_b:
+        raise ValueError("the two models must have identical vocabs in the "
+                         "same order")
+    vocab = vocab_a
+    V = len(vocab)
+    table = {ch: i for i, ch in enumerate(vocab)}
+
+    cell_a = LSTMCell(V, len(h0_a))
+    cell_a.W = [list(row) for row in W_a]
+    cell_a.b = list(b_a)
+    cell_b = LSTMCell(V, len(h0_b))
+    cell_b.W = [list(row) for row in W_b]
+    cell_b.b = list(b_b)
+
+    base_dir = os.path.dirname(list_path)
+
+    def _step_nll(cell, Why, by, h, c, memory, ids, t, window_text):
+        """perplexity-lstm-attn 单步：推进状态并返回 (nll, h, c, memory)。"""
+        y = ids[t + 1]
+
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c = cell.forward(x, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        u = _attn_context(h, M)
+
+        z = _output_logits(Why, by, u)
+
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        d = 0.0
+        for k in range(V):
+            d += math.exp(z[k] - m)
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        nll = m + math.log(d) - z[y]
+        if not math.isfinite(nll):
+            raise ValueError("cross-entropy step is non-finite")
+
+        memory.append([float(v) for v in h])
+        return nll, h, c, memory
+
+    items = []
+    a_wins = 0
+    b_wins = 0
+    ties = 0
+    G = 0.0
+    for corpus_text, window_text in entries:
+        corpus_path = os.path.join(base_dir, corpus_text)
+        with open(corpus_path, "rb") as f:
+            corpus = f.read().decode("utf-8")
+        if len(corpus) < 2:
+            raise ValueError("corpus must contain at least 2 codepoints")
+
+        ids = [0] * len(corpus)
+        for t, ch in enumerate(corpus):
+            ix = table.get(ch)
+            if ix is None:
+                raise ValueError(
+                    "corpus contains an out-of-vocab character")
+            ids[t] = ix
+
+        T = len(ids) - 1
+
+        # 两轨各自从自身的 h0、c0、memory=[h0] 独立重置。
+        memory_a = [h0_a]
+        h_a = list(h0_a)
+        c_a = list(c0_a)
+        memory_b = [h0_b]
+        h_b = list(h0_b)
+        c_b = list(c0_b)
+        D = 0.0
+        for t in range(T):
+            nll_a, h_a, c_a, memory_a = _step_nll(
+                cell_a, Why_a, by_a, h_a, c_a, memory_a, ids, t,
+                window_text)
+            nll_b, h_b, c_b, memory_b = _step_nll(
+                cell_b, Why_b, by_b, h_b, c_b, memory_b, ids, t,
+                window_text)
+
+            delta = nll_b - nll_a
+            if not math.isfinite(delta):
+                raise ValueError("per-step delta is non-finite")
+            D += delta
+            if not math.isfinite(D):
+                raise ValueError("total delta accumulated non-finitely")
+
+        if D > 0:
+            winner = "A"
+            a_wins += 1
+        elif D < 0:
+            winner = "B"
+            b_wins += 1
+        else:
+            winner = "tie"
+            ties += 1
+
+        G += D
+        if not math.isfinite(G):
+            raise ValueError("grand total accumulated non-finitely")
+
+        items.append([corpus_text, window_text, T, format(D, ".17g"),
+                      winner])
+
+    if G > 0:
+        suite_winner = "A"
+    elif G < 0:
+        suite_winner = "B"
+    else:
+        suite_winner = "tie"
+
+    obj = {
+        "items": items,
+        "summary": [len(entries), a_wins, b_wins, ties,
+                    format(G, ".17g"), suite_winner],
+    }
+    return (json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                       allow_nan=False)
+            + "\n")
+
+
 def _perplexity_lstm_attn_trace(model_path, corpus_path, window_text):
     """perplexity-lstm-attn 的逐步负对数似然轨迹，返回待写出的字符串。
 
@@ -5303,6 +5477,20 @@ def main(argv):
     生成的 UTF-8 字节组成，末行保留 LF；失败时不输出任何部分行，
     不写文件。
 
+    python seqmodel.py compare-suite MODEL_A MODEL_B LIST：MODEL_A、
+    MODEL_B 的契约及每项的两轨独立重置与逐步 NLL 计算均沿用
+    compare-lstm-attn。LIST 为严格 UTF-8 的 JSON 非空数组，每项恰为
+    [corpus,window] 两个 str：corpus 为非空相对路径并按 LIST 父目录
+    解析，window 整串匹配 [1-9][0-9]*（任意位数安全处理），重复项按
+    序保留。每项令 D=0.0 按 t 升序累加 b_nll-a_nll，D 正/负/零时
+    winner 为 A/B/tie；G=0.0 按项序累加 D，非有限即失败。stdout 恰为
+    单个 JSON 对象加 LF，键序 items,summary：items 按清单序，每项为
+    [corpus,window,steps,format(D,'.17g'),winner]（steps 为 int）；
+    summary 为 [groups,a_wins,b_wins,ties,format(G,'.17g'),winner]
+    （前四项为 int，winner 按 G 同规则）。序列化恰用
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n'；失败时不输出任何部分行，不写文件。
+
     python seqmodel.py sample-attn MODEL START SEED TEMPERATURE LENGTH
     WINDOW：以同样的注意力上下文替换 logit 隐状态，softmax 与抽样契约
     与 sample 相同，整次仅初始化一次随机源、不写文件。WINDOW 整串匹配
@@ -5535,6 +5723,9 @@ def main(argv):
         elif len(argv) == 6 and argv[1] == "compare-lstm-attn":
             output = _compare_lstm_attn(
                 argv[2], argv[3], argv[4], argv[5])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 5 and argv[1] == "compare-suite":
+            output = _compare_suite(argv[2], argv[3], argv[4])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 5 and argv[1] == "lstm-attn-weights":
             output = _lstm_attn_weights(argv[2], argv[3], argv[4])
