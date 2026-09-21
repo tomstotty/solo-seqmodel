@@ -2576,6 +2576,90 @@ def _lstm_attn_weights(model_path, corpus_path, window_text):
                       allow_nan=False) + "\n"
 
 
+def _lstm_attn_entropy(model_path, corpus_path, window_text):
+    """perplexity-lstm-attn 每步注意力权重的平均熵，返回待写出的字符串。
+
+    MODEL、CORPUS、WINDOW 的校验、状态推进（h、c 与 memory）与 M 截取
+    完全沿用 _lstm_attn_weights，但不计算输出层与负对数似然（它们不影响
+    状态）。令 T=语料码点数-1、E=0.0；t 升序先以当前字符 one-hot 调用
+    LSTMCell.forward 更新 h、c，M 取 memory 末尾至多 WINDOW 项（从旧到
+    新），在向 memory 追加 h 前以 attention([h], M, M, None) 取 w[0]；
+    第 t 步令 e=0.0，按 j 升序累加 e-=w[j]*log(w[j])（w[j] 恰为 0.0 时
+    贡献 0.0，不取对数），再令 E+=e。任一 log、乘加或 E/T 非有限均抛
+    ValueError。构造 JSON 对象：顶层键序恰为 version,steps,mean_entropy，
+    值依次为 int 1、int T、format(E/T,'.17g') 字符串。返回
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n'，不写文件。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    vocab, W, b, Why, by, h0, c0 = _load_perplexity_lstm_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    memory = [h0]
+    h = list(h0)
+    c = list(c0)
+    T = len(ids) - 1
+    E = 0.0
+    for t in range(T):
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c = cell.forward(x, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        _ctx, w = attention([h], M, M, None)
+
+        # 第 t 步熵：e 自 0.0 起按 j 升序累加 -w[j]*log(w[j])；
+        # w[j] 恰为 0.0 时贡献 0.0（不取对数）。
+        e = 0.0
+        for wj in w[0]:
+            if wj != 0.0:
+                lj = math.log(wj)
+                if not math.isfinite(lj):
+                    raise ValueError("entropy log became non-finite")
+                e -= wj * lj
+                if not math.isfinite(e):
+                    raise ValueError(
+                        "entropy accumulated to a non-finite value")
+        E += e
+        if not math.isfinite(E):
+            raise ValueError("total entropy accumulated to a non-finite value")
+
+        memory.append([float(v) for v in h])
+
+    mean = E / T
+    if not math.isfinite(mean):
+        raise ValueError("mean entropy is non-finite")
+
+    obj = {
+        "version": 1,
+        "steps": T,
+        "mean_entropy": format(mean, ".17g"),
+    }
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+
+
 def _sample_attn(model_path, start, seed_text, temperature_text, length_text,
                  window_text):
     """带注意力上下文从 RNN 语言模型采样 LENGTH 个码点，返回待写出的字符串。
@@ -4822,6 +4906,9 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 5 and argv[1] == "lstm-attn-weights":
             output = _lstm_attn_weights(argv[2], argv[3], argv[4])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 5 and argv[1] == "lstm-attn-entropy":
+            output = _lstm_attn_entropy(argv[2], argv[3], argv[4])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 6 and argv[1] == "train-attn":
             _train_attn(argv[2], argv[3], argv[4], argv[5])
