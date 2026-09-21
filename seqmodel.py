@@ -2635,6 +2635,142 @@ def _sample_lstm_attn(model_path, start, seed_text, temperature_text,
     return "".join(out) + "\n"
 
 
+def _sample_lstm_attn_anneal(model_path, start, seed_text, start_t_text,
+                             end_t_text, length_text, window_text):
+    """以线性退火温度带注意力上下文从 LSTM 语言模型采样 LENGTH 个码点。
+
+    MODEL、START、SEED、LENGTH、WINDOW 的词法与校验、LSTM 状态推进、
+    memory 记忆与窗口截取、attention 上下文、Why/by logit、稳定 softmax、
+    随机阈值与词表升序抽样规则均逐项沿用 _sample_lstm_attn；仅以退火温度
+    替换原固定温度，退火规则同 _sample_lstm_anneal。START_T、END_T 各经
+    float() 解析，结果须有限且严格大于 0，否则抛 ValueError。整次调用仅
+    初始化一次 r=random.Random(int(SEED))，不写任何文件。
+
+    LENGTH 为 0 时不计算温度，仅输出 LF；为 1 时仅用 START_T；否则 t 自 0
+    升序，第 t 步温度严格按 Python 表达式
+    START_T+(END_T-START_T)*t/(LENGTH-1) 求值，结果非有限或不大于 0 即抛
+    ValueError。每步沿用同一 h、c、x 与 memory，生成后令 x=k 并向 memory
+    追加 h 的 float 副本。任一中间量非有限均抛 ValueError。成功返回 LENGTH
+    个码点再加一个 LF。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    vocab, W, b, Why, by, h0, c0 = _load_perplexity_lstm_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # START_T、END_T：float() 可解析且有限、严格大于 0。
+    start_t = float(start_t_text)
+    if not math.isfinite(start_t) or start_t <= 0.0:
+        raise ValueError("START_T must be a finite positive float")
+    end_t = float(end_t_text)
+    if not math.isfinite(end_t) or end_t <= 0.0:
+        raise ValueError("END_T must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    if length == 1:
+        # 仅用 START_T，不求值退火表达式。
+        def temperature_at(t):
+            return start_t
+    elif length >= 2:
+        def temperature_at(t):
+            # 严格按 START_T+(END_T-START_T)*t/(LENGTH-1) 的运算顺序求值。
+            temp = start_t + (end_t - start_t) * t / (length - 1)
+            if not math.isfinite(temp) or temp <= 0.0:
+                raise ValueError(
+                    "annealed temperature became non-finite or non-positive")
+            return temp
+    else:
+        temperature_at = None  # LENGTH 为 0：循环不执行，不计算温度。
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    rng = random.Random(seed)
+    # 与 _sample_lstm_attn 相同：h0 保留模型原值，attention 不修改其
+    # 输入，故直接共享行即可。
+    memory = [h0]
+    h = list(h0)
+    c = list(c0)
+    x = vocab.index(start)
+    out = []
+
+    for t in range(length):
+        temperature = temperature_at(t)
+        # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+        xvec = [0.0] * V
+        xvec[x] = 1.0
+        h, c = cell.forward(xvec, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        u = _attn_context(h, M)
+
+        # logit 仅以 u 替代 h；下标与累加顺序同 _sample_lstm。
+        z = _output_logits(Why, by, u)
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # u=r.random()*d；自 0.0 依 k 升序累加 e_k，选首个累计值严格大于
+        # u 者；无则取词表末项。
+        threshold = rng.random() * d
+        if not math.isfinite(threshold):
+            raise ValueError("sample threshold became non-finite")
+        chosen = V - 1
+        cum = 0.0
+        for k in range(V):
+            cum += e[k]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > threshold:
+                chosen = k
+                break
+
+        out.append(vocab[chosen])
+        x = chosen
+        memory.append([float(v) for v in h])
+
+    return "".join(out) + "\n"
+
+
 def _train_attn(model_path, corpus_path, out_path, window_text):
     """带注意力上下文的一次全语料 SGD 更新并把新模型写入 OUT。
 
@@ -2928,6 +3064,16 @@ def main(argv):
     h 与首行上下文之和 u 替代 h 计算 logit 并抽样，随后向 memory 追加
     h 的 float 副本；输出契约与 sample 相同，不写文件。
 
+    python seqmodel.py sample-lstm-attn-anneal MODEL START SEED START_T
+    END_T LENGTH WINDOW：除温度外，MODEL、START、SEED、LENGTH、WINDOW、
+    LSTM 状态、注意力记忆、Why/by logit、稳定 softmax 与词表升序阈值抽样
+    均沿用 sample-lstm-attn；START_T、END_T 经 float() 解析且有限、严格
+    大于 0。整次仅初始化一次随机源。LENGTH 为 0 时不求温度且仅输出 LF，
+    为 1 时仅用 START_T，否则第 t 步温度严格按
+    START_T+(END_T-START_T)*t/(LENGTH-1) 求值，每步须有限且大于 0。每步
+    以该温度替换固定温度，沿用同一 h、c、x 与 memory，生成后更新 x 并追加
+    h 的 float 副本；输出契约与 sample 相同，不写文件。
+
     python seqmodel.py train-attn MODEL CORPUS OUT WINDOW：前向严格复用
     perplexity-attn 的 n_t、M_t、u_t 与 logit 顺序；反向令
     g_t = p_t-onehot(y_t)，按 t 升序累加 dWhy、dby（以 u_t 为隐状态），
@@ -2963,6 +3109,11 @@ def main(argv):
         elif len(argv) == 8 and argv[1] == "sample-lstm-anneal":
             output = _sample_lstm_anneal(argv[2], argv[3], argv[4], argv[5],
                                          argv[6], argv[7])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 9 and argv[1] == "sample-lstm-attn-anneal":
+            output = _sample_lstm_attn_anneal(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                argv[8])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 5 and argv[1] == "perplexity-attn":
             output = _perplexity_attn(argv[2], argv[3], argv[4])
