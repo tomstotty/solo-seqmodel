@@ -3653,6 +3653,219 @@ def _beam_lstm_attn_topk_topp(model_path, start, start_t_text, end_t_text,
     return beams[0][1] + "\n"
 
 
+def _beam_lstm_attn_topk_topp_nbest(model_path, start, start_t_text,
+                                    end_t_text, top_k_text, top_p_text,
+                                    beam_text, n_text, length_text,
+                                    window_text):
+    """beam-lstm-attn-topk-topp 的 n-best 版本：逐轮行为完全一致，输出前 N 束。
+
+    除 N 及最终输出外，MODEL、START、START_T、END_T、TOP_K、TOP_P、BEAM、
+    LENGTH、WINDOW 的全部校验与逐轮候选裁剪、累计分数及 (-分数, 生成索引
+    元组) 决胜均严格沿用 _beam_lstm_attn_topk_topp；本命令同样无 SEED、无
+    随机源且不写任何文件。
+
+    N 整串匹配 [1-9][0-9]*，任意位数合法。最终束形成后，以十进制位数及同
+    长字典序把 N 与最终束数比较：仅当 N 较小时才转 int 并取前 N 束，否则
+    取全部束，超长 N 文本不得触发整数转换异常。按最终束既有顺序，每个候
+    选独占一个 JSON 行，其值仅为生成文本，恰以
+    json.dumps(text, ensure_ascii=True, separators=(',', ':'),
+    allow_nan=False)+'\\n' 序列化；各行直接拼接，末行保留 LF。LENGTH 为 0
+    时最终仅初始束，故输出一个空字符串 JSON 行（'\"\"\\n'）。相同输入输出
+    逐字节相同。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    # BEAM：整串匹配 [1-9][0-9]*（任意位数均合法，不预先转 int）。
+    if not _WINDOW_RE.match(beam_text):
+        raise ValueError("BEAM must match [1-9][0-9]*")
+
+    # N：整串匹配 [1-9][0-9]*（任意位数均合法，不预先转 int）。
+    if not _WINDOW_RE.match(n_text):
+        raise ValueError("N must match [1-9][0-9]*")
+
+    vocab, W, b, Why, by, h0, c0 = _load_perplexity_lstm_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # START_T、END_T：float() 可解析且有限、严格大于 0。
+    start_t = float(start_t_text)
+    if not math.isfinite(start_t) or start_t <= 0.0:
+        raise ValueError("START_T must be a finite positive float")
+    end_t = float(end_t_text)
+    if not math.isfinite(end_t) or end_t <= 0.0:
+        raise ValueError("END_T must be a finite positive float")
+
+    # TOP_K：整串匹配 [1-9][0-9]*，且 K<=V。先以十进制位数、同位数字典序
+    # 与 str(V) 比较，越界即失败；仅通过后才 int()，任何长度文本都不会触发
+    # 整数转换异常（str(V) 受内存约束而位数有界）。
+    if not _WINDOW_RE.match(top_k_text):
+        raise ValueError("TOP_K must match [1-9][0-9]*")
+    v_text = str(V)
+    if len(top_k_text) > len(v_text) or (
+            len(top_k_text) == len(v_text) and top_k_text > v_text):
+        raise ValueError("TOP_K must not exceed len(vocab)")
+    top_k = int(top_k_text)
+
+    # TOP_P：float() 可解析且有限，0<TOP_P<=1。
+    top_p = float(top_p_text)
+    if not math.isfinite(top_p) or top_p <= 0.0 or top_p > 1.0:
+        raise ValueError("TOP_P must be a finite float with 0<TOP_P<=1")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    if length == 1:
+        # 仅用 START_T，不求值退火表达式。
+        def temperature_at(t):
+            return start_t
+    elif length >= 2:
+        def temperature_at(t):
+            # 严格按 START_T+(END_T-START_T)*t/(LENGTH-1) 的运算顺序求值。
+            temp = start_t + (end_t - start_t) * t / (length - 1)
+            if not math.isfinite(temp) or temp <= 0.0:
+                raise ValueError(
+                    "annealed temperature became non-finite or non-positive")
+            return temp
+    else:
+        temperature_at = None  # LENGTH 为 0：循环不执行，不计算温度。
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    # 初始束 (0.0, "", h0, c0, START 索引, [h0])；h0 保留模型原值，
+    # attention 与 LSTMCell.forward 均不修改其输入，故可直接共享。indices
+    # 为与各束并行的生成索引元组（仅用于排序的确定性决胜）。
+    beams = [(0.0, "", h0, c0, vocab.index(start), [h0])]
+    indices = [()]
+
+    for t in range(length):
+        temperature = temperature_at(t)
+        children = []
+        child_indices = []
+        for bi in range(len(beams)):
+            score, text, h, c, x, memory = beams[bi]
+
+            # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+            xvec = [0.0] * V
+            xvec[x] = 1.0
+            nh, nc = cell.forward(xvec, h, c)[:2]
+
+            M = _window_tail(memory, window_text)
+            u = _attn_context(nh, M)
+
+            # logit 仅以 u 替代 h；下标与累加顺序同 _sample_lstm。
+            z = _output_logits(Why, by, u)
+
+            # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)（求值顺序同
+            # _beam_lstm_attn）。
+            a = [0.0] * V
+            m = None
+            for k in range(V):
+                ak = z[k] / temperature
+                if not math.isfinite(ak):
+                    raise ValueError("scaled logit became non-finite")
+                a[k] = ak
+                if m is None or ak > m:
+                    m = ak
+            e = [0.0] * V
+            for k in range(V):
+                try:
+                    ek = math.exp(a[k] - m)
+                except OverflowError:
+                    raise ValueError("softmax exp overflowed")
+                if not math.isfinite(ek):
+                    raise ValueError("softmax exp became non-finite")
+                e[k] = ek
+
+            # 索引按 (-e_k, k) 升序：e 降序、并列时 k 升序；取前 K 项。
+            order = sorted(range(V), key=lambda k: (-e[k], k))
+            candidates = order[:top_k]
+
+            # sK 自 0.0 按候选序累加 e；target=TOP_P*sK 须有限。
+            s_k = 0.0
+            for idx in candidates:
+                s_k += e[idx]
+                if not math.isfinite(s_k):
+                    raise ValueError("top-k mass accumulated non-finitely")
+            target = top_p * s_k
+            if not math.isfinite(target):
+                raise ValueError("top-p target became non-finite")
+
+            # 再从 0.0 按候选序累加 e，取累计值首次 >=target 的最短前缀；
+            # s 为其累计和。因累加顺序相同，末项累计恰为 sK>=target，前缀
+            # 必存在。
+            prefix = []
+            s = 0.0
+            for idx in candidates:
+                prefix.append(idx)
+                s += e[idx]
+                if not math.isfinite(s):
+                    raise ValueError("top-p prefix accumulated non-finitely")
+                if s >= target:
+                    break
+
+            ls = math.log(s)
+            if not math.isfinite(ls):
+                raise ValueError("log top-p mass became non-finite")
+
+            # 仅为前缀中每个 k 生成子束；子束共享父束推进后的 nh、nc 与追
+            # 加后的 memory（均不被修改），其余更新沿用 _beam_lstm_attn。
+            new_memory = memory + [[float(v) for v in nh]]
+            base_idx = indices[bi]
+            for k in prefix:
+                step = a[k] - m - ls
+                if not math.isfinite(step):
+                    raise ValueError("beam score step became non-finite")
+                child_score = score + step
+                if not math.isfinite(child_score):
+                    raise ValueError("beam score became non-finite")
+                children.append((child_score, text + vocab[k], nh, nc, k,
+                                 new_memory))
+                child_indices.append(base_idx + (k,))
+
+        # 全部子束按 (-分数, 生成索引元组) 升序；同轮等长，使用原始累计
+        # 分数（长度归一化因子固定为 1）。
+        order = sorted(range(len(children)),
+                       key=lambda i: (-children[i][0], child_indices[i]))
+
+        # 仅当 BEAM 的数学值小于候选数时转 int（位数不超过 str(候选数)，
+        # 不触发整数文本位数上限），否则保留全部候选。
+        n_candidates = len(children)
+        limit_text = str(n_candidates)
+        if len(beam_text) < len(limit_text) or (
+                len(beam_text) == len(limit_text)
+                and beam_text < limit_text):
+            keep = int(beam_text)
+        else:
+            keep = n_candidates
+        beams = [children[i] for i in order[:keep]]
+        indices = [child_indices[i] for i in order[:keep]]
+
+    # 最终束已按既有顺序排列。以十进制位数及同长字典序比较 N 与束数：仅
+    # 当 N 较小时才转 int 取前 N 束，否则取全部；超长 N 不触发整数转换。
+    final_count = len(beams)
+    final_text = str(final_count)
+    if len(n_text) < len(final_text) or (
+            len(n_text) == len(final_text) and n_text < final_text):
+        selected = beams[:int(n_text)]
+    else:
+        selected = beams
+
+    # 每个候选独占一个 JSON 行，值仅为生成文本，各行直接拼接、末行保留 LF。
+    return "".join(
+        json.dumps(beam[1], ensure_ascii=True, separators=(",", ":"),
+                   allow_nan=False) + "\n"
+        for beam in selected)
+
+
 def _train_attn(model_path, corpus_path, out_path, window_text):
     """带注意力上下文的一次全语料 SGD 更新并把新模型写入 OUT。
 
@@ -4025,6 +4238,17 @@ def main(argv):
     (-分数, 生成索引元组) 升序，保留前 min(BEAM, 候选数) 项。LENGTH 为
     0 时仅输出 LF，否则输出最终首束文本加 LF。
 
+    python seqmodel.py beam-lstm-attn-topk-topp-nbest MODEL START START_T
+    END_T TOP_K TOP_P BEAM N LENGTH WINDOW：beam-lstm-attn-topk-topp 的
+    n-best 版本。除 N 及最终输出外，全部校验与逐轮候选裁剪、累计分数及
+    索引元组决胜均沿用 beam-lstm-attn-topk-topp；无 SEED、无随机源且不写
+    文件。N 整串匹配 [1-9][0-9]*，任意位数合法；最终束形成后，以十进制位
+    数及同长字典序与最终束数比较，仅当 N 较小时才转 int 取前 N 束，否则
+    取全部，超长文本不触发整数转换异常。按最终束既有顺序，每个候选独占一
+    个 JSON 行（值仅为生成文本，恰用 json.dumps(text, ensure_ascii=True,
+    separators=(',',':'),allow_nan=False)+'\\n'），各行直接拼接、末行保留
+    LF；LENGTH 为 0 时最终仅初始束，输出一个空字符串 JSON 行。
+
     python seqmodel.py train-attn MODEL CORPUS OUT WINDOW：前向严格复用
     perplexity-attn 的 n_t、M_t、u_t 与 logit 顺序；反向令
     g_t = p_t-onehot(y_t)，按 t 升序累加 dWhy、dby（以 u_t 为隐状态），
@@ -4105,6 +4329,11 @@ def main(argv):
             output = _beam_lstm_attn_topk_topp(argv[2], argv[3], argv[4],
                                                argv[5], argv[6], argv[7],
                                                argv[8], argv[9], argv[10])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 12 and argv[1] == "beam-lstm-attn-topk-topp-nbest":
+            output = _beam_lstm_attn_topk_topp_nbest(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                argv[8], argv[9], argv[10], argv[11])
             sys.stdout.buffer.write(output.encode("utf-8"))
         else:
             raise ValueError(
