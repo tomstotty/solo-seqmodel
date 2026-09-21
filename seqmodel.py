@@ -2514,6 +2514,144 @@ def _eval_windows(model_path, corpus_path, windows_text):
     return "".join(line + "\n" for line in lines)
 
 
+def _decimal_less(a_text, b_text):
+    """两个已匹配 [1-9][0-9]* 的文本按数学值比较：a < b（不转 int）。
+
+    位数少者数值小；同位数则字典序与数值序一致（两者均无前导零）。
+    """
+    return len(a_text) < len(b_text) or (
+        len(a_text) == len(b_text) and a_text < b_text)
+
+
+def _window_sensitivity_lstm_attn(model_path, corpus_path, short_text,
+                                  long_text):
+    """同一 LSTM 注意力模型在短、长两个窗口下的逐步 NLL 差，返回输出字符串。
+
+    MODEL、CORPUS 完全沿用 perplexity-lstm-attn 的读取、形状、F、严格
+    UTF-8、词表及语料至少 2 码点契约；状态推进、窗口截取与单步负对数
+    似然也与 perplexity-lstm-attn 完全相同。SHORT、LONG 各须整串匹配
+    [1-9][0-9]*（任意位数均合法），且数学值 SHORT<LONG；比较仅按十进制
+    位数及同长字典序，全程不转 int，否则抛 ValueError。
+
+    两窗各自独立重置：h=h0、c=c0、memory=[h0]，t 升序在同一装入 W、b 的
+    cell 上各跑一遍完全相同的单步计算（forward 不修改 cell）。令 T=语料
+    码点数-1；第 t 步短、长窗的单步负对数似然分别为 s、l，令 d=s-l，
+    D 从 0.0 按 t 升序累加 d。s、l、d、D 任一非有限均抛 ValueError（本命令
+    无困惑度，故不计算 exp(L/T)）。
+
+    stdout 先为 T 个 JSON 项行，第 t 项键序恰为
+    t,target,short_nll,long_nll,delta，值依次为 int t、下一单码点 str、
+    format(s,'.17g')、format(l,'.17g')、format(d,'.17g') 字符串；随后唯一
+    汇总行键序恰为 steps,total_delta，值依次为 int T、format(D,'.17g')
+    字符串。每行恰由 json.dumps(obj,ensure_ascii=True,
+    separators=(',',':'),allow_nan=False)+'\\n' 生成，各行直接拼接，末行
+    保留 LF。全部行先完整构造再返回，故失败时不产生任何部分输出，不写
+    文件。
+    """
+    if not _WINDOW_RE.match(short_text):
+        raise ValueError("SHORT must match [1-9][0-9]*")
+    if not _WINDOW_RE.match(long_text):
+        raise ValueError("LONG must match [1-9][0-9]*")
+    if not _decimal_less(short_text, long_text):
+        raise ValueError("SHORT must be numerically less than LONG")
+
+    vocab, W, b, Why, by, h0, c0 = _load_perplexity_lstm_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    T = len(ids) - 1
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    def _step(t, memory, h, c, window_text):
+        """单窗单步：严格复用 perplexity-lstm-attn 的逐步计算，返回
+        (step, h, c, h 的 float 副本)；不修改传入的 memory/h/c。"""
+        y = ids[t + 1]
+
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c = cell.forward(x, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        u = _attn_context(h, M)
+
+        z = _output_logits(Why, by, u)
+
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        dd = 0.0
+        for k in range(V):
+            dd += math.exp(z[k] - m)
+            if not math.isfinite(dd):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        nll = m + math.log(dd) - z[y]
+        if not math.isfinite(nll):
+            raise ValueError("cross-entropy step is non-finite")
+        return nll, h, c, [float(v) for v in h]
+
+    # 两窗均从 h0、c0、memory=[h0] 独立重置。
+    short_memory = [h0]
+    short_h = list(h0)
+    short_c = list(c0)
+    long_memory = [h0]
+    long_h = list(h0)
+    long_c = list(c0)
+
+    D = 0.0
+    items = []
+    for t in range(T):
+        s, short_h, short_c, h_copy = _step(
+            t, short_memory, short_h, short_c, short_text)
+        short_memory.append(h_copy)
+        l, long_h, long_c, h_copy = _step(
+            t, long_memory, long_h, long_c, long_text)
+        long_memory.append(h_copy)
+
+        d = s - l
+        if not math.isfinite(d):
+            raise ValueError("per-step NLL delta is non-finite")
+        D += d
+        if not math.isfinite(D):
+            raise ValueError("total NLL delta accumulated non-finitely")
+
+        items.append({
+            "t": t,
+            "target": corpus[t + 1],
+            "short_nll": format(s, ".17g"),
+            "long_nll": format(l, ".17g"),
+            "delta": format(d, ".17g"),
+        })
+
+    lines = [json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                        allow_nan=False) for obj in items]
+    summary = {
+        "steps": T,
+        "total_delta": format(D, ".17g"),
+    }
+    lines.append(json.dumps(summary, ensure_ascii=True,
+                            separators=(",", ":"), allow_nan=False))
+    return "".join(line + "\n" for line in lines)
+
+
 def _perplexity_lstm_attn_trace(model_path, corpus_path, window_text):
     """perplexity-lstm-attn 的逐步负对数似然轨迹，返回待写出的字符串。
 
@@ -5009,6 +5147,21 @@ def main(argv):
     生成的 UTF-8 字节组成，末行保留 LF；失败时不输出任何部分行，
     不写文件。
 
+    python seqmodel.py window-sensitivity-lstm-attn MODEL CORPUS SHORT
+    LONG：MODEL、CORPUS、状态推进、窗口截取与单步负对数似然完全沿用
+    perplexity-lstm-attn。SHORT、LONG 各整串匹配 [1-9][0-9]*（任意位数
+    均合法），且数学值 SHORT<LONG；按十进制位数及同长字典序比较，不转
+    int，否则失败。两窗均从 h=h0、c=c0、memory=[h0] 独立重置。令 T=语料
+    码点数-1；第 t 步短、长窗 NLL 分别为 s、l，令 d=s-l，D 从 0.0 按 t
+    升序累加 d；s、l、d、D 任一非有限即失败（无困惑度计算）。stdout 先
+    写 T 个 JSON 项行，键序恰为 t,target,short_nll,long_nll,delta，值
+    依次为 int t、下一单码点 str、format(s,'.17g')、format(l,'.17g')、
+    format(d,'.17g') 字符串；再写唯一汇总行，键序恰为 steps,total_delta，
+    值为 int T 与 format(D,'.17g') 字符串。每行恰由 json.dumps(obj,
+    ensure_ascii=True,separators=(',',':'),allow_nan=False)+'\\n'
+    生成的 UTF-8 字节组成，各行直接拼接、末行保留 LF；失败时不输出任何
+    部分行，不写文件。
+
     python seqmodel.py sample-attn MODEL START SEED TEMPERATURE LENGTH
     WINDOW：以同样的注意力上下文替换 logit 隐状态，softmax 与抽样契约
     与 sample 相同，整次仅初始化一次随机源、不写文件。WINDOW 整串匹配
@@ -5233,6 +5386,11 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 5 and argv[1] == "eval-windows":
             output = _eval_windows(argv[2], argv[3], argv[4])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif (len(argv) == 6
+              and argv[1] == "window-sensitivity-lstm-attn"):
+            output = _window_sensitivity_lstm_attn(
+                argv[2], argv[3], argv[4], argv[5])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 5 and argv[1] == "lstm-attn-weights":
             output = _lstm_attn_weights(argv[2], argv[3], argv[4])
