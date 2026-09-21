@@ -12,6 +12,7 @@ TypeError。
 
 import json
 import math
+import os
 import random
 import re
 import sys
@@ -2775,6 +2776,198 @@ def _compare_lstm_attn(model_a_path, model_b_path, corpus_path,
     return "".join(line + "\n" for line in lines)
 
 
+def _compare_suite(model_a_path, model_b_path, list_path):
+    """按 (corpus, window) 清单逐项比较两模型，汇总胜场，返回待写出字符串。
+
+    MODEL_A、MODEL_B 各自沿用 compare-lstm-attn 的 version 2 八键、F、形状
+    与严格 UTF-8 契约，两者 vocab 须逐项同序相等，H 可不同；WINDOW 词法、
+    任意位数安全截取、两轨独立状态重置与逐步 NLL 均完全沿用
+    compare-lstm-attn。
+
+    LIST 为严格 UTF-8 编码的 JSON 非空数组，每项恰为两个 str：
+    [corpus, window]；corpus 须为非空相对路径（不得为绝对路径，亦不得含
+    空段），相对 LIST 文件所在目录解析；window 须整串匹配 [1-9][0-9]*；
+    重复项按序保留。否则抛 ValueError。
+
+    每项两轨各从自身 h0、c0、memory=[h0] 重置；令 D=0.0，按 t 升序累加
+    b_nll-a_nll。D 为正/负/零时 winner 依次为 "A"/"B"/"tie"。令 G=0.0
+    并按项序累加各项 D；任一计算非有限即失败。stdout 恰为单个 JSON 对象
+    加 LF，顶层键序恰为 items,summary；items 按清单序，每项为
+    [corpus, window, steps, format(D,'.17g'), winner]，其中 corpus、window
+    为原 str，steps 为 int；summary 为
+    [groups, a_wins, b_wins, ties, format(G,'.17g'), winner]，前四项为
+    int，winner 按 G 同规则判定。序列化恰用 json.dumps(obj,
+    ensure_ascii=True,separators=(',',':'),allow_nan=False)+'\\n' 的
+    UTF-8 字节；整个对象先完整构造再返回，故失败时不产生任何部分输出，
+    不写文件。
+    """
+    with open(list_path, "rb") as f:
+        list_text = f.read().decode("utf-8")
+    entries = json.loads(list_text)
+    if type(entries) is not list or len(entries) == 0:
+        raise ValueError("LIST must be a non-empty JSON array")
+    for entry in entries:
+        if (type(entry) is not list or len(entry) != 2
+                or type(entry[0]) is not str
+                or type(entry[1]) is not str):
+            raise ValueError("each LIST item must be exactly two strings "
+                             "[corpus, window]")
+        corpus_text, window_text = entry
+        if corpus_text == "":
+            raise ValueError("corpus must be a non-empty path")
+        if os.path.isabs(corpus_text):
+            raise ValueError("corpus must be a relative path")
+        # normpath 折叠后若仍以分隔符开头则为绝对路径（上面已拒）；空段
+        # （a//b、a/、/b 等）会在 normpath 中被折叠，故以归一化文本中是否
+        # 仍含分隔符无法判空段——改为在原文本上逐段检查非空。
+        for segment in corpus_text.split("/"):
+            if segment == "":
+                raise ValueError("corpus path must not contain empty segments")
+        if not _WINDOW_RE.match(window_text):
+            raise ValueError("each window must match [1-9][0-9]*")
+
+    list_dir = os.path.dirname(os.path.abspath(list_path))
+
+    (vocab_a, W_a, b_a, Why_a, by_a, h0_a,
+     c0_a) = _load_perplexity_lstm_model(model_a_path)
+    (vocab_b, W_b, b_b, Why_b, by_b, h0_b,
+     c0_b) = _load_perplexity_lstm_model(model_b_path)
+    if vocab_a != vocab_b:
+        raise ValueError("the two models must have identical vocabs in the "
+                         "same order")
+    vocab = vocab_a
+    V = len(vocab)
+
+    cell_a = LSTMCell(V, len(h0_a))
+    cell_a.W = [list(row) for row in W_a]
+    cell_a.b = list(b_a)
+    cell_b = LSTMCell(V, len(h0_b))
+    cell_b.W = [list(row) for row in W_b]
+    cell_b.b = list(b_b)
+
+    def _step_nll(cell, Why, by, h, c, memory, ids, window_text, t):
+        """compare-lstm-attn 单步：推进状态并返回 (nll, h, c, memory)。"""
+        y = ids[t + 1]
+
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c = cell.forward(x, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        u = _attn_context(h, M)
+
+        z = _output_logits(Why, by, u)
+
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        d = 0.0
+        for k in range(V):
+            d += math.exp(z[k] - m)
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        nll = m + math.log(d) - z[y]
+        if not math.isfinite(nll):
+            raise ValueError("cross-entropy step is non-finite")
+
+        memory.append([float(v) for v in h])
+        return nll, h, c, memory
+
+    def _read_corpus_ids(corpus_path):
+        """按共同 vocab 读取语料并转索引，沿用 compare-lstm-attn 契约。"""
+        with open(corpus_path, "rb") as f:
+            corpus = f.read().decode("utf-8")
+        if len(corpus) < 2:
+            raise ValueError("corpus must contain at least 2 codepoints")
+        table = {ch: i for i, ch in enumerate(vocab)}
+        ids = [0] * len(corpus)
+        for t, ch in enumerate(corpus):
+            ix = table.get(ch)
+            if ix is None:
+                raise ValueError(
+                    "corpus contains an out-of-vocab character")
+            ids[t] = ix
+        return ids
+
+    def _winner(delta):
+        if delta > 0.0:
+            return "A"
+        if delta < 0.0:
+            return "B"
+        return "tie"
+
+    items = []
+    groups = 0
+    a_wins = 0
+    b_wins = 0
+    ties = 0
+    G = 0.0
+    for corpus_text, window_text in entries:
+        corpus_path = os.path.join(list_dir, corpus_text)
+        ids = _read_corpus_ids(corpus_path)
+        T = len(ids) - 1
+
+        # 每项两轨各自从自身的 h0、c0、memory=[h0] 独立重置。
+        memory_a = [h0_a]
+        h_a = list(h0_a)
+        c_a = list(c0_a)
+        memory_b = [h0_b]
+        h_b = list(h0_b)
+        c_b = list(c0_b)
+        D = 0.0
+        for t in range(T):
+            nll_a, h_a, c_a, memory_a = _step_nll(
+                cell_a, Why_a, by_a, h_a, c_a, memory_a,
+                ids, window_text, t)
+            nll_b, h_b, c_b, memory_b = _step_nll(
+                cell_b, Why_b, by_b, h_b, c_b, memory_b,
+                ids, window_text, t)
+
+            delta = nll_b - nll_a
+            if not math.isfinite(delta):
+                raise ValueError("per-step delta is non-finite")
+            D += delta
+            if not math.isfinite(D):
+                raise ValueError("item delta accumulated non-finitely")
+
+        winner = _winner(D)
+        groups += 1
+        if winner == "A":
+            a_wins += 1
+        elif winner == "B":
+            b_wins += 1
+        else:
+            ties += 1
+        G += D
+        if not math.isfinite(G):
+            raise ValueError("group delta accumulated non-finitely")
+
+        items.append([
+            corpus_text,
+            window_text,
+            T,
+            format(D, ".17g"),
+            winner,
+        ])
+
+    obj = {
+        "items": items,
+        "summary": [
+            groups,
+            a_wins,
+            b_wins,
+            ties,
+            format(G, ".17g"),
+            _winner(G),
+        ],
+    }
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+
+
 def _perplexity_lstm_attn_trace(model_path, corpus_path, window_text):
     """perplexity-lstm-attn 的逐步负对数似然轨迹，返回待写出的字符串。
 
@@ -5303,6 +5496,22 @@ def main(argv):
     生成的 UTF-8 字节组成，末行保留 LF；失败时不输出任何部分行，
     不写文件。
 
+    python seqmodel.py compare-suite MODEL_A MODEL_B LIST：MODEL_A、
+    MODEL_B 的契约（含两者 vocab 逐项同序、H 可不同）、WINDOW 词法、
+    任意位数安全截取、两轨独立状态重置与逐步 NLL 均完全沿用
+    compare-lstm-attn。LIST 为严格 UTF-8 编码的 JSON 非空数组，每项恰
+    含两个 str：[corpus,window]；corpus 须为非空相对路径（不得为绝对
+    路径或含空段），相对 LIST 文件所在目录解析；window 须整串匹配
+    [1-9][0-9]*；重复项按序保留，否则失败。每项令 D=0.0，按 t 升序累加
+    b_nll-a_nll；D 为正/负/零时 winner 依次为 A/B/tie。令 G=0.0 并按
+    项序累加各项 D，任一计算非有限即失败。stdout 恰为单个 JSON 对象加
+    LF，顶层键序恰为 items,summary；items 按清单序，每项为
+    [corpus,window,steps,format(D,'.17g'),winner]，steps 为 int；
+    summary 为 [groups,a_wins,b_wins,ties,format(G,'.17g'),winner]，
+    前四项为 int，winner 按 G 同规则判定。序列化恰用 json.dumps(obj,
+    ensure_ascii=True,separators=(',',':'),allow_nan=False)+'\\n' 的
+    UTF-8 字节；失败时不输出任何部分结果，不写文件。
+
     python seqmodel.py sample-attn MODEL START SEED TEMPERATURE LENGTH
     WINDOW：以同样的注意力上下文替换 logit 隐状态，softmax 与抽样契约
     与 sample 相同，整次仅初始化一次随机源、不写文件。WINDOW 整串匹配
@@ -5535,6 +5744,9 @@ def main(argv):
         elif len(argv) == 6 and argv[1] == "compare-lstm-attn":
             output = _compare_lstm_attn(
                 argv[2], argv[3], argv[4], argv[5])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 5 and argv[1] == "compare-suite":
+            output = _compare_suite(argv[2], argv[3], argv[4])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 5 and argv[1] == "lstm-attn-weights":
             output = _lstm_attn_weights(argv[2], argv[3], argv[4])
