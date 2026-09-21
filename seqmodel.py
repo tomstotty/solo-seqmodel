@@ -2505,6 +2505,83 @@ def _perplexity_lstm_attn_trace(model_path, corpus_path, window_text):
                       allow_nan=False) + "\n"
 
 
+def _lstm_attn_weights(model_path, corpus_path, window_text):
+    """lstm-attn-weights：逐步注意力权重轨迹，返回待写出的字符串。
+
+    MODEL、CORPUS、WINDOW 的校验、LSTM 状态推进与 M 的任意位数安全截取
+    完全沿用 _perplexity_lstm_attn（不计算 logit、softmax 与困惑度）。
+    置 h=h0、c=c0、memory=[h0]、T=len(CORPUS)-1，t 升序：以当前字符的
+    V 长 one-hot 为 x，调用装入 W、b 的 LSTMCell.forward(x, h, c)，取前
+    两项更新 h、c；M 取 memory 末尾至多 WINDOW 项（顺序从旧到新），在向
+    memory 追加 h 之前以 attention([h], M, M, None) 取 w[0]，并令
+    start=t+1-len(M)（memory 下标 0 为 h0，q≥1 为 h_(q-1)，故
+    weights[j] 对应 h_(start+j)）；随后向 memory 追加 h 的 float 副本。
+    stdout 恰为单个 JSON 对象加 LF：顶层键序恰为 version,items；version
+    为 int 1；items 为 T 长列表，第 t 项键序恰为 t,start,weights，前两值
+    为 int t、int start，weights 为按 M 从旧到新排列的字符串列表，第 j
+    项恰为 format(w[0][j], '.17g')。序列化恰用
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n'，不写文件。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    vocab, W, b, Why, by, h0, c0 = _load_perplexity_lstm_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    # 记忆序列 [h0, h_0, ..., h_{t-1}]；attention 不修改其输入，追加在求
+    # 取权重之后进行，故 w[0][j] 恰对应当前 M 中自旧到新第 j 项。
+    memory = [h0]
+    h = list(h0)
+    c = list(c0)
+    T = len(ids) - 1
+    items = []
+    for t in range(T):
+        # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c = cell.forward(x, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        _ctx, w = attention([h], M, M, None)
+        row = w[0]
+        start = t + 1 - len(M)
+
+        items.append({
+            "t": t,
+            "start": start,
+            "weights": [format(row[j], ".17g") for j in range(len(M))],
+        })
+
+        memory.append([float(v) for v in h])
+
+    obj = {
+        "version": 1,
+        "items": items,
+    }
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+
+
 def _sample_attn(model_path, start, seed_text, temperature_text, length_text,
                  window_text):
     """带注意力上下文从 RNN 语言模型采样 LENGTH 个码点，返回待写出的字符串。
@@ -4540,6 +4617,21 @@ def main(argv):
     json.dumps(obj,ensure_ascii=True,separators=(',',':'),
     allow_nan=False)+'\\n'，不写文件。
 
+    python seqmodel.py lstm-attn-weights MODEL CORPUS WINDOW：MODEL、
+    CORPUS、WINDOW 的校验、LSTM 状态推进与 M 截取均沿用
+    perplexity-lstm-attn，但不求 logit、softmax 或困惑度。置 h=h0、
+    c=c0、memory=[h0]，t 升序以当前字符 one-hot 调用装入 W、b 的
+    LSTMCell.forward 更新 h、c；每步在向 memory 追加 h 之前，以 M 调用
+    attention([h],M,M,None) 取 w[0]（M 为 memory 末尾至多 WINDOW 项，
+    从旧到新），令 start=t+1-len(M)。stdout 恰为一个 JSON 对象加 LF：
+    顶层键序恰为 version,items；version 为 int 1；items 长度
+    T=语料码点数-1，第 t 项键序恰为 t,start,weights，前两值为 int t、
+    int start，weights 为按 M 从旧到新排列的字符串列表，第 j 项恰为
+    format(w[0][j],'.17g')；memory 下标 0 为 h0、q≥1 为 h_(q-1)，
+    weights[j] 对应 start+j。序列化恰用
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n' 的 UTF-8 字节，不写文件。
+
     python seqmodel.py sample-attn MODEL START SEED TEMPERATURE LENGTH
     WINDOW：以同样的注意力上下文替换 logit 隐状态，softmax 与抽样契约
     与 sample 相同，整次仅初始化一次随机源、不写文件。WINDOW 整串匹配
@@ -4748,6 +4840,9 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 5 and argv[1] == "perplexity-lstm-attn-trace":
             output = _perplexity_lstm_attn_trace(argv[2], argv[3], argv[4])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 5 and argv[1] == "lstm-attn-weights":
+            output = _lstm_attn_weights(argv[2], argv[3], argv[4])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 6 and argv[1] == "train-attn":
             _train_attn(argv[2], argv[3], argv[4], argv[5])
