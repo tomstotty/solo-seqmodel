@@ -2949,6 +2949,152 @@ def _compare_suite(model_a_path, model_b_path, list_path):
             + "\n")
 
 
+def _load_rank_inputs(models_path, list_path):
+    """读取并校验 rank-suite / rank-window-* 的 MODELS、LIST 与模型、语料。
+
+    返回四元组 (model_paths, entries, loaded, entry_ids)：
+      - model_paths：MODELS 原路径 str 列表（重复项按序保留）；
+      - entries：LIST 原 (corpus, window) 元组列表（重复项按序保留）；
+      - loaded：与 model_paths 同序的 (cell, Why, by, h0, c0) 列表，cell 为
+        已装入 W、b 的 LSTMCell，Why、by 沿用模型原值，h0、c0 为模型原列表；
+      - entry_ids：与 entries 同序的语料 id 序列列表，每项为 int 列表。
+
+    MODELS 为严格 UTF-8 的 JSON 数组，至少 2 项；每项须为非空相对路径
+    str（绝对路径非法），按 MODELS 文件的父目录解析；重复项按序保留。
+    LIST 为严格 UTF-8 的 JSON 非空数组，每项恰为 [corpus, window] 两个
+    str；corpus 为非空相对路径（按 LIST 父目录解析），window 整串匹配
+    [1-9][0-9]*（任意位数均合法，全程不转 int）；重复项按序保留。模型的
+    读取沿用 compare-lstm-attn 的 version 2 八键、F、形状与严格 UTF-8 契
+    约；所有模型 vocab 须逐项同序相等，H 可不同。每个语料按严格 UTF-8 全
+    文读取，须至少 2 码点且全部字符在公共 vocab 内（语料只读取一次并转成
+    id 序列，结果与重复读取逐位相同）。
+
+    模型/语料文件缺失或不可读抛 OSError；其余解析（含严格 UTF-8、JSON 词
+    法）、形状、词表或非有限错误抛 ValueError。
+    """
+    with open(models_path, "rb") as f:
+        model_paths = json.loads(f.read().decode("utf-8"))
+    if not isinstance(model_paths, list) or len(model_paths) < 2:
+        raise ValueError("MODELS must be a JSON array with at least 2 items")
+    for path_text in model_paths:
+        if not isinstance(path_text, str) or not path_text \
+                or os.path.isabs(path_text):
+            raise ValueError("each model must be a non-empty relative path")
+
+    with open(list_path, "rb") as f:
+        suite = json.loads(f.read().decode("utf-8"))
+    if not isinstance(suite, list) or not suite:
+        raise ValueError("LIST must be a non-empty JSON array")
+    entries = []
+    for item in suite:
+        if (not isinstance(item, list) or len(item) != 2
+                or not isinstance(item[0], str)
+                or not isinstance(item[1], str)):
+            raise ValueError("each LIST item must be a [corpus, window] "
+                             "pair of strings")
+        corpus_text, window_text = item
+        if not corpus_text or os.path.isabs(corpus_text):
+            raise ValueError("each corpus must be a non-empty relative path")
+        if not _WINDOW_RE.match(window_text):
+            raise ValueError("each window must match [1-9][0-9]*")
+        entries.append((corpus_text, window_text))
+
+    models_base = os.path.dirname(models_path)
+    loaded = []
+    vocab = None
+    for path_text in model_paths:
+        resolved = os.path.join(models_base, path_text)
+        (one_vocab, W, b, Why, by, h0,
+         c0) = _load_perplexity_lstm_model(resolved)
+        if vocab is None:
+            vocab = one_vocab
+        elif one_vocab != vocab:
+            raise ValueError("all models must have identical vocabs in the "
+                             "same order")
+        V = len(vocab)
+        cell = LSTMCell(V, len(h0))
+        cell.W = [list(row) for row in W]
+        cell.b = list(b)
+        loaded.append((cell, Why, by, h0, c0))
+    V = len(vocab)
+    table = {ch: i for i, ch in enumerate(vocab)}
+
+    base_dir = os.path.dirname(list_path)
+
+    entry_ids = []
+    for corpus_text, _window_text in entries:
+        corpus_path = os.path.join(base_dir, corpus_text)
+        with open(corpus_path, "rb") as f:
+            corpus = f.read().decode("utf-8")
+        if len(corpus) < 2:
+            raise ValueError("corpus must contain at least 2 codepoints")
+
+        ids = [0] * len(corpus)
+        for t, ch in enumerate(corpus):
+            ix = table.get(ch)
+            if ix is None:
+                raise ValueError(
+                    "corpus contains an out-of-vocab character")
+            ids[t] = ix
+        entry_ids.append(ids)
+
+    return model_paths, entries, loaded, entry_ids
+
+
+def _total_rank_nll(cell, Why, by, h0, c0, ids, window_text):
+    """单模型在单语料 id 序列上的窗口注意力总 NLL，从独立初态重置。
+
+    每次以 h0、c0、memory=[h0] 重置，t 升序（x、y 为当前、下一字符索
+    引）：以当前字符的 V 长 one-hot 为 x，调用 cell.forward(x, h, c) 取前
+    两项更新 h、c；M 取 memory 末尾恰 min(WINDOW, len(memory)) 项（顺序从
+    旧到新，窗口截断沿用 _window_tail），以 _attn_context 求注意力调整后
+    的隐状态 u，再经 _output_logits 计算 z。单步 NLL 以稳定 log-sum-exp
+    计算：m=max(z)，d 从 0.0 依 k 升序累加 exp(z_k-m)，
+    nll=m+log(d)-z[y]，保持 LSTM、attention 窗口及 t/j/k 的下标与累加顺
+    序。总和从 0.0 按 t 升序累加 nll，每步后向 memory 追加 h 的 float 副
+    本；任一中间量（logit 最大值、softmax 分母、单步 NLL、总和）非有限即
+    抛 ValueError。返回未格式化的 float 总和。
+    """
+    V = len(by)
+    memory = [h0]
+    h = list(h0)
+    c = list(c0)
+    total = 0.0
+    for t in range(len(ids) - 1):
+        y = ids[t + 1]
+
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c = cell.forward(x, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        u = _attn_context(h, M)
+
+        z = _output_logits(Why, by, u)
+
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        d = 0.0
+        for k in range(V):
+            d += math.exp(z[k] - m)
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        nll = m + math.log(d) - z[y]
+        if not math.isfinite(nll):
+            raise ValueError("cross-entropy step is non-finite")
+
+        total += nll
+        if not math.isfinite(total):
+            raise ValueError("item total NLL accumulated non-finitely")
+
+        memory.append([float(v) for v in h])
+    return total
+
+
 def _rank_suite(models_path, list_path):
     """多个 LSTM-attn 模型在同一组 (语料, 窗口) 上按总 NLL 排名。
 
@@ -3291,118 +3437,8 @@ def _rank_window_sensitivity(models_path, list_path, base_text):
     if not _WINDOW_RE.match(base_text):
         raise ValueError("BASE must match [1-9][0-9]*")
 
-    with open(models_path, "rb") as f:
-        model_paths = json.loads(f.read().decode("utf-8"))
-    if not isinstance(model_paths, list) or len(model_paths) < 2:
-        raise ValueError("MODELS must be a JSON array with at least 2 items")
-    for path_text in model_paths:
-        if not isinstance(path_text, str) or not path_text \
-                or os.path.isabs(path_text):
-            raise ValueError("each model must be a non-empty relative path")
-
-    with open(list_path, "rb") as f:
-        suite = json.loads(f.read().decode("utf-8"))
-    if not isinstance(suite, list) or not suite:
-        raise ValueError("LIST must be a non-empty JSON array")
-    entries = []
-    for item in suite:
-        if (not isinstance(item, list) or len(item) != 2
-                or not isinstance(item[0], str)
-                or not isinstance(item[1], str)):
-            raise ValueError("each LIST item must be a [corpus, window] "
-                             "pair of strings")
-        corpus_text, window_text = item
-        if not corpus_text or os.path.isabs(corpus_text):
-            raise ValueError("each corpus must be a non-empty relative path")
-        if not _WINDOW_RE.match(window_text):
-            raise ValueError("each window must match [1-9][0-9]*")
-        entries.append((corpus_text, window_text))
-
-    models_base = os.path.dirname(models_path)
-    loaded = []
-    vocab = None
-    for path_text in model_paths:
-        resolved = os.path.join(models_base, path_text)
-        (one_vocab, W, b, Why, by, h0,
-         c0) = _load_perplexity_lstm_model(resolved)
-        if vocab is None:
-            vocab = one_vocab
-        elif one_vocab != vocab:
-            raise ValueError("all models must have identical vocabs in the "
-                             "same order")
-        V = len(vocab)
-        cell = LSTMCell(V, len(h0))
-        cell.W = [list(row) for row in W]
-        cell.b = list(b)
-        loaded.append((cell, Why, by, h0, c0))
-    V = len(vocab)
-    table = {ch: i for i, ch in enumerate(vocab)}
-
-    base_dir = os.path.dirname(list_path)
-
-    # 每个清单项的语料只读一次并转成 id 序列；计算结果与重复读取逐位相同。
-    entry_ids = []
-    for corpus_text, _window_text in entries:
-        corpus_path = os.path.join(base_dir, corpus_text)
-        with open(corpus_path, "rb") as f:
-            corpus = f.read().decode("utf-8")
-        if len(corpus) < 2:
-            raise ValueError("corpus must contain at least 2 codepoints")
-
-        ids = [0] * len(corpus)
-        for t, ch in enumerate(corpus):
-            ix = table.get(ch)
-            if ix is None:
-                raise ValueError(
-                    "corpus contains an out-of-vocab character")
-            ids[t] = ix
-        entry_ids.append(ids)
-
-    def _step_nll(cell, Why, by, h, c, memory, ids, t, window_text):
-        """perplexity-lstm-attn 单步：推进状态并返回 (nll, h, c, memory)。"""
-        y = ids[t + 1]
-
-        x = [0.0] * V
-        x[ids[t]] = 1.0
-
-        h, c = cell.forward(x, h, c)[:2]
-
-        M = _window_tail(memory, window_text)
-        u = _attn_context(h, M)
-
-        z = _output_logits(Why, by, u)
-
-        m = max(z)
-        if not math.isfinite(m):
-            raise ValueError("logit maximum is non-finite")
-        d = 0.0
-        for k in range(V):
-            d += math.exp(z[k] - m)
-            if not math.isfinite(d):
-                raise ValueError(
-                    "softmax denominator accumulated non-finitely")
-
-        nll = m + math.log(d) - z[y]
-        if not math.isfinite(nll):
-            raise ValueError("cross-entropy step is non-finite")
-
-        memory.append([float(v) for v in h])
-        return nll, h, c, memory
-
-    def _total_nll(cell, Why, by, h0_m, c0_m, ids, window_text):
-        """从自身 h0、c0、memory=[h0] 独立重置并按 t 升序累加总 NLL。"""
-        memory = [h0_m]
-        h = list(h0_m)
-        c = list(c0_m)
-        total = 0.0
-        for t in range(len(ids) - 1):
-            nll, h, c, memory = _step_nll(
-                cell, Why, by, h, c, memory, ids, t, window_text)
-            total += nll
-            if not math.isfinite(total):
-                raise ValueError(
-                    "item total NLL accumulated non-finitely")
-        return total
+    model_paths, entries, loaded, entry_ids = _load_rank_inputs(
+        models_path, list_path)
 
     items = []
     # 每个模型的敏感度 A 从 0.0 起，按 gi 升序累加各项 abs(delta)。
@@ -3412,9 +3448,9 @@ def _rank_window_sensitivity(models_path, list_path, base_text):
             ids = entry_ids[gi]
             T = len(ids) - 1
 
-            # 两轨均从自身 h0、c0、memory=[h0] 独立重置。
-            L = _total_nll(cell, Why, by, h0_m, c0_m, ids, window_text)
-            B = _total_nll(cell, Why, by, h0_m, c0_m, ids, base_text)
+            # 两轨均经 _total_rank_nll 从自身 h0、c0、memory=[h0] 独立重置。
+            L = _total_rank_nll(cell, Why, by, h0_m, c0_m, ids, window_text)
+            B = _total_rank_nll(cell, Why, by, h0_m, c0_m, ids, base_text)
 
             delta = L - B
             if not math.isfinite(delta):
@@ -3479,118 +3515,8 @@ def _rank_window_stability(models_path, list_path, bases_text):
             raise ValueError("each BASES item must be a string matching "
                              "[1-9][0-9]*")
 
-    with open(models_path, "rb") as f:
-        model_paths = json.loads(f.read().decode("utf-8"))
-    if not isinstance(model_paths, list) or len(model_paths) < 2:
-        raise ValueError("MODELS must be a JSON array with at least 2 items")
-    for path_text in model_paths:
-        if not isinstance(path_text, str) or not path_text \
-                or os.path.isabs(path_text):
-            raise ValueError("each model must be a non-empty relative path")
-
-    with open(list_path, "rb") as f:
-        suite = json.loads(f.read().decode("utf-8"))
-    if not isinstance(suite, list) or not suite:
-        raise ValueError("LIST must be a non-empty JSON array")
-    entries = []
-    for item in suite:
-        if (not isinstance(item, list) or len(item) != 2
-                or not isinstance(item[0], str)
-                or not isinstance(item[1], str)):
-            raise ValueError("each LIST item must be a [corpus, window] "
-                             "pair of strings")
-        corpus_text, window_text = item
-        if not corpus_text or os.path.isabs(corpus_text):
-            raise ValueError("each corpus must be a non-empty relative path")
-        if not _WINDOW_RE.match(window_text):
-            raise ValueError("each window must match [1-9][0-9]*")
-        entries.append((corpus_text, window_text))
-
-    models_base = os.path.dirname(models_path)
-    loaded = []
-    vocab = None
-    for path_text in model_paths:
-        resolved = os.path.join(models_base, path_text)
-        (one_vocab, W, b, Why, by, h0,
-         c0) = _load_perplexity_lstm_model(resolved)
-        if vocab is None:
-            vocab = one_vocab
-        elif one_vocab != vocab:
-            raise ValueError("all models must have identical vocabs in the "
-                             "same order")
-        V = len(vocab)
-        cell = LSTMCell(V, len(h0))
-        cell.W = [list(row) for row in W]
-        cell.b = list(b)
-        loaded.append((cell, Why, by, h0, c0))
-    V = len(vocab)
-    table = {ch: i for i, ch in enumerate(vocab)}
-
-    base_dir = os.path.dirname(list_path)
-
-    # 每个清单项的语料只读一次并转成 id 序列；计算结果与重复读取逐位相同。
-    entry_ids = []
-    for corpus_text, _window_text in entries:
-        corpus_path = os.path.join(base_dir, corpus_text)
-        with open(corpus_path, "rb") as f:
-            corpus = f.read().decode("utf-8")
-        if len(corpus) < 2:
-            raise ValueError("corpus must contain at least 2 codepoints")
-
-        ids = [0] * len(corpus)
-        for t, ch in enumerate(corpus):
-            ix = table.get(ch)
-            if ix is None:
-                raise ValueError(
-                    "corpus contains an out-of-vocab character")
-            ids[t] = ix
-        entry_ids.append(ids)
-
-    def _step_nll(cell, Why, by, h, c, memory, ids, t, window_text):
-        """perplexity-lstm-attn 单步：推进状态并返回 (nll, h, c, memory)。"""
-        y = ids[t + 1]
-
-        x = [0.0] * V
-        x[ids[t]] = 1.0
-
-        h, c = cell.forward(x, h, c)[:2]
-
-        M = _window_tail(memory, window_text)
-        u = _attn_context(h, M)
-
-        z = _output_logits(Why, by, u)
-
-        m = max(z)
-        if not math.isfinite(m):
-            raise ValueError("logit maximum is non-finite")
-        d = 0.0
-        for k in range(V):
-            d += math.exp(z[k] - m)
-            if not math.isfinite(d):
-                raise ValueError(
-                    "softmax denominator accumulated non-finitely")
-
-        nll = m + math.log(d) - z[y]
-        if not math.isfinite(nll):
-            raise ValueError("cross-entropy step is non-finite")
-
-        memory.append([float(v) for v in h])
-        return nll, h, c, memory
-
-    def _total_nll(cell, Why, by, h0_m, c0_m, ids, window_text):
-        """从自身 h0、c0、memory=[h0] 独立重置并按 t 升序累加总 NLL。"""
-        memory = [h0_m]
-        h = list(h0_m)
-        c = list(c0_m)
-        total = 0.0
-        for t in range(len(ids) - 1):
-            nll, h, c, memory = _step_nll(
-                cell, Why, by, h, c, memory, ids, t, window_text)
-            total += nll
-            if not math.isfinite(total):
-                raise ValueError(
-                    "item total NLL accumulated non-finitely")
-        return total
+    model_paths, entries, loaded, entry_ids = _load_rank_inputs(
+        models_path, list_path)
 
     n_models = len(loaded)
     # ranks[bi][mi] 为模型 mi 在第 bi 个 base 下的名次（从 1 起）。
@@ -3603,9 +3529,11 @@ def _rank_window_stability(models_path, list_path, bases_text):
             for gi, (corpus_text, window_text) in enumerate(entries):
                 ids = entry_ids[gi]
 
-                # 两轨均从自身 h0、c0、memory=[h0] 独立重置。
-                L = _total_nll(cell, Why, by, h0_m, c0_m, ids, window_text)
-                B = _total_nll(cell, Why, by, h0_m, c0_m, ids, base_text)
+                # 两轨均经 _total_rank_nll 从自身 h0、c0、memory=[h0] 重置。
+                L = _total_rank_nll(cell, Why, by, h0_m, c0_m, ids,
+                                    window_text)
+                B = _total_rank_nll(cell, Why, by, h0_m, c0_m, ids,
+                                    base_text)
 
                 delta = L - B
                 if not math.isfinite(delta):
@@ -3679,118 +3607,8 @@ def _rank_window_stability_details(models_path, list_path, bases_text):
             raise ValueError("each BASES item must be a string matching "
                              "[1-9][0-9]*")
 
-    with open(models_path, "rb") as f:
-        model_paths = json.loads(f.read().decode("utf-8"))
-    if not isinstance(model_paths, list) or len(model_paths) < 2:
-        raise ValueError("MODELS must be a JSON array with at least 2 items")
-    for path_text in model_paths:
-        if not isinstance(path_text, str) or not path_text \
-                or os.path.isabs(path_text):
-            raise ValueError("each model must be a non-empty relative path")
-
-    with open(list_path, "rb") as f:
-        suite = json.loads(f.read().decode("utf-8"))
-    if not isinstance(suite, list) or not suite:
-        raise ValueError("LIST must be a non-empty JSON array")
-    entries = []
-    for item in suite:
-        if (not isinstance(item, list) or len(item) != 2
-                or not isinstance(item[0], str)
-                or not isinstance(item[1], str)):
-            raise ValueError("each LIST item must be a [corpus, window] "
-                             "pair of strings")
-        corpus_text, window_text = item
-        if not corpus_text or os.path.isabs(corpus_text):
-            raise ValueError("each corpus must be a non-empty relative path")
-        if not _WINDOW_RE.match(window_text):
-            raise ValueError("each window must match [1-9][0-9]*")
-        entries.append((corpus_text, window_text))
-
-    models_base = os.path.dirname(models_path)
-    loaded = []
-    vocab = None
-    for path_text in model_paths:
-        resolved = os.path.join(models_base, path_text)
-        (one_vocab, W, b, Why, by, h0,
-         c0) = _load_perplexity_lstm_model(resolved)
-        if vocab is None:
-            vocab = one_vocab
-        elif one_vocab != vocab:
-            raise ValueError("all models must have identical vocabs in the "
-                             "same order")
-        V = len(vocab)
-        cell = LSTMCell(V, len(h0))
-        cell.W = [list(row) for row in W]
-        cell.b = list(b)
-        loaded.append((cell, Why, by, h0, c0))
-    V = len(vocab)
-    table = {ch: i for i, ch in enumerate(vocab)}
-
-    base_dir = os.path.dirname(list_path)
-
-    # 每个清单项的语料只读一次并转成 id 序列；计算结果与重复读取逐位相同。
-    entry_ids = []
-    for corpus_text, _window_text in entries:
-        corpus_path = os.path.join(base_dir, corpus_text)
-        with open(corpus_path, "rb") as f:
-            corpus = f.read().decode("utf-8")
-        if len(corpus) < 2:
-            raise ValueError("corpus must contain at least 2 codepoints")
-
-        ids = [0] * len(corpus)
-        for t, ch in enumerate(corpus):
-            ix = table.get(ch)
-            if ix is None:
-                raise ValueError(
-                    "corpus contains an out-of-vocab character")
-            ids[t] = ix
-        entry_ids.append(ids)
-
-    def _step_nll(cell, Why, by, h, c, memory, ids, t, window_text):
-        """perplexity-lstm-attn 单步：推进状态并返回 (nll, h, c, memory)。"""
-        y = ids[t + 1]
-
-        x = [0.0] * V
-        x[ids[t]] = 1.0
-
-        h, c = cell.forward(x, h, c)[:2]
-
-        M = _window_tail(memory, window_text)
-        u = _attn_context(h, M)
-
-        z = _output_logits(Why, by, u)
-
-        m = max(z)
-        if not math.isfinite(m):
-            raise ValueError("logit maximum is non-finite")
-        d = 0.0
-        for k in range(V):
-            d += math.exp(z[k] - m)
-            if not math.isfinite(d):
-                raise ValueError(
-                    "softmax denominator accumulated non-finitely")
-
-        nll = m + math.log(d) - z[y]
-        if not math.isfinite(nll):
-            raise ValueError("cross-entropy step is non-finite")
-
-        memory.append([float(v) for v in h])
-        return nll, h, c, memory
-
-    def _total_nll(cell, Why, by, h0_m, c0_m, ids, window_text):
-        """从自身 h0、c0、memory=[h0] 独立重置并按 t 升序累加总 NLL。"""
-        memory = [h0_m]
-        h = list(h0_m)
-        c = list(c0_m)
-        total = 0.0
-        for t in range(len(ids) - 1):
-            nll, h, c, memory = _step_nll(
-                cell, Why, by, h, c, memory, ids, t, window_text)
-            total += nll
-            if not math.isfinite(total):
-                raise ValueError(
-                    "item total NLL accumulated non-finitely")
-        return total
+    model_paths, entries, loaded, entry_ids = _load_rank_inputs(
+        models_path, list_path)
 
     n_models = len(loaded)
     items = []
@@ -3804,9 +3622,11 @@ def _rank_window_stability_details(models_path, list_path, bases_text):
                 ids = entry_ids[gi]
                 T = len(ids) - 1
 
-                # 两轨均从自身 h0、c0、memory=[h0] 独立重置。
-                L = _total_nll(cell, Why, by, h0_m, c0_m, ids, window_text)
-                B = _total_nll(cell, Why, by, h0_m, c0_m, ids, base_text)
+                # 两轨均经 _total_rank_nll 从自身 h0、c0、memory=[h0] 重置。
+                L = _total_rank_nll(cell, Why, by, h0_m, c0_m, ids,
+                                    window_text)
+                B = _total_rank_nll(cell, Why, by, h0_m, c0_m, ids,
+                                    base_text)
 
                 delta = L - B
                 if not math.isfinite(delta):
