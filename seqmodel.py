@@ -5855,6 +5855,152 @@ def _sample_lstm_attn_topk_topp_batch(model_path, start, seeds_path,
                       allow_nan=False) + "\n"
 
 
+def _sample_lstm_attn_topk_topp_consensus(
+        model_path, start, seeds_path, start_t_text, end_t_text, top_k_text,
+        top_p_text, length_text, window_text):
+    """sample-lstm-attn-top-k-top-p-consensus：多 seed 采样的逐位共识与熵。
+
+    SEEDS 的严格 UTF-8 JSON、非空数组、元素为匹配 _INT_RE 的 str 及重复
+    按原序保留契约、逐项独立调用 _sample_lstm_attn_topk_topp_run 的方
+    式、d_i=Σ_j H(text_i,text_j) 与 medoid=(d_i,-total_i,i) 的计算，全
+    部逐值沿用 _sample_lstm_attn_topk_topp_batch；MODEL、START、
+    START_T、END_T、TOP_K、TOP_P、LENGTH、WINDOW 的全部校验、温度退火、
+    top-k 后 top-p 截取、随机源初始化与消费及错误协议亦严格沿用该入
+    口，runs 与 medoid 同参逐值相同。不写任何文件。
+
+    令 N 为种子数。每个位置 t 按 vocab 索引 k 升序计数 n=text_i[t]==
+    vocab[k] 的项数；counts 仅含 n>0 的 [vocab[k],n]，按 k 升序。
+    winner 取 n 最大者，并列时取最小 k。令 p=n/N，位置熵 e 从 0.0 按 k
+    升序对各 n>0 累加 -p*math.log(p)；总熵 E 从 0.0 按 t 升序累加各 e；
+    任一项或累加结果非有限即失败。LENGTH 为 0 时不计算熵。
+
+    stdout 恰为单个 JSON 对象加 LF，键序
+    runs,medoid,positions,consensus,mean_entropy；runs 与 medoid 逐值
+    同 batch；positions 按 t 升序，每项恰为
+    [t,counts,winner,format(e,'.17g')]，t 与计数为 int；consensus 为各
+    位置 winner 按 t 升序连接的字符串；mean_entropy 为
+    format(E/LENGTH,'.17g')。LENGTH 为 0 时 positions、consensus、
+    mean_entropy 依次为 []、""、"0"。序列化恰用
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n' 的 UTF-8 字节；失败时 stdout 为空。
+    """
+    # SEEDS：严格 UTF-8 的 JSON 非空数组，元素为匹配整数词法的 str。
+    with open(seeds_path, "rb") as f:
+        seeds = json.loads(f.read().decode("utf-8"))
+    if not isinstance(seeds, list) or not seeds:
+        raise ValueError("SEEDS must be a non-empty JSON array")
+    for seed_text in seeds:
+        if type(seed_text) is not str or not _INT_RE.match(seed_text):
+            raise ValueError(
+                "each seed must match 0|-?[1-9][0-9]*")
+
+    # 先于逐项采样加载并校验模型（与 batch 首次采样调用内的加载同一加载
+    # 器），vocab 供下方逐位计数；模型非法时失败顺序与 batch 一致。
+    # WINDOW 词法在采样核心内先于模型加载校验，此处保持同一先后。
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+    vocab = _load_perplexity_lstm_model(model_path)[0]
+    V = len(vocab)
+
+    runs = []
+    texts = []
+    totals = []
+    for seed_text in seeds:
+        # 每项均以独立调用采样，随机源在核心内按 seed 新建，项间不共享
+        # 任何状态；返回值逐值等同于单独调用 -scored 入口。
+        text, logprobs, total = _sample_lstm_attn_topk_topp_run(
+            model_path, start, seed_text, start_t_text, end_t_text,
+            top_k_text, top_p_text, length_text, window_text)
+        runs.append([
+            seed_text,
+            text,
+            [format(lp, ".17g") for lp in logprobs],
+            format(total, ".17g"),
+            0,
+        ])
+        texts.append(text)
+        totals.append(total)
+
+    n = len(texts)
+    for i in range(n):
+        # H(text_i,text_j)：等长部分逐码点比较，长度差位置全部计不等；
+        # d_i 按 j 原序自 0 累加。
+        d_i = 0
+        ti = texts[i]
+        for tj in texts:
+            if len(ti) >= len(tj):
+                longer, shorter = ti, tj
+            else:
+                longer, shorter = tj, ti
+            dij = len(longer) - len(shorter)
+            for k, ch in enumerate(shorter):
+                if ch != longer[k]:
+                    dij += 1
+            d_i += dij
+        runs[i][4] = d_i
+
+    # medoid 按 (d_i,-total_i,i) 升序取首项；total 用未格式化 float。
+    medoid = min(range(n), key=lambda i: (runs[i][4], -totals[i], i))
+
+    # LENGTH 词法已由采样核心校验，此处仅转 int 驱动逐位计数。
+    length = int(length_text)
+
+    positions = []
+    consensus = []
+    entropy_total = 0.0
+    for t in range(length):
+        counts = []
+        winner = None
+        winner_n = -1
+        entropy = 0.0
+        for k in range(V):
+            # n 按 i 原序计数；仅 n>0 的 [vocab[k],n] 进入 counts。
+            ch = vocab[k]
+            count_k = 0
+            for i in range(n):
+                if texts[i][t] == ch:
+                    count_k += 1
+            if count_k == 0:
+                continue
+            counts.append([ch, count_k])
+            # p=n/N；e 从 0.0 按 k 升序累加 -p*log(p)。
+            p = count_k / n
+            term = -p * math.log(p)
+            if not math.isfinite(term):
+                raise ValueError("entropy term became non-finite")
+            entropy += term
+            if not math.isfinite(entropy):
+                raise ValueError("entropy accumulated non-finitely")
+            # k 升序遍历且仅在严格更大时更新，并列自然取最小 k。
+            if count_k > winner_n:
+                winner_n = count_k
+                winner = ch
+        positions.append([t, counts, winner, format(entropy, ".17g")])
+        consensus.append(winner)
+        # E 从 0.0 按 t 升序累加各位置熵 e。
+        entropy_total += entropy
+        if not math.isfinite(entropy_total):
+            raise ValueError("total entropy accumulated non-finitely")
+
+    if length == 0:
+        mean_entropy_text = "0"
+    else:
+        mean_entropy = entropy_total / length
+        if not math.isfinite(mean_entropy):
+            raise ValueError("mean entropy became non-finite")
+        mean_entropy_text = format(mean_entropy, ".17g")
+
+    obj = {
+        "runs": runs,
+        "medoid": medoid,
+        "positions": positions,
+        "consensus": "".join(consensus),
+        "mean_entropy": mean_entropy_text,
+    }
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+
+
 def _beam_lstm_attn(model_path, start, start_t_text, end_t_text,
                     beam_text, length_text, window_text):
     """以线性退火温度、带注意力上下文从 LSTM 模型做确定性束搜索。
@@ -7144,6 +7290,20 @@ def main(argv):
     json.dumps(obj,ensure_ascii=True,separators=(',',':'),
     allow_nan=False)+'\\n' 的 UTF-8 字节。失败时 stdout 为空且不写文件。
 
+    python seqmodel.py sample-lstm-attn-consensus MODEL START SEEDS
+    START_T END_T TOP_K TOP_P LENGTH WINDOW：除输出外，SEEDS 文件契约、
+    逐项采样、runs 与 medoid 的计算全部严格沿用
+    sample-lstm-attn-top-k-top-p-batch，同参 runs、medoid 逐值相同，原
+    入口不变。令 N 为种子数：每个位置 t 按 vocab 索引 k 升序计数 n，
+    仅输出 n>0 的 [vocab[k],n]；winner 取 n 最大者，并列取最小 k。令
+    p=n/N，位置熵 e 从 0.0 按 k 升序累加 -p*math.log(p)，总熵 E 从 0.0
+    按 t 升序累加，任一项或累加结果非有限即失败。stdout 恰为单个 JSON
+    对象加 LF，键序 runs,medoid,positions,consensus,mean_entropy；
+    positions 按 t 升序，每项恰为 [t,counts,winner,format(e,'.17g')]；
+    consensus 连接各位置 winner；mean_entropy 为
+    format(E/LENGTH,'.17g')；LENGTH 为 0 时三者依次为 []、""、"0"。序
+    列化、返回码、stderr、失败原子性及不写文件均沿用原 batch 入口。
+
     python seqmodel.py beam-lstm-attn MODEL START START_T END_T BEAM LENGTH
     WINDOW：以线性退火温度、带注意力上下文从 version 2 的 LSTM 模型做确定
     性束搜索。除 BEAM 与确定性选束外，参数校验、LENGTH 的 0/1 语义、线性
@@ -7370,6 +7530,12 @@ def main(argv):
         elif (len(argv) == 11
               and argv[1] == "sample-lstm-attn-top-k-top-p-batch"):
             output = _sample_lstm_attn_topk_topp_batch(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                argv[8], argv[9], argv[10])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif (len(argv) == 11
+              and argv[1] == "sample-lstm-attn-consensus"):
+            output = _sample_lstm_attn_topk_topp_consensus(
                 argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
                 argv[8], argv[9], argv[10])
             sys.stdout.buffer.write(output.encode("utf-8"))
