@@ -4353,6 +4353,141 @@ def _score_lstm_attn(model_path, start, text, temperature_text, window_text):
     return format(total, ".17g") + "\n"
 
 
+def _score_lstm_attn_batch(model_path, start, candidates_path,
+                           temperature_text, window_text):
+    """确定性评分 CANDIDATES 文件中的多个候选，返回待写出的 JSON 字符串。
+
+    MODEL、START、TEMPERATURE、WINDOW 的读取、词法、形状、F 及失败契约
+    均沿用 score-lstm-attn；本命令无 SEED、无随机源且不写文件。CANDIDATES
+    为严格 UTF-8 的 JSON 文件路径，顶层须为非空数组；元素须为 str（允许空
+    串）且每个码点在 vocab 内，否则抛 ValueError。
+
+    每个候选独立重置 h=h0、c=c0、x=START 索引、memory=[h0]、total=0.0，
+    逐字符推进与 score-lstm-attn 完全一致：one-hot 推进 LSTM、窗口注意力、
+    a=z/TEMPERATURE、m=max(a)、d 自 0.0 依 k 升序累加 exp(a[k]-m)、
+    lp=a[y]-m-log(d)、total 自 0.0 累加，steps 为码点数；候选间不共享任何
+    状态。任一计算非有限均抛 ValueError。成功返回单个 JSON 对象加 LF：键序
+    items,best；items 每项恰为 [text,steps,format(total,'.17g')]，best 为
+    total 最高候选的 int 下标，平分取较小下标。序列化恰用
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n'。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    vocab, W, b, Why, by, h0, c0 = _load_perplexity_lstm_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # TEMPERATURE：float() 可解析且有限、严格大于 0；inf/nan/0/负数均失败。
+    temperature = float(temperature_text)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite positive float")
+
+    # CANDIDATES：严格 UTF-8 的 JSON 非空数组；元素为可空 str，每个码点须
+    # 在词表内。
+    with open(candidates_path, "rb") as f:
+        candidates = json.loads(f.read().decode("utf-8"))
+    if not isinstance(candidates, list) or not candidates:
+        raise ValueError("CANDIDATES must be a non-empty JSON array")
+    table = {ch: i for i, ch in enumerate(vocab)}
+    candidate_ids = []
+    for text in candidates:
+        if type(text) is not str:
+            raise ValueError("each candidate must be a string")
+        ids = [0] * len(text)
+        for t, ch in enumerate(text):
+            ix = table.get(ch)
+            if ix is None:
+                raise ValueError(
+                    "candidate contains an out-of-vocab character")
+            ids[t] = ix
+        candidate_ids.append(ids)
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    start_id = vocab.index(start)
+    items = []
+    best = 0
+    best_total = None
+
+    # 每个候选独占一次完整重置，互不共享 h、c、x、memory 或 total。
+    for i in range(len(candidate_ids)):
+        ids = candidate_ids[i]
+        memory = [h0]
+        h = list(h0)
+        c = list(c0)
+        x = start_id
+        total = 0.0
+
+        for t in range(len(ids)):
+            # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+            xvec = [0.0] * V
+            xvec[x] = 1.0
+
+            h, c = cell.forward(xvec, h, c)[:2]
+
+            M = _window_tail(memory, window_text)
+            u = _attn_context(h, M)
+
+            # z_k = by_k + Σ_j Why_k,j*u_j，依 j 升序自 float 偏置累加。
+            z = _output_logits(Why, by, u)
+
+            # a_k=z_k/TEMPERATURE，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k
+            # 升序累加。
+            a = [0.0] * V
+            m = None
+            for k in range(V):
+                ak = z[k] / temperature
+                if not math.isfinite(ak):
+                    raise ValueError("scaled logit became non-finite")
+                a[k] = ak
+                if m is None or ak > m:
+                    m = ak
+            d = 0.0
+            for k in range(V):
+                try:
+                    ek = math.exp(a[k] - m)
+                except OverflowError:
+                    raise ValueError("softmax exp overflowed")
+                if not math.isfinite(ek):
+                    raise ValueError("softmax exp became non-finite")
+                d += ek
+                if not math.isfinite(d):
+                    raise ValueError(
+                        "softmax denominator accumulated non-finitely")
+
+            # 不抽样：y 为候选[t] 索引，lp=a[y]-m-log(d)，total 依 t 升序
+            # 累加。
+            y = ids[t]
+            lp = a[y] - m - math.log(d)
+            if not math.isfinite(lp):
+                raise ValueError("log probability is non-finite")
+            total += lp
+            if not math.isfinite(total):
+                raise ValueError(
+                    "total log probability accumulated non-finitely")
+
+            x = y
+            memory.append([float(v) for v in h])
+
+        items.append([candidates[i], len(ids), format(total, ".17g")])
+        # 严格大于才替换：平分时保留首次出现的较小下标。
+        if best_total is None or total > best_total:
+            best = i
+            best_total = total
+
+    obj = {"items": items, "best": best}
+    return (json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                       allow_nan=False) + "\n")
+
+
 def _sample_lstm_attn_anneal(model_path, start, seed_text, start_t_text,
                              end_t_text, length_text, window_text):
     """以线性退火温度、带注意力上下文从 LSTM 语言模型采样 LENGTH 个码点。
@@ -6324,6 +6459,21 @@ def main(argv):
     format(total,'.17g')+'\\n' 的 ASCII 字节（空 TEXT 为 "0\\n"），
     stderr 为空并返回 0。
 
+    python seqmodel.py score-lstm-attn-batch MODEL START CANDIDATES
+    TEMPERATURE WINDOW：一次评分 CANDIDATES 文件中的多个候选。MODEL、
+    START、TEMPERATURE、WINDOW 及计算沿用 score-lstm-attn（WINDOW 整串匹
+    配 [1-9][0-9]* 并安全截取，不转 int）；无 SEED、无随机源、不写文件。
+    CANDIDATES 为严格 UTF-8 的 JSON 文件路径，顶层须为非空数组；元素须为
+    str（允许空串）且每个码点在 vocab，否则失败。每个候选独立重置 h0、
+    c0、START 索引与 memory，逐字符 one-hot 推进：a=z/TEMPERATURE、
+    m=max(a)、d 自 0.0 依 k 升序累加 exp(a[k]-m)，
+    lp=a[y]-m-math.log(d)，total 从 0.0 累加，steps 为码点数；候选间不共
+    享状态，任一计算非有限即失败。成功时 stdout 恰为单个 JSON 对象加 LF，
+    键序 items,best：items 每项恰为 [text,steps,format(total,'.17g')]，
+    best 为 total 最高候选的 int 下标，平分取较小下标。序列化恰用
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n' 的 UTF-8 字节，stderr 为空并返回 0。
+
     python seqmodel.py sample-lstm-attn-anneal MODEL START SEED START_T
     END_T LENGTH WINDOW：以线性退火温度、带注意力上下文从 version 2 的
     LSTM 模型采样。除温度外，MODEL、START、SEED、LENGTH、WINDOW、LSTM
@@ -6575,6 +6725,10 @@ def main(argv):
             output = _score_lstm_attn(argv[2], argv[3], argv[4], argv[5],
                                       argv[6])
             sys.stdout.buffer.write(output.encode("ascii"))
+        elif len(argv) == 7 and argv[1] == "score-lstm-attn-batch":
+            output = _score_lstm_attn_batch(
+                argv[2], argv[3], argv[4], argv[5], argv[6])
+            sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 9 and argv[1] == "sample-lstm-attn-anneal":
             output = _sample_lstm_attn_anneal(argv[2], argv[3], argv[4],
                                               argv[5], argv[6], argv[7],
