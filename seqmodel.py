@@ -1109,6 +1109,150 @@ class GRUCell(object):
         }
         return [float(v) for v in h], cache
 
+    def backward(self, dh, cache):
+        """单步反向传播，固定返回 (dx, dh_prev, dW, db)。
+
+        dh 须为长度 H 的 F 列表；cache 须为 dict 且严格符合 forward 的
+        公开缓存契约：恰含 x、h_prev、z、r、u、q、n、h、W 共 9 个有序键
+        （多、少、乱序均非法），其中 x 长 I，z、q 长 I+H，h_prev、r、u、
+        n、h 长 H，W 为 3H×(I+H)，元素均为 F。任一容器、键序、形状或
+        元素非法抛 ValueError；实参数量错误沿用 Python 自带的 TypeError。
+
+        所有运算逐元素（变量取 cache 同名值）：
+            dn   = dh*(1 - u)，du = dh*(h_prev - n)
+            da_n = dn*(1 - n^2)
+            dq[j] 对每个 j 以 0.0 起按 i 升序累加 W[2H+i][j]*da_n[i]
+            dr   = dq[I:]*h_prev
+            da_r = dr*r*(1-r)，da_u = du*u*(1-u)
+            da 依次拼接 da_r、da_u、da_n 各 H 项
+            dz[j] 对每个 j 以 0.0 起按 k=0..2H-1 升序累加 W[k][j]*da[k]
+            dx[j] = dq[j] + dz[j]（j=0..I-1）
+            dh_prev[i] 从 0.0 起依次加 dh[i]*u[i]、dq[I+i]*r[i]、dz[I+i]
+            dW 前 2H 行取 da[k]*z[j]，末 H 行取 da[k]*q[j]，db[k] = da[k]
+        四个返回值形状依次为 I、H、3H×(I+H)、3H，均为全新 float 列表
+        （dW 逐层新建），不修改或复用 dh、cache 及其内容。任一中间结果或
+        输出非有限同样抛 ValueError。
+        """
+        I, H = self.I, self.H
+        M = I + H
+        dh = _check_vector(dh, H, "dh")
+
+        if type(cache) is not dict:
+            raise ValueError("cache must be a dict returned by forward")
+        expected_keys = ["x", "h_prev", "z", "r", "u", "q", "n", "h", "W"]
+        if list(cache.keys()) != expected_keys:
+            raise ValueError(
+                "cache must contain exactly the 9 forward keys in order: %r"
+                % expected_keys)
+        _check_vector(cache["x"], I, "cache['x']")
+        h_prev = _check_vector(cache["h_prev"], H, "cache['h_prev']")
+        z = _check_vector(cache["z"], M, "cache['z']")
+        r = _check_vector(cache["r"], H, "cache['r']")
+        u = _check_vector(cache["u"], H, "cache['u']")
+        q = _check_vector(cache["q"], M, "cache['q']")
+        n = _check_vector(cache["n"], H, "cache['n']")
+        _check_vector(cache["h"], H, "cache['h']")
+        W = _check_matrix(cache["W"], 3 * H, M, "cache['W']")
+
+        # h = (1-u)*n + u*h_prev：dn、du；n = tanh(A_n(q))：da_n。
+        dn = [0.0] * H
+        du = [0.0] * H
+        da = [0.0] * (3 * H)
+        for i in range(H):
+            ui = float(u[i])
+            ni = float(n[i])
+
+            dni = float(dh[i]) * (1.0 - ui)
+            if not math.isfinite(dni):
+                raise ValueError("dn became non-finite")
+            dn[i] = dni
+
+            dui = float(dh[i]) * (float(h_prev[i]) - ni)
+            if not math.isfinite(dui):
+                raise ValueError("du became non-finite")
+            du[i] = dui
+
+            dani = dni * (1.0 - ni * ni)
+            if not math.isfinite(dani):
+                raise ValueError("candidate gradient became non-finite")
+            da[2 * H + i] = dani
+
+        # dq = W_nᵀ da_n：每个 j 独立以 0.0 起按 i 升序累加。
+        dq = [0.0] * M
+        for j in range(M):
+            acc = 0.0
+            for i in range(H):
+                acc += W[2 * H + i][j] * da[2 * H + i]
+                if not math.isfinite(acc):
+                    raise ValueError("dq accumulated to a non-finite value")
+            dq[j] = acc
+
+        # q[I+i] = r_i*h_prev_i：dr = dq[I:]*h_prev；两门 sigmoid 导数。
+        for i in range(H):
+            dri = dq[I + i] * float(h_prev[i])
+            if not math.isfinite(dri):
+                raise ValueError("dr became non-finite")
+
+            ri = float(r[i])
+            dari = dri * ri * (1.0 - ri)
+            if not math.isfinite(dari):
+                raise ValueError("reset gate gradient became non-finite")
+            da[i] = dari
+
+            ui = float(u[i])
+            daui = du[i] * ui * (1.0 - ui)
+            if not math.isfinite(daui):
+                raise ValueError("update gate gradient became non-finite")
+            da[H + i] = daui
+
+        # dz = [W_r; W_u]ᵀ da：每个 j 独立以 0.0 起按 k=0..2H-1 累加。
+        dz = [0.0] * M
+        for j in range(M):
+            acc = 0.0
+            for k in range(2 * H):
+                acc += W[k][j] * da[k]
+                if not math.isfinite(acc):
+                    raise ValueError("dz accumulated to a non-finite value")
+            dz[j] = acc
+
+        # x 同时进入 z[:I] 与 q[:I]：dx = dq[:I] + dz[:I]。
+        dx = [0.0] * I
+        for j in range(I):
+            v = dq[j] + dz[j]
+            if not math.isfinite(v):
+                raise ValueError("dx became non-finite")
+            dx[j] = v
+
+        # h_prev 的三项贡献：直接路径 u、经 q[I:] 的 r、经 z[I:]。
+        dh_prev = [0.0] * H
+        for i in range(H):
+            acc = 0.0
+            acc += float(dh[i]) * float(u[i])
+            if not math.isfinite(acc):
+                raise ValueError("dh_prev accumulated to a non-finite value")
+            acc += dq[I + i] * float(r[i])
+            if not math.isfinite(acc):
+                raise ValueError("dh_prev accumulated to a non-finite value")
+            acc += dz[I + i]
+            if not math.isfinite(acc):
+                raise ValueError("dh_prev accumulated to a non-finite value")
+            dh_prev[i] = acc
+
+        # dW：门段（r、u）对 z 求导，候选段（n）对 q 求导；db = da。
+        dW = [[0.0] * M for _ in range(3 * H)]
+        for k in range(3 * H):
+            row = dW[k]
+            dak = da[k]
+            src = z if k < 2 * H else q
+            for j in range(M):
+                v = dak * src[j]
+                if not math.isfinite(v):
+                    raise ValueError("dW became non-finite")
+                row[j] = v
+        db = [float(v) for v in da]
+
+        return dx, dh_prev, dW, db
+
 
 # 模型 JSON 顶层唯一允许的键及其出现顺序。
 _MODEL_KEYS = ["version", "vocab", "Wxh", "Whh", "bh", "Why", "by", "h0"]
