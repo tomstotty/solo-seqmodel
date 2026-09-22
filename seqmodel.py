@@ -4020,6 +4020,103 @@ def _lstm_attn_mean_lag(model_path, corpus_path, window_text):
                       allow_nan=False) + "\n"
 
 
+def _lstm_attn_reach(model_path, corpus_path, window_text, mass_text):
+    """perplexity-lstm-attn 每步注意力权重的质量回眺长度，返回待写出的字符串。
+
+    MODEL、CORPUS、WINDOW 的校验、状态推进（h、c 与 memory）与 M 截取
+    完全沿用 _lstm_attn_weights，但不计算输出层与负对数似然（它们不影响
+    状态）。MASS 经 float() 解析，须有限且 0<MASS<=1，否则抛 ValueError。
+    令 T=语料码点数-1、A=0.0；t 升序先以当前字符 one-hot 调用
+    LSTMCell.forward 更新 h、c，M 取 memory 末尾至多 WINDOW 项（从旧到
+    新），在向 memory 追加 h 前以 attention([h], M, M, None) 取 w[0]，
+    并令 start=t+1-len(M)；第 t 步令 c=0.0，j 自 len(M)-1 降至 0 累加
+    c+=w[0][j]，首次 c>=MASS 即令 reach=len(M)-j，否则 reach=len(M)。
+    c 及按 t 升序执行的 A+=float(reach) 均须有限，否则抛 ValueError。
+    构造 JSON 对象：顶层键序恰为 version,mass,items,mean_reach；version
+    为 int 1；mass 为 format(MASS,'.17g') 字符串；items 为 T 长列表，
+    第 t 项为三个 int 的列表 [t,start,reach]；mean_reach 为
+    format(A/T,'.17g') 字符串。返回
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n'，不写文件。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    # MASS：float() 可解析且有限，0<MASS<=1。
+    mass = float(mass_text)
+    if not math.isfinite(mass) or mass <= 0.0 or mass > 1.0:
+        raise ValueError("MASS must be a finite float with 0<MASS<=1")
+
+    vocab, W, b, Why, by, h0, c0 = _load_perplexity_lstm_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    memory = [h0]
+    h = list(h0)
+    c = list(c0)
+    T = len(ids) - 1
+    A = 0.0
+    items = []
+    for t in range(T):
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c = cell.forward(x, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        _ctx, w = attention([h], M, M, None)
+        start = t + 1 - len(M)
+
+        # 第 t 步回眺：c 自 0.0 起按 j 降序累加 w[0][j]，首次 c>=MASS
+        # 时 reach=len(M)-j，否则 reach=len(M)。
+        mass_acc = 0.0
+        reach = len(M)
+        for j in range(len(M) - 1, -1, -1):
+            mass_acc += w[0][j]
+            if not math.isfinite(mass_acc):
+                raise ValueError("mass accumulated to a non-finite value")
+            if mass_acc >= mass:
+                reach = len(M) - j
+                break
+        A += float(reach)
+        if not math.isfinite(A):
+            raise ValueError("total reach accumulated to a non-finite value")
+
+        items.append([t, start, reach])
+
+        memory.append([float(v) for v in h])
+
+    mean = A / T
+    if not math.isfinite(mean):
+        raise ValueError("mean reach is non-finite")
+
+    obj = {
+        "version": 1,
+        "mass": format(mass, ".17g"),
+        "items": items,
+        "mean_reach": format(mean, ".17g"),
+    }
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+
+
 def _sample_attn(model_path, start, seed_text, temperature_text, length_text,
                  window_text):
     """带注意力上下文从 RNN 语言模型采样 LENGTH 个码点，返回待写出的字符串。
@@ -6714,6 +6811,9 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 5 and argv[1] == "lstm-attn-mean-lag":
             output = _lstm_attn_mean_lag(argv[2], argv[3], argv[4])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 6 and argv[1] == "lstm-attn-reach":
+            output = _lstm_attn_reach(argv[2], argv[3], argv[4], argv[5])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 6 and argv[1] == "train-attn":
             _train_attn(argv[2], argv[3], argv[4], argv[5])
