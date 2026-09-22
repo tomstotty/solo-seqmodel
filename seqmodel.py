@@ -5222,6 +5222,87 @@ def _sample_lstm_attn_topp_scored(model_path, start, seed_text, start_t_text,
                       allow_nan=False) + "\n"
 
 
+def _sample_lstm_attn_topp_batch(model_path, start, seeds_path,
+                                 start_t_text, end_t_text, top_p_text,
+                                 length_text, window_text):
+    """sample-lstm-attn-top-p-batch：对 SEEDS 文件中的多个种子独立采样。
+
+    SEEDS 为严格 UTF-8 的 JSON 非空数组文件；每个元素 type 恰为 str，且
+    整串匹配 _INT_RE（0|-?[1-9][0-9]*，禁止空白、+ 前缀、前导零、下划
+    线），重复项按原序保留；文件读取、UTF-8/JSON 解析或元素非法即按既
+    有协议失败。MODEL、START、START_T、END_T、TOP_P、LENGTH、WINDOW 与
+    其余校验、解码、逐步得分、total 累加及错误协议均沿用
+    sample-lstm-attn-top-p-scored。
+
+    按 SEEDS 原序逐项独立调用 _sample_lstm_attn_topp_run，每项逐值等同
+    于以该 seed 单独调用 sample-lstm-attn-top-p-scored 入口，项间不共享
+    任何随机源或采样状态。令 d_i=Σ_j H(text_i,text_j)，H 为两串逐码点
+    不等位置数（较短串长度之外的位置均计为不等），j 按原序自 0 累加；
+    medoid 按 (d_i,-total_i,i) 升序取首项下标，total 使用累加所得的未
+    格式化 float。不写任何文件。
+
+    stdout 恰为单个 JSON 对象加 LF，键序 runs,medoid；runs[i] 恰为
+    [SEEDS[i],text_i,logs_i,format(total_i,'.17g'),d_i]，SEEDS[i] 为原
+    始种子 str，text_i 为生成字符串（不含尾随 LF），logs_i 为逐步
+    format(lp,'.17g') 字符串列表，d_i 为 int；medoid 为所选 int 下标。
+    序列化恰用 json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n' 的 UTF-8 字节。
+    """
+    # SEEDS：严格 UTF-8 的 JSON 非空数组，元素为匹配整数词法的 str。
+    with open(seeds_path, "rb") as f:
+        seeds = json.loads(f.read().decode("utf-8"))
+    if not isinstance(seeds, list) or not seeds:
+        raise ValueError("SEEDS must be a non-empty JSON array")
+    for seed_text in seeds:
+        if type(seed_text) is not str or not _INT_RE.match(seed_text):
+            raise ValueError(
+                "each seed must match 0|-?[1-9][0-9]*")
+
+    runs = []
+    texts = []
+    totals = []
+    for seed_text in seeds:
+        # 每项均以独立调用采样，随机源在核心内按 seed 新建，项间不共享
+        # 任何状态；返回值逐值等同于单独调用 -scored 入口。
+        text, logprobs, total = _sample_lstm_attn_topp_run(
+            model_path, start, seed_text, start_t_text, end_t_text,
+            top_p_text, length_text, window_text)
+        runs.append([
+            seed_text,
+            text,
+            [format(lp, ".17g") for lp in logprobs],
+            format(total, ".17g"),
+            0,
+        ])
+        texts.append(text)
+        totals.append(total)
+
+    n = len(texts)
+    for i in range(n):
+        # H(text_i,text_j)：等长部分逐码点比较，长度差位置全部计不等；
+        # d_i 按 j 原序自 0 累加。
+        d_i = 0
+        ti = texts[i]
+        for tj in texts:
+            if len(ti) >= len(tj):
+                longer, shorter = ti, tj
+            else:
+                longer, shorter = tj, ti
+            dij = len(longer) - len(shorter)
+            for k, ch in enumerate(shorter):
+                if ch != longer[k]:
+                    dij += 1
+            d_i += dij
+        runs[i][4] = d_i
+
+    # medoid 按 (d_i,-total_i,i) 升序取首项；total 用未格式化 float。
+    medoid = min(range(n), key=lambda i: (runs[i][4], -totals[i], i))
+
+    obj = {"runs": runs, "medoid": medoid}
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+
+
 def _sample_lstm_attn_topk_run(model_path, start, seed_text, start_t_text,
                                end_t_text, top_k_text, length_text,
                                window_text):
@@ -6894,6 +6975,22 @@ def main(argv):
     separators=(',',':'),allow_nan=False)+'\\n' 的 UTF-8 字节。返回码、
     stderr 及不写文件行为均沿用原入口。
 
+    python seqmodel.py sample-lstm-attn-top-p-batch MODEL START SEEDS
+    START_T END_T TOP_P LENGTH WINDOW：SEEDS 为严格 UTF-8 的 JSON 非空
+    数组文件，每个元素 type 恰为 str 且整串匹配 0|-?[1-9][0-9]*，重复项
+    按原序保留；文件读取、UTF-8/JSON 解析与元素非法均按既有错误协议失
+    败。其余校验、解码、逐步得分与错误协议均沿用
+    sample-lstm-attn-top-p-scored。按 SEEDS 原序逐项独立采样，每项逐值
+    等同于以该 seed 单独调用原入口，项间不共享随机源或任何状态。令
+    d_i=Σ_j H(text_i,text_j)，H 为两串逐码点不等位置数，j 按原序累
+    加；medoid 按 (d_i,-total_i,i) 升序取首项下标，total 使用未格式化
+    float。stdout 恰为单个 JSON 对象加 LF，键序 runs,medoid；
+    runs[i] 恰为 [SEEDS[i],text_i,logs_i,format(total_i,'.17g'),d_i]，
+    logs_i 为逐步 format(lp,'.17g') 字符串列表，medoid 为所选 int 下
+    标。序列化恰用 json.dumps(obj,ensure_ascii=True,
+    separators=(',',':'),allow_nan=False)+'\\n' 的 UTF-8 字节。失败时
+    stdout 为空且不写文件。
+
     python seqmodel.py sample-lstm-attn-top-k MODEL START SEED START_T
     END_T TOP_K LENGTH WINDOW：除 TOP_K 及候选截取外，参数校验、LENGTH
     的 0/1 语义、线性温度、LSTM 状态、注意力记忆、Why/by logit、稳定
@@ -7140,6 +7237,12 @@ def main(argv):
         elif (len(argv) == 10
               and argv[1] == "sample-lstm-attn-top-p-scored"):
             output = _sample_lstm_attn_topp_scored(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                argv[8], argv[9])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif (len(argv) == 10
+              and argv[1] == "sample-lstm-attn-top-p-batch"):
+            output = _sample_lstm_attn_topp_batch(
                 argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
                 argv[8], argv[9])
             sys.stdout.buffer.write(output.encode("utf-8"))
