@@ -2949,6 +2949,157 @@ def _compare_suite(model_a_path, model_b_path, list_path):
             + "\n")
 
 
+def _rank_suite(models_path, list_path):
+    """多个 LSTM-attn 模型在同一组 (语料, 窗口) 上按总 NLL 排名。
+
+    MODELS 为严格 UTF-8 的 JSON 数组，至少 2 项；每项须为非空相对路径
+    str（绝对路径非法），按 MODELS 文件的父目录解析；重复项按序保留，
+    否则抛 ValueError。LIST 的结构、语料相对路径（按 LIST 父目录解析）、
+    WINDOW 的 [1-9][0-9]* 词法及重复项契约完全沿用 compare-suite。
+
+    各模型的读取沿用 compare-lstm-attn 的 version 2 八键、F、形状与严格
+    UTF-8 契约；所有模型 vocab 须逐项同序相等，H 可不同。每个模型在每
+    个清单项均从自身 h0、c0、memory=[h0] 重置，单步状态推进、注意力、
+    logit 与稳定 log-sum-exp 完全沿用 compare-lstm-attn。每项 NLL 总和
+    L 从 0.0 按 t 升序累加（任一计算非有限即抛 ValueError）；模型总分
+    S 从 0.0 按 LIST 序累加各项 L，累加结果非有限即抛 ValueError。
+
+    按 (S, MODELS 原下标) 升序排名，S 以 float 精确比较。stdout 恰为
+    单个 JSON 对象加 LF，顶层唯一键 ranking；其值为排名后的数组，每项
+    恰为 [path, total_nll]，依次为 MODELS 原文 str 与
+    format(S,'.17g') 字符串。序列化恰用 json.dumps(obj,ensure_ascii=
+    True,separators=(',',':'),allow_nan=False)+'\\n'。整个对象先完整
+    构造再返回，故失败时不产生任何部分输出，不写文件。
+    """
+    with open(models_path, "rb") as f:
+        model_paths = json.loads(f.read().decode("utf-8"))
+    if not isinstance(model_paths, list) or len(model_paths) < 2:
+        raise ValueError("MODELS must be a JSON array with at least 2 items")
+    for path_text in model_paths:
+        if not isinstance(path_text, str) or not path_text \
+                or os.path.isabs(path_text):
+            raise ValueError("each model must be a non-empty relative path")
+
+    with open(list_path, "rb") as f:
+        suite = json.loads(f.read().decode("utf-8"))
+    if not isinstance(suite, list) or not suite:
+        raise ValueError("LIST must be a non-empty JSON array")
+    entries = []
+    for item in suite:
+        if (not isinstance(item, list) or len(item) != 2
+                or not isinstance(item[0], str)
+                or not isinstance(item[1], str)):
+            raise ValueError("each LIST item must be a [corpus, window] "
+                             "pair of strings")
+        corpus_text, window_text = item
+        if not corpus_text or os.path.isabs(corpus_text):
+            raise ValueError("each corpus must be a non-empty relative path")
+        if not _WINDOW_RE.match(window_text):
+            raise ValueError("each window must match [1-9][0-9]*")
+        entries.append((corpus_text, window_text))
+
+    models_base = os.path.dirname(models_path)
+    loaded = []
+    vocab = None
+    for path_text in model_paths:
+        resolved = os.path.join(models_base, path_text)
+        (one_vocab, W, b, Why, by, h0,
+         c0) = _load_perplexity_lstm_model(resolved)
+        if vocab is None:
+            vocab = one_vocab
+        elif one_vocab != vocab:
+            raise ValueError("all models must have identical vocabs in the "
+                             "same order")
+        V = len(vocab)
+        cell = LSTMCell(V, len(h0))
+        cell.W = [list(row) for row in W]
+        cell.b = list(b)
+        loaded.append((cell, Why, by, h0, c0))
+    V = len(vocab)
+    table = {ch: i for i, ch in enumerate(vocab)}
+
+    base_dir = os.path.dirname(list_path)
+
+    def _step_nll(cell, Why, by, h, c, memory, ids, t, window_text):
+        """perplexity-lstm-attn 单步：推进状态并返回 (nll, h, c, memory)。"""
+        y = ids[t + 1]
+
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c = cell.forward(x, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        u = _attn_context(h, M)
+
+        z = _output_logits(Why, by, u)
+
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        d = 0.0
+        for k in range(V):
+            d += math.exp(z[k] - m)
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        nll = m + math.log(d) - z[y]
+        if not math.isfinite(nll):
+            raise ValueError("cross-entropy step is non-finite")
+
+        memory.append([float(v) for v in h])
+        return nll, h, c, memory
+
+    # 每个模型的总分 S 从 0.0 起，按 LIST 序累加各项 L。
+    scores = [0.0] * len(loaded)
+    for corpus_text, window_text in entries:
+        corpus_path = os.path.join(base_dir, corpus_text)
+        with open(corpus_path, "rb") as f:
+            corpus = f.read().decode("utf-8")
+        if len(corpus) < 2:
+            raise ValueError("corpus must contain at least 2 codepoints")
+
+        ids = [0] * len(corpus)
+        for t, ch in enumerate(corpus):
+            ix = table.get(ch)
+            if ix is None:
+                raise ValueError(
+                    "corpus contains an out-of-vocab character")
+            ids[t] = ix
+
+        T = len(ids) - 1
+
+        for mi, (cell, Why, by, h0_m, c0_m) in enumerate(loaded):
+            # 每项均从自身 h0、c0、memory=[h0] 独立重置。
+            memory = [h0_m]
+            h = list(h0_m)
+            c = list(c0_m)
+            L = 0.0
+            for t in range(T):
+                nll, h, c, memory = _step_nll(
+                    cell, Why, by, h, c, memory, ids, t, window_text)
+                L += nll
+                if not math.isfinite(L):
+                    raise ValueError(
+                        "item total NLL accumulated non-finitely")
+
+            scores[mi] += L
+            if not math.isfinite(scores[mi]):
+                raise ValueError("model score accumulated non-finitely")
+
+    # 按 (S, MODELS 原下标) 升序排名；S 以 float 精确比较，下标决胜保序。
+    order = sorted(range(len(loaded)),
+                   key=lambda mi: (scores[mi], mi))
+    ranking = [[model_paths[mi], format(scores[mi], ".17g")]
+               for mi in order]
+
+    obj = {"ranking": ranking}
+    return (json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                       allow_nan=False)
+            + "\n")
+
+
 def _perplexity_lstm_attn_trace(model_path, corpus_path, window_text):
     """perplexity-lstm-attn 的逐步负对数似然轨迹，返回待写出的字符串。
 
@@ -5491,6 +5642,20 @@ def main(argv):
     json.dumps(obj,ensure_ascii=True,separators=(',',':'),
     allow_nan=False)+'\\n'；失败时不输出任何部分行，不写文件。
 
+    python seqmodel.py rank-suite MODELS LIST：MODELS 为严格 UTF-8 的
+    JSON 数组且至少 2 项，每项须为非空相对路径 str（按 MODELS 父目录
+    解析），重复项按序保留。LIST 的结构、语料路径、WINDOW 及重复项
+    契约沿用 compare-suite。模型读取与逐项计算沿用 compare-lstm-attn：
+    所有模型 vocab 须同序相等，H 可不同；每个模型在每项均从自身 h0、
+    c0、memory=[h0] 重置。每项 NLL 总和 L 从 0.0 按 t 升序累加；模型
+    总分 S 从 0.0 按 LIST 序累加 L，任一计算非有限即失败。按
+    (S,MODELS 原下标) 升序排名，S 以 float 精确比较。stdout 恰为单个
+    JSON 对象加 LF，顶层唯一键 ranking；其值为排名后的数组，每项恰为
+    [path,total_nll]，依次为 MODELS 原文 str 与
+    format(S,'.17g') 字符串。序列化恰用
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n'；失败时不输出任何部分行，不写文件。
+
     python seqmodel.py sample-attn MODEL START SEED TEMPERATURE LENGTH
     WINDOW：以同样的注意力上下文替换 logit 隐状态，softmax 与抽样契约
     与 sample 相同，整次仅初始化一次随机源、不写文件。WINDOW 整串匹配
@@ -5726,6 +5891,9 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 5 and argv[1] == "compare-suite":
             output = _compare_suite(argv[2], argv[3], argv[4])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 4 and argv[1] == "rank-suite":
+            output = _rank_suite(argv[2], argv[3])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 5 and argv[1] == "lstm-attn-weights":
             output = _lstm_attn_weights(argv[2], argv[3], argv[4])
