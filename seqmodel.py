@@ -1007,6 +1007,113 @@ class LSTMCell(object):
         return dxs, dh0, dc0, dW, db
 
 
+class GRUCell(object):
+    """单步 GRU 单元，参数 W/b 由 seed 确定性初始化。
+
+    W 形状 3H×(I+H)，b 形状 3H。以 R = random.Random(seed)、
+    s = 1/sqrt(I+H)，按 W 行列序令每项为 float((2*R.random()-1)*s)，
+    b 初始化为全 0.0。
+    """
+
+    def __init__(self, I, H, seed=0):
+        if type(I) is not int or type(H) is not int or I <= 0 or H <= 0:
+            raise ValueError("I and H must be positive integers")
+        if type(seed) is not int:
+            raise ValueError("seed must be an integer")
+        self.I = I
+        self.H = H
+        R = random.Random(seed)
+        s = 1.0 / math.sqrt(I + H)
+        self.W = [[float((2 * R.random() - 1) * s)
+                   for _ in range(I + H)] for _ in range(3 * H)]
+        self.b = [0.0] * (3 * H)
+
+    def forward(self, x, h_prev):
+        """单步前向传播，返回 (h, cache)。
+
+        x、h_prev 须分别为长度 I、H 的 F 列表；self.W、self.b 须仍满足
+        3H×(I+H)、3H 的形状且元素均为 F，否则抛 ValueError。
+
+        记 A_k(v) = b[k] + Σ_j W[k][j]*v[j]（j 升序累加），逐元素：
+            z = x + h_prev
+            r_i = sigmoid(A_i(z))，u_i = sigmoid(A_{H+i}(z))
+            q = x + (r ⊙ h_prev)
+            n_i = tanh(A_{2H+i}(q))
+            h_i = (1 - u_i)*n_i + u_i*h_prev_i
+        中间量出现非有限值同样抛 ValueError。返回的 h 为 H 长新的 float
+        列表；cache 为 dict，键按 x、h_prev、z、r、u、q、n、h、W 顺序
+        插入，向量值均为新的 float 列表，W 为二维 float 深拷贝；返回
+        对象不复用或修改输入及属性。实参数量错误沿用 Python 自带的
+        TypeError。
+        """
+        I, H = self.I, self.H
+        x = _check_vector(x, I, "x")
+        h_prev = _check_vector(h_prev, H, "h_prev")
+        W = _check_matrix(self.W, 3 * H, I + H, "W")
+        b = _check_vector(self.b, 3 * H, "b")
+
+        z = x + h_prev
+
+        # A_k(v) = b[k] + Σ_j W[k][j]*v[j]，自 float(b[k]) 起按 j 升序累加
+        def _preacts(v):
+            a = [0.0] * (3 * H)
+            for k in range(3 * H):
+                acc = float(b[k])
+                row = W[k]
+                for j in range(I + H):
+                    acc += float(row[j]) * float(v[j])
+                if not math.isfinite(acc):
+                    raise ValueError("pre-activation accumulated to a "
+                                     "non-finite value")
+                a[k] = acc
+            return a
+
+        # 连续 H 段依次解释为 r、u（作用于 z）
+        az = _preacts(z)
+        r = [0.0] * H
+        u = [0.0] * H
+        for i in range(H):
+            r[i] = LSTMCell._sigmoid(az[i])
+            u[i] = LSTMCell._sigmoid(az[H + i])
+
+        # q = x + (r ⊙ h_prev)：前 I 项为 x，后 H 项为 r*h_prev
+        q = [0.0] * (I + H)
+        for j in range(I):
+            q[j] = float(x[j])
+        for i in range(H):
+            rv = r[i] * float(h_prev[i])
+            if not math.isfinite(rv):
+                raise ValueError("reset gate application became non-finite")
+            q[I + i] = rv
+
+        # 末 H 段作用于 q，经 tanh 得候选状态 n
+        aq = _preacts(q)
+        n = [0.0] * H
+        h = [0.0] * H
+        for i in range(H):
+            nv = math.tanh(aq[2 * H + i])
+            if not math.isfinite(nv):
+                raise ValueError("candidate state became non-finite")
+            n[i] = nv
+            hv = (1.0 - u[i]) * nv + u[i] * float(h_prev[i])
+            if not math.isfinite(hv):
+                raise ValueError("hidden state became non-finite")
+            h[i] = hv
+
+        cache = {
+            "x": [float(v) for v in x],
+            "h_prev": [float(v) for v in h_prev],
+            "z": [float(v) for v in z],
+            "r": [float(v) for v in r],
+            "u": [float(v) for v in u],
+            "q": [float(v) for v in q],
+            "n": [float(v) for v in n],
+            "h": [float(v) for v in h],
+            "W": [[float(v) for v in row] for row in W],
+        }
+        return [float(v) for v in h], cache
+
+
 # 模型 JSON 顶层唯一允许的键及其出现顺序。
 _MODEL_KEYS = ["version", "vocab", "Wxh", "Whh", "bh", "Why", "by", "h0"]
 
