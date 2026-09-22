@@ -1253,6 +1253,114 @@ class GRUCell(object):
 
         return dx, dh_prev, dW, db
 
+    def _check_forward_cache(self, cache):
+        """校验单个 cache 严格符合 forward 的公开缓存契约。
+
+        须为 dict，恰含 x、h_prev、z、r、u、q、n、h、W 共 9 个有序键
+        （多、少、乱序均非法），其中 x 长 I，h_prev、r、u、n、h 长 H，
+        z、q 长 I+H，W 为 3H×(I+H)，元素均为 F。任一容器、键序、形状或
+        元素非法抛 ValueError。
+        """
+        I, H = self.I, self.H
+        if type(cache) is not dict:
+            raise ValueError("cache must be a dict returned by forward")
+        expected_keys = ["x", "h_prev", "z", "r", "u", "q", "n", "h", "W"]
+        if list(cache.keys()) != expected_keys:
+            raise ValueError(
+                "cache must contain exactly the 9 forward keys in order: %r"
+                % expected_keys)
+        _check_vector(cache["x"], I, "cache['x']")
+        _check_vector(cache["h_prev"], H, "cache['h_prev']")
+        _check_vector(cache["z"], I + H, "cache['z']")
+        _check_vector(cache["r"], H, "cache['r']")
+        _check_vector(cache["u"], H, "cache['u']")
+        _check_vector(cache["q"], I + H, "cache['q']")
+        _check_vector(cache["n"], H, "cache['n']")
+        _check_vector(cache["h"], H, "cache['h']")
+        _check_matrix(cache["W"], 3 * H, I + H, "cache['W']")
+
+    def backward_sequence(self, dhs, caches, dh_last=None, tbptt_steps=None):
+        """沿整条序列反向传播（可选截断 BPTT），固定返回
+        (dxs, dh0, dW, db)。
+
+        caches 须为非空的时序 list，长度确定 T，每项均为 dict 且严格符合
+        forward 的公开缓存契约（同 backward 对单个 cache 的要求）；dhs 须为
+        与 caches 同长的 T×H 的 F 列表；dh_last 为 None（等价全零末端梯度）
+        或长度 H 的 F 列表；tbptt_steps 为 None 或非 bool 的正整数 K。任一
+        校验失败抛 ValueError；实参数量错误沿用 Python 自带的 TypeError。
+
+        置 ph = dh_last 或零，自 t=T-1 至 0 依次调用
+        现有 backward(dhs[t]+ph, caches[t])：dx 放回 dxs 的 t 位，返回的
+        dh_prev 成为下一步的 ph；dW、db 各元素自 0.0 起按 t 降序、行列
+        升序累加。给定 K 时窗口从末端对齐：每处理完 K 步且尚有更早的步，
+        便将 ph 清零，故跨窗状态梯度为零。
+
+        四个返回值形状依次为 T×I、H、3H×(I+H)、3H；dh0 即处理完 t=0
+        一步后所得的状态梯度。所有结果均为全新 float 列表（矩阵逐层
+        新建），不修改输入、缓存或参数；中间量非有限同样抛 ValueError。
+        """
+        I, H = self.I, self.H
+
+        # caches：非空时序 list，每项严格符合 forward 缓存契约。
+        if type(caches) is not list or len(caches) == 0:
+            raise ValueError("caches must be a non-empty list")
+        T = len(caches)
+        for cache in caches:
+            self._check_forward_cache(cache)
+
+        # dhs：与 caches 同长的 T×H 的 F 列表。
+        dhs = _check_matrix(dhs, T, H, "dhs")
+
+        # 末端状态梯度：None 等价全零。
+        if dh_last is None:
+            ph = [0.0] * H
+        else:
+            ph = _check_vector(dh_last, H, "dh_last")
+
+        # tbptt_steps：None 或非 bool 正整数。
+        if tbptt_steps is not None:
+            if type(tbptt_steps) is bool or type(tbptt_steps) is not int \
+                    or tbptt_steps <= 0:
+                raise ValueError(
+                    "tbptt_steps must be None or a positive integer, got %r"
+                    % (tbptt_steps,))
+
+        dxs = [None] * T
+        dW = [[0.0] * (I + H) for _ in range(3 * H)]
+        db = [0.0] * (3 * H)
+
+        steps_done = 0
+        for t in range(T - 1, -1, -1):
+            # dhs[t] + ph：交由 backward 再做 F 校验（溢出即 ValueError）。
+            dh_in = [dhs[t][j] + ph[j] for j in range(H)]
+            dx, dh_prev, step_dW, step_db = self.backward(dh_in, caches[t])
+            dxs[t] = [float(v) for v in dx]
+
+            # 各参数梯度元素自 0.0 起按 t 降序、行列升序累加，累加后须有限。
+            for k in range(3 * H):
+                row = dW[k]
+                srow = step_dW[k]
+                for j in range(I + H):
+                    row[j] += srow[j]
+                    if not math.isfinite(row[j]):
+                        raise ValueError(
+                            "dW accumulated to a non-finite value")
+                db[k] += step_db[k]
+                if not math.isfinite(db[k]):
+                    raise ValueError(
+                        "db accumulated to a non-finite value")
+
+            ph = dh_prev
+            steps_done += 1
+
+            # 窗口末端对齐：每满 K 步且尚有更早步，截断跨窗状态梯度。
+            if (tbptt_steps is not None
+                    and steps_done % tbptt_steps == 0 and t > 0):
+                ph = [0.0] * H
+
+        dh0 = [float(v) for v in ph]
+        return dxs, dh0, dW, db
+
 
 # 模型 JSON 顶层唯一允许的键及其出现顺序。
 _MODEL_KEYS = ["version", "vocab", "Wxh", "Whh", "bh", "Why", "by", "h0"]
