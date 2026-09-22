@@ -3262,6 +3262,190 @@ def _rank_suite_details(models_path, list_path):
             + "\n")
 
 
+def _rank_window_sensitivity(models_path, list_path, base_text):
+    """各模型清单窗口相对基准窗 BASE 的逐项 NLL 偏移总量排名。
+
+    MODELS、LIST 的读取、校验、相对路径解析与重复项保序完全沿用
+    rank-suite-details（MODELS 为至少 2 项的非空相对路径 str 数组；
+    LIST 为非空 [corpus, window] 数组；所有模型 vocab 须逐项同序相等，
+    H 可不同）。BASE 整串匹配 [1-9][0-9]*（任意位数均合法，不转 int），
+    窗口截取沿用 _window_tail，否则抛 ValueError。
+
+    按模型原下标 mi、清单原下标 gi 升序遍历 (mi, gi)；每项分别以该清单
+    项的 window 与 BASE 从该模型的 h0、c0、memory=[h0] 独立重置，两条
+    轨道的单步状态推进、注意力、logit 与稳定 log-sum-exp 完全沿用
+    rank-suite-details。每项 window 轨 NLL 总和 L、BASE 轨 NLL 总和 B
+    各从 0.0 按 t 升序累加；令 delta=L-B，模型敏感度 A 从 0.0 按 gi
+    升序累加 abs(delta)，任一计算非有限即抛 ValueError。整个对象先完
+    整构造再返回，失败时不产生任何部分输出，不写文件。
+
+    stdout 恰为单个 JSON 对象加 LF，顶层键序 items,ranking。items 按
+    (mi, gi) 展平，每项恰为
+    [model,corpus,window,steps,item_nll,base_nll,delta]：前三项依次为
+    MODELS 原文 str、LIST 原文 corpus str、LIST 原文 window str；steps
+    为语料码点数减 1 的 int；item_nll、base_nll、delta 依次为
+    format(L,'.17g')、format(B,'.17g')、format(delta,'.17g') 字符串。
+    ranking 按 (-A, mi) 升序（A 以 float 精确比较，下标决胜保序），每
+    项恰为 [model, format(A,'.17g')]。序列化恰用
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n'。
+    """
+    if not _WINDOW_RE.match(base_text):
+        raise ValueError("BASE must match [1-9][0-9]*")
+
+    with open(models_path, "rb") as f:
+        model_paths = json.loads(f.read().decode("utf-8"))
+    if not isinstance(model_paths, list) or len(model_paths) < 2:
+        raise ValueError("MODELS must be a JSON array with at least 2 items")
+    for path_text in model_paths:
+        if not isinstance(path_text, str) or not path_text \
+                or os.path.isabs(path_text):
+            raise ValueError("each model must be a non-empty relative path")
+
+    with open(list_path, "rb") as f:
+        suite = json.loads(f.read().decode("utf-8"))
+    if not isinstance(suite, list) or not suite:
+        raise ValueError("LIST must be a non-empty JSON array")
+    entries = []
+    for item in suite:
+        if (not isinstance(item, list) or len(item) != 2
+                or not isinstance(item[0], str)
+                or not isinstance(item[1], str)):
+            raise ValueError("each LIST item must be a [corpus, window] "
+                             "pair of strings")
+        corpus_text, window_text = item
+        if not corpus_text or os.path.isabs(corpus_text):
+            raise ValueError("each corpus must be a non-empty relative path")
+        if not _WINDOW_RE.match(window_text):
+            raise ValueError("each window must match [1-9][0-9]*")
+        entries.append((corpus_text, window_text))
+
+    models_base = os.path.dirname(models_path)
+    loaded = []
+    vocab = None
+    for path_text in model_paths:
+        resolved = os.path.join(models_base, path_text)
+        (one_vocab, W, b, Why, by, h0,
+         c0) = _load_perplexity_lstm_model(resolved)
+        if vocab is None:
+            vocab = one_vocab
+        elif one_vocab != vocab:
+            raise ValueError("all models must have identical vocabs in the "
+                             "same order")
+        V = len(vocab)
+        cell = LSTMCell(V, len(h0))
+        cell.W = [list(row) for row in W]
+        cell.b = list(b)
+        loaded.append((cell, Why, by, h0, c0))
+    V = len(vocab)
+    table = {ch: i for i, ch in enumerate(vocab)}
+
+    base_dir = os.path.dirname(list_path)
+
+    # 每个清单项的语料只读一次并转成 id 序列；计算结果与重复读取逐位相同。
+    entry_ids = []
+    for corpus_text, _window_text in entries:
+        corpus_path = os.path.join(base_dir, corpus_text)
+        with open(corpus_path, "rb") as f:
+            corpus = f.read().decode("utf-8")
+        if len(corpus) < 2:
+            raise ValueError("corpus must contain at least 2 codepoints")
+
+        ids = [0] * len(corpus)
+        for t, ch in enumerate(corpus):
+            ix = table.get(ch)
+            if ix is None:
+                raise ValueError(
+                    "corpus contains an out-of-vocab character")
+            ids[t] = ix
+        entry_ids.append(ids)
+
+    def _step_nll(cell, Why, by, h, c, memory, ids, t, window_text):
+        """perplexity-lstm-attn 单步：推进状态并返回 (nll, h, c, memory)。"""
+        y = ids[t + 1]
+
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c = cell.forward(x, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        u = _attn_context(h, M)
+
+        z = _output_logits(Why, by, u)
+
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        d = 0.0
+        for k in range(V):
+            d += math.exp(z[k] - m)
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        nll = m + math.log(d) - z[y]
+        if not math.isfinite(nll):
+            raise ValueError("cross-entropy step is non-finite")
+
+        memory.append([float(v) for v in h])
+        return nll, h, c, memory
+
+    items = []
+    # 每个模型的敏感度 A 从 0.0 起，按 gi 升序累加 abs(delta)。
+    sensitivities = [0.0] * len(loaded)
+    for mi, (cell, Why, by, h0_m, c0_m) in enumerate(loaded):
+        for gi, (corpus_text, window_text) in enumerate(entries):
+            ids = entry_ids[gi]
+            T = len(ids) - 1
+
+            # 每项分别以 window、BASE 从该模型 h0、c0、memory=[h0] 独立重置。
+            memory_w = [h0_m]
+            h_w = list(h0_m)
+            c_w = list(c0_m)
+            memory_b = [h0_m]
+            h_b = list(h0_m)
+            c_b = list(c0_m)
+            L = 0.0
+            B = 0.0
+            for t in range(T):
+                nll_w, h_w, c_w, memory_w = _step_nll(
+                    cell, Why, by, h_w, c_w, memory_w, ids, t, window_text)
+                L += nll_w
+                if not math.isfinite(L):
+                    raise ValueError(
+                        "item total NLL accumulated non-finitely")
+                nll_b, h_b, c_b, memory_b = _step_nll(
+                    cell, Why, by, h_b, c_b, memory_b, ids, t, base_text)
+                B += nll_b
+                if not math.isfinite(B):
+                    raise ValueError(
+                        "base total NLL accumulated non-finitely")
+
+            delta = L - B
+            if not math.isfinite(delta):
+                raise ValueError("item delta is non-finite")
+            sensitivities[mi] += abs(delta)
+            if not math.isfinite(sensitivities[mi]):
+                raise ValueError(
+                    "model sensitivity accumulated non-finitely")
+
+            items.append([model_paths[mi], corpus_text, window_text, T,
+                          format(L, ".17g"), format(B, ".17g"),
+                          format(delta, ".17g")])
+
+    # 按 (-A, MODELS 原下标) 升序排名；A 以 float 精确比较，下标决胜保序。
+    order = sorted(range(len(loaded)),
+                   key=lambda mi: (-sensitivities[mi], mi))
+    ranking = [[model_paths[mi], format(sensitivities[mi], ".17g")]
+               for mi in order]
+
+    obj = {"items": items, "ranking": ranking}
+    return (json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                       allow_nan=False)
+            + "\n")
+
+
 def _perplexity_lstm_attn_trace(model_path, corpus_path, window_text):
     """perplexity-lstm-attn 的逐步负对数似然轨迹，返回待写出的字符串。
 
@@ -5831,6 +6015,22 @@ def main(argv):
     [model,format(S,'.17g')]，须等于同参 rank-suite 的 ranking。序列化
     与失败协议沿用 rank-suite；失败不部分输出、不写文件。
 
+    python seqmodel.py rank-window-sensitivity MODELS LIST BASE：MODELS、
+    LIST 及模型/语料/WINDOW 的读取、校验、相对路径和重复保序均沿用
+    rank-suite-details（至少 2 个模型，vocab 同序，H 可不同），既有接
+    口不变。BASE 整串匹配 [1-9][0-9]*（任意位数安全处理，不转 int）。
+    按模型原下标 mi、清单原下标 gi 升序遍历，每项分别以该清单项的
+    window 与 BASE 从该模型的 h0、c0、memory=[h0] 独立重置并沿用其逐
+    步 NLL。每项 window 轨总和 L、BASE 轨总和 B 各从 0.0 按 t 升序累
+    加；令 delta=L-B，模型敏感度 A 从 0.0 按 gi 升序累加 abs(delta)，
+    任一计算非有限即失败。stdout 恰为键序 items,ranking 的单个 JSON
+    对象加 LF。items 按 (mi,gi) 展平，每项恰为
+    [model,corpus,window,steps,item_nll,base_nll,delta]，前三项是
+    MODELS/LIST 原文 str，steps 是语料码点数减 1 的 int，后三项依次
+    format(L,'.17g')、format(B,'.17g')、format(delta,'.17g')；
+    ranking 按 (-A,mi) 升序，每项恰为 [model,format(A,'.17g')]。
+    序列化与失败协议沿用 rank-suite-details；失败不部分输出、不写文件。
+
     python seqmodel.py sample-attn MODEL START SEED TEMPERATURE LENGTH
     WINDOW：以同样的注意力上下文替换 logit 隐状态，softmax 与抽样契约
     与 sample 相同，整次仅初始化一次随机源、不写文件。WINDOW 整串匹配
@@ -6072,6 +6272,9 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 4 and argv[1] == "rank-suite-details":
             output = _rank_suite_details(argv[2], argv[3])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 5 and argv[1] == "rank-window-sensitivity":
+            output = _rank_window_sensitivity(argv[2], argv[3], argv[4])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 5 and argv[1] == "lstm-attn-weights":
             output = _lstm_attn_weights(argv[2], argv[3], argv[4])
