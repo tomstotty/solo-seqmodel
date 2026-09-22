@@ -4110,6 +4110,121 @@ def _lstm_attn_reach(model_path, corpus_path, window_text, mass_text):
                       allow_nan=False) + "\n"
 
 
+def _lstm_attn_reach_profile(model_path, corpus_path, window_text,
+                             masses_path):
+    """lstm-attn-reach 的多质量批量版本，返回待写出的字符串。
+
+    MODEL、CORPUS、WINDOW 的校验、状态推进（h、c 与 memory）、M 截取与
+    逐步权重计算完全沿用 _lstm_attn_reach，故每个 (t,m) 的 start、reach
+    与单独调用 _lstm_attn_reach 逐位相同；不写文件。MASSES 为严格
+    UTF-8 JSON 文件：顶层须为非空数组，元素 type 恰为 str，其 float()
+    值 m 须有限且 0<m<=1，重复项按原序保留，否则抛 ValueError。
+
+    令 T=语料码点数-1；t 升序的单次状态推进内，对原序每个 m 独立复用
+    “自最新向最旧累计质量”规则（各 m 的累加器自 0.0 起互不相干），
+    reach_m(t) 与单独调用一致；A_m 自 0.0 起按 t 升序累加
+    float(reach_m(t))。任一累加中间量非有限即抛 ValueError。构造 JSON
+    对象：顶层键序恰为 version,masses,items,mean_reach；version 为
+    int 1；masses 为原序 format(m,'.17g') 字符串列表；items 按 t 升序，
+    每项恰为 [t,start,reaches]，前两项为 int，reaches 为与 masses 对齐
+    的 int 列表；mean_reach 为与 masses 对齐的
+    format(A_m/T,'.17g') 字符串列表。返回
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n'。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    # MASSES：严格 UTF-8 解码后经 json 解析；顶层须为非空数组，元素须为
+    # type 恰为 str 的有限质量文本（重复项按原序保留）。
+    with open(masses_path, "rb") as f:
+        masses_raw = f.read()
+    masses_data = json.loads(masses_raw.decode("utf-8"))
+    if type(masses_data) is not list or len(masses_data) == 0:
+        raise ValueError("MASSES must be a non-empty JSON array")
+    masses = []
+    for element in masses_data:
+        if type(element) is not str:
+            raise ValueError("each MASSES element must be a JSON string")
+        m = float(element)
+        if not math.isfinite(m) or not 0.0 < m <= 1.0:
+            raise ValueError(
+                "each mass must be finite and satisfy 0 < mass <= 1")
+        masses.append(m)
+
+    vocab, W, b, Why, by, h0, c0 = _load_perplexity_lstm_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    n_masses = len(masses)
+    memory = [h0]
+    h = list(h0)
+    c = list(c0)
+    T = len(ids) - 1
+    totals = [0.0] * n_masses
+    items = []
+    for t in range(T):
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c = cell.forward(x, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        _ctx, w = attention([h], M, M, None)
+        start = t + 1 - len(M)
+
+        # 各 m 独立复用自最新向最旧累加权重的规则，首次达到 m 时的项数。
+        reaches = [len(M)] * n_masses
+        for k in range(n_masses):
+            mass = masses[k]
+            acc = 0.0
+            reach = len(M)
+            for j in range(len(M) - 1, -1, -1):
+                acc += w[0][j]
+                if not math.isfinite(acc):
+                    raise ValueError(
+                        "mass accumulated to a non-finite value")
+                if acc >= mass:
+                    reach = len(M) - j
+                    break
+            totals[k] += float(reach)
+            if not math.isfinite(totals[k]):
+                raise ValueError(
+                    "total reach accumulated to a non-finite value")
+            reaches[k] = reach
+
+        items.append([t, start, reaches])
+
+        memory.append([float(v) for v in h])
+
+    obj = {
+        "version": 1,
+        "masses": [format(m, ".17g") for m in masses],
+        "items": items,
+        "mean_reach": [format(totals[k] / T, ".17g")
+                       for k in range(n_masses)],
+    }
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+
+
 def _sample_attn(model_path, start, seed_text, temperature_text, length_text,
                  window_text):
     """带注意力上下文从 RNN 语言模型采样 LENGTH 个码点，返回待写出的字符串。
@@ -6807,6 +6922,10 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 6 and argv[1] == "lstm-attn-reach":
             output = _lstm_attn_reach(argv[2], argv[3], argv[4], argv[5])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 6 and argv[1] == "lstm-attn-reach-profile":
+            output = _lstm_attn_reach_profile(
+                argv[2], argv[3], argv[4], argv[5])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 6 and argv[1] == "train-attn":
             _train_attn(argv[2], argv[3], argv[4], argv[5])
