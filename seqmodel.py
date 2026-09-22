@@ -4110,6 +4110,61 @@ def _lstm_attn_reach(model_path, corpus_path, window_text, mass_text):
                       allow_nan=False) + "\n"
 
 
+def _lstm_attn_reach_profile(model_path, corpus_path, window_text,
+                             masses_path):
+    """多个 MASS 下的质量回眺长度批量画像，返回待写出的字符串。
+
+    MODEL、CORPUS、WINDOW 及逐步权重、质量累加规则完全沿用
+    _lstm_attn_reach。MASSES 为严格 UTF-8 JSON 文件：顶层须为非空数组，
+    每个元素 type 恰为 str，其 float() 值 m 须有限且 0<m<=1（否则抛
+    ValueError），重复项按原序保留。对每个 m 独立复用原入口（按 m 原
+    序），故每个 (t,m) 的 start、reach 及各 m 的平均 reach 分别等同单独
+    调用 _lstm_attn_reach；任一中间量非有限即由原入口失败。构造 JSON
+    对象：顶层键序恰为 version,masses,items,mean_reach；version 为
+    int 1；masses 为原序 format(m,'.17g') 字符串列表；items 按 t 升序，
+    每项恰为 [t,start,reaches]，前两项为 int，reaches 为与 masses 对齐
+    的 int 列表；mean_reach 为与 masses 对齐的 format(x,'.17g') 字符串
+    列表。返回 json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n' 的 UTF-8 字节对应字符串，不写文件。
+    """
+    with open(masses_path, "rb") as f:
+        mass_texts = json.loads(f.read().decode("utf-8"))
+    if type(mass_texts) is not list or not mass_texts:
+        raise ValueError("MASSES must be a non-empty JSON array")
+
+    masses = []
+    for mass_text in mass_texts:
+        if type(mass_text) is not str:
+            raise ValueError("each MASS element must be a string")
+        mass = float(mass_text)
+        if not math.isfinite(mass) or not 0.0 < mass <= 1.0:
+            raise ValueError("each MASS must be finite and satisfy 0 < MASS "
+                             "<= 1")
+        masses.append(mass)
+
+    # 对每个 m 独立复用原入口，保证逐 (t,m) 与单独调用完全一致。
+    profiles = [
+        json.loads(_lstm_attn_reach(model_path, corpus_path, window_text,
+                                    mass_text))
+        for mass_text in mass_texts
+    ]
+
+    reaches_by_t = []
+    for i, (t, start, _reach) in enumerate(profiles[0]["items"]):
+        reaches_by_t.append([
+            t, start, [profile["items"][i][2] for profile in profiles],
+        ])
+
+    obj = {
+        "version": 1,
+        "masses": [format(mass, ".17g") for mass in masses],
+        "items": reaches_by_t,
+        "mean_reach": [profile["mean_reach"] for profile in profiles],
+    }
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+
+
 def _sample_attn(model_path, start, seed_text, temperature_text, length_text,
                  window_text):
     """带注意力上下文从 RNN 语言模型采样 LENGTH 个码点，返回待写出的字符串。
@@ -6807,6 +6862,10 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 6 and argv[1] == "lstm-attn-reach":
             output = _lstm_attn_reach(argv[2], argv[3], argv[4], argv[5])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 6 and argv[1] == "lstm-attn-reach-profile":
+            output = _lstm_attn_reach_profile(argv[2], argv[3], argv[4],
+                                              argv[5])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 6 and argv[1] == "train-attn":
             _train_attn(argv[2], argv[3], argv[4], argv[5])
