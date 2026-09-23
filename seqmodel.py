@@ -1484,6 +1484,208 @@ class BidirectionalGRU(object):
 
         return dxs, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b
 
+    def forward_padded(self, xs, lengths):
+        """变长批双向前向，返回 B×T×2H 的全新 float 列表并保存批缓存。
+
+        xs 须为非空 B×T×I 的 F 嵌套列表（B、T>0，各样本等长 T、每行等长
+        I，padding 位同样须为 F）；lengths 须为 B 长 list，各项 type 为非
+        bool 的 int 且 1<=值<=T，否则抛 ValueError。任何失败都使既有缓存
+        失效（其后的 backward_padded 必须重新 forward_padded）。样本 b 仅
+        对前 lengths[b] 行执行双向前向：两支均以全零 H 向量为初态，前支按
+        t=0..L_b-1 正序调用 forward_cell.forward，后支按 t=L_b-1..0 倒序
+        调用 backward_cell.forward。返回第 b 样本第 t 行为前支 h_f[t] 拼接
+        映射至 t 的后支 h_b[t]（长度 2H）；有效前缀（t<L_b）为真实输出，
+        其余行是 2H 个 0.0。输出为逐层新建的 float 列表，不修改或复用输入
+        与单元参数；任一中间量非有限同样抛 ValueError。
+        """
+        I, H = self.I, self.H
+        # 任何失败的 forward_padded 都使既有缓存（含普通 forward 缓存）失效。
+        self._cache = None
+
+        # xs：非空 B×T×I 的 F 嵌套列表，B、T>0，矩形且每行等长 I。
+        if type(xs) is not list or len(xs) == 0:
+            raise ValueError("xs must be a non-empty list")
+        B = len(xs)
+        first = xs[0]
+        if type(first) is not list or len(first) == 0:
+            raise ValueError("xs must be a list of shape B×T×I with T>0")
+        T = len(first)
+        checked_xs = []
+        for b in range(B):
+            seq = xs[b]
+            if type(seq) is not list or len(seq) != T:
+                raise ValueError("xs must be a list of shape %d×%d×%d"
+                                 % (B, T, I))
+            checked_seq = []
+            for row in seq:
+                if type(row) is not list or len(row) != I:
+                    raise ValueError("xs must be a list of shape %d×%d×%d"
+                                     % (B, T, I))
+                for v in row:
+                    if not _is_f(v):
+                        raise ValueError(
+                            "xs entries must be finite numbers, got %r" % (v,))
+                checked_seq.append([float(v) for v in row])
+            checked_xs.append(checked_seq)
+        xs = checked_xs
+
+        # lengths：B 长 list，各项为非 bool int 且 1<=值<=T。
+        if type(lengths) is not list or len(lengths) != B:
+            raise ValueError("lengths must be a list of length %d" % B)
+        for L in lengths:
+            if type(L) is bool or type(L) is not int or L < 1 or L > T:
+                raise ValueError(
+                    "lengths entries must be non-bool integers in [1, %d], "
+                    "got %r" % (T, L))
+
+        # 输出先铺零：有效前缀随后覆写，padding 行保持全新的 2H 零行。
+        outputs = [[[0.0] * (2 * H) for _ in range(T)] for _ in range(B)]
+        cfs = [None] * B
+        cbs = [None] * B
+        zero = [0.0] * H
+        for b in range(B):
+            L = lengths[b]
+            cf = [None] * L
+            hf = [None] * L
+            h = zero
+            for t in range(L):
+                hf[t], cf[t] = self.forward_cell.forward(xs[b][t], h)
+                h = hf[t]
+
+            cb = [None] * L
+            hb = [None] * L
+            h = zero
+            for t in range(L - 1, -1, -1):
+                hb[t], cb[t] = self.backward_cell.forward(xs[b][t], h)
+                h = hb[t]
+
+            cfs[b] = cf
+            cbs[b] = cb
+            out_b = outputs[b]
+            for t in range(L):
+                out_b[t] = [float(v) for v in hf[t]] + \
+                           [float(v) for v in hb[t]]
+
+        self._cache = ("padded", B, T, list(lengths), cfs, cbs)
+        return outputs
+
+    def backward_padded(self, dys):
+        """变长批双向反向，固定返回
+        (dxs, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b)。
+
+        最近一次前向须为成功的 forward_padded（其后无失败的 forward 类调用
+        使缓存失效），否则抛 ValueError；dys 须为 B×T×2H 的 F 嵌套列表
+        （与前向同形，padding 位经校验后忽略），否则抛 ValueError。各样本
+        有效前缀按现有 backward 语义反传：前支以原序梯度、原序缓存调用
+        forward_cell.backward_sequence，后支沿其扫描方向（时间倒序组织梯度
+        与缓存）调用 backward_cell.backward_sequence，所得末端状态梯度即
+        该样本后支初态（位于 t=L_b-1）梯度，输入梯度再倒回时间正序。
+
+        dxs 为 B×T×I（有效前缀为前、后两支输入梯度逐元素相加，padding 行
+        为 I 个 0.0）；dh0_f、dh0_b 均为 B×H，第 b 行为样本 b 的两支初态
+        梯度；dW_f、dW_b 形状 3H×(I+H)，db_f、db_b 长 3H，各元素均自
+        0.0 起按 b 升序逐元素累加。所有结果均为逐层新建的 float 列表，不
+        修改 dys、缓存或单元参数，重复调用结果确定；任一中间量非有限抛
+        ValueError，实参数量错误沿用 Python 自带的 TypeError。
+        """
+        I, H = self.I, self.H
+        cache = self._cache
+        if type(cache) is not tuple or len(cache) != 6 \
+                or cache[0] != "padded":
+            raise ValueError(
+                "backward_padded requires a successful forward_padded pass "
+                "before it")
+        _, B, T, lengths, cfs, cbs = cache
+
+        # dys：B×T×2H 的 F 嵌套列表；padding 位在此一并校验，随后忽略。
+        if type(dys) is not list or len(dys) != B:
+            raise ValueError("dys must be a list of shape %d×%d×%d"
+                             % (B, T, 2 * H))
+        checked_dys = []
+        for b in range(B):
+            seq = dys[b]
+            if type(seq) is not list or len(seq) != T:
+                raise ValueError("dys must be a list of shape %d×%d×%d"
+                                 % (B, T, 2 * H))
+            checked_seq = []
+            for row in seq:
+                if type(row) is not list or len(row) != 2 * H:
+                    raise ValueError("dys must be a list of shape %d×%d×%d"
+                                     % (B, T, 2 * H))
+                for v in row:
+                    if not _is_f(v):
+                        raise ValueError(
+                            "dys entries must be finite numbers, got %r"
+                            % (v,))
+                checked_seq.append([float(v) for v in row])
+            checked_dys.append(checked_seq)
+        dys = checked_dys
+
+        dxs = [[[0.0] * I for _ in range(T)] for _ in range(B)]
+        dh0_f = [None] * B
+        dh0_b = [None] * B
+        dW_f = [[0.0] * (I + H) for _ in range(3 * H)]
+        db_f = [0.0] * (3 * H)
+        dW_b = [[0.0] * (I + H) for _ in range(3 * H)]
+        db_b = [0.0] * (3 * H)
+
+        # 参数梯度自 0.0 起按 b 升序、行列升序逐元素累加。
+        for b in range(B):
+            L = lengths[b]
+            dhf = [[float(v) for v in dys[b][t][:H]] for t in range(L)]
+            dhb = [[float(v) for v in dys[b][t][H:]] for t in range(L)]
+
+            dxs_f, dh0f_b, sdW_f, sdb_f = \
+                self.forward_cell.backward_sequence(dhf, cfs[b])
+            dxs_b_rev, dh0b_b, sdW_b, sdb_b = \
+                self.backward_cell.backward_sequence(dhb[::-1], cbs[b][::-1])
+            # 后支输入梯度按扫描倒序给出，倒回时间正序以便两支逐时刻相加。
+            dxs_b = dxs_b_rev[::-1]
+
+            dh0_f[b] = [float(v) for v in dh0f_b]
+            dh0_b[b] = [float(v) for v in dh0b_b]
+
+            rowx = dxs[b]
+            for t in range(L):
+                row_f = dxs_f[t]
+                row_b = dxs_b[t]
+                for j in range(I):
+                    acc = 0.0
+                    acc += float(row_f[j])
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "dxs accumulated to a non-finite value")
+                    acc += float(row_b[j])
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "dxs accumulated to a non-finite value")
+                    rowx[t][j] = acc
+
+            for k in range(3 * H):
+                row_f = dW_f[k]
+                srow_f = sdW_f[k]
+                row_b = dW_b[k]
+                srow_b = sdW_b[k]
+                for j in range(I + H):
+                    row_f[j] += srow_f[j]
+                    if not math.isfinite(row_f[j]):
+                        raise ValueError(
+                            "dW_f accumulated to a non-finite value")
+                    row_b[j] += srow_b[j]
+                    if not math.isfinite(row_b[j]):
+                        raise ValueError(
+                            "dW_b accumulated to a non-finite value")
+                db_f[k] += sdb_f[k]
+                if not math.isfinite(db_f[k]):
+                    raise ValueError(
+                        "db_f accumulated to a non-finite value")
+                db_b[k] += sdb_b[k]
+                if not math.isfinite(db_b[k]):
+                    raise ValueError(
+                        "db_b accumulated to a non-finite value")
+
+        return dxs, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b
+
 
 # 模型 JSON 顶层唯一允许的键及其出现顺序。
 _MODEL_KEYS = ["version", "vocab", "Wxh", "Whh", "bh", "Why", "by", "h0"]
