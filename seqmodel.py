@@ -1849,6 +1849,143 @@ class BidirectionalGRU(object):
 
         return dxs, dq, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b
 
+    def forward_self_attn_padded(self, xs, lengths):
+        """变长批自注意力前向，返回 (c, w) 并保存 self-attn 批缓存。
+
+        xs、lengths 完全沿用 forward_padded 的契约（xs 为非空 B×T×I 的 F
+        嵌套列表，lengths 各项为 1<=值<=T 的非 bool int）。任何失败都使
+        既有缓存（含 forward、forward_padded、forward_attn_padded 缓存）
+        失效。
+
+        先按 forward_padded 的同一前向语义求批双向输出 y（有效前缀为真实
+        输出、padding 行为 2H 个 0.0）；对样本 b 令 L=lengths[b]、取
+        v=y[b][:L]（逐行新建的 float 行），以 v 同时作为查询、键、值调用
+        attention(v, v, v, None) 得 (c_b, w_b)：c 为 B×T×2H，c[b] 有效
+        前缀（t<L）逐行取 c_b，padding 行为 2H 个 0.0；w 为 B×T×T，
+        w[b] 的有效 L×L 块取 w_b，其余 padding 行、列均为 0.0。缓存须
+        足以支撑 backward_self_attn_padded：保存批 GRU 缓存及 v 的快照。
+        结果均为逐层新建的 float 列表，不修改或复用输入与单元参数；任一
+        中间量非有限同样抛 ValueError，实参数量错误沿用 Python 自带的
+        TypeError。
+        """
+        I, H = self.I, self.H
+        # 任何失败的 forward_self_attn_padded 都使既有缓存失效。
+        self._cache = None
+
+        # y 复用 forward_padded 的全部校验与前向计算；成功后其缓存即当前
+        # 缓存（标签 "padded"），随后改写为带 v 快照的 self-attn 缓存。其
+        # 内部失败已自行清空缓存；其后任一步失败也须清掉它留下的缓存。
+        y = self.forward_padded(xs, lengths)
+        try:
+            _, B, T, lengths, cfs, cbs = self._cache
+
+            # c、w 先铺零：有效块随后覆写，padding 行（及 w 的 padding 列）
+            # 保持全新的零行。
+            c = [[[0.0] * (2 * H) for _ in range(T)] for _ in range(B)]
+            w = [[[0.0] * T for _ in range(T)] for _ in range(B)]
+            vs = [None] * B
+            for b in range(B):
+                L = lengths[b]
+                # v 为 y[b] 有效前缀的逐行新建 float 快照，独立于返回的 y。
+                v = [[float(x) for x in y[b][t]] for t in range(L)]
+                vs[b] = v
+                cb, wb = attention(v, v, v, None)
+                c_b = c[b]
+                for t in range(L):
+                    cbt = cb[t]
+                    row = c_b[t]
+                    for a in range(2 * H):
+                        cv = cbt[a]
+                        if not math.isfinite(cv):
+                            raise ValueError("context became non-finite")
+                        row[a] = float(cv)
+                w_b = w[b]
+                for i in range(L):
+                    wbi = wb[i]
+                    row = w_b[i]
+                    for j in range(L):
+                        wv = wbi[j]
+                        if not math.isfinite(wv):
+                            raise ValueError("attention weight became non-finite")
+                        row[j] = float(wv)
+        except ValueError:
+            self._cache = None
+            raise
+
+        self._cache = ("self_attn", B, T, list(lengths), cfs, cbs, vs)
+        return c, w
+
+    def backward_self_attn_padded(self, dc):
+        """变长批自注意力反向，固定返回
+        (dxs, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b)。
+
+        最近一次成功前向须为 forward_self_attn_padded，且其后无任何其他
+        forward 类调用（forward、forward_padded、forward_attn_padded、
+        forward_self_attn_padded 自身的成功或失败调用均会替换或使缓存
+        失效），否则抛 ValueError；dc 须为 B×T×2H 的 F 嵌套列表（与前向
+        输出同形，padding 位经校验合法后忽略），否则抛 ValueError。实参
+        数量错误沿用 Python 自带的 TypeError。
+
+        对样本 b 令 L=lengths[b]，以缓存的有效前缀 v（长 L、行长 2H）及
+        dc[b] 的有效前缀（逐行新建 float 快照）调用
+        attention_backward(v, v, v, dc前缀, None) 得 (gq, gk, gv)（形状均
+        为 L×2H）：有效前缀输出梯度 dy 自 0.0 起按 t、维升序依次累加
+        gq[t][a]、gk[t][a]、gv[t][a]，padding 位置 0.0 并随后忽略。再以
+        该 dy 按 backward_padded 的同一语义反传批双向 GRU。dxs 形状
+        B×T×I（padding 行为 I 个 0.0）；dh0_f、dh0_b、dW_f、db_f、dW_b、
+        db_b 六项完全沿用 backward_padded 的形状与按 b 升序累加语义。所有
+        结果均为逐层新建的 float 列表，不修改 dc、缓存或单元参数，重复
+        调用结果确定；任一中间量非有限抛 ValueError。
+        """
+        I, H = self.I, self.H
+        cache = self._cache
+        if type(cache) is not tuple or len(cache) != 7 \
+                or cache[0] != "self_attn":
+            raise ValueError(
+                "backward_self_attn_padded requires a successful "
+                "forward_self_attn_padded pass before it")
+        _, B, T, lengths, cfs, cbs, vs = cache
+
+        # dc：B×T×2H 的 F 嵌套列表；padding 位在此一并校验，随后忽略。
+        dc = self._check_padded_3d(dc, B, T, 2 * H, "dc")
+
+        # 各样本有效前缀的输出梯度 dy：对前缀调用 attention_backward（v 同
+        # 时充当 q、k、v），自 0.0 起按 t、维升序依次累加 gq、gk、gv。
+        dy_valid = [None] * B
+        for b in range(B):
+            L = lengths[b]
+            v = vs[b]
+            dc_prefix = [[float(x) for x in dc[b][t]] for t in range(L)]
+            gq, gk, gv = attention_backward(v, v, v, dc_prefix, None)
+            dy_b = [[0.0] * (2 * H) for _ in range(L)]
+            for t in range(L):
+                row = dy_b[t]
+                gqt = gq[t]
+                gkt = gk[t]
+                gvt = gv[t]
+                for a in range(2 * H):
+                    acc = 0.0
+                    acc += gqt[a]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "dy accumulated to a non-finite value")
+                    acc += gkt[a]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "dy accumulated to a non-finite value")
+                    acc += gvt[a]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "dy accumulated to a non-finite value")
+                    row[a] = acc
+            dy_valid[b] = dy_b
+
+        # 批 GRU 反传完全沿用 backward_padded 的语义；padding 位梯度为零。
+        dxs, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b = self._padded_backprop(
+            B, T, lengths, cfs, cbs, dy_valid)
+
+        return dxs, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b
+
 
 # 模型 JSON 顶层唯一允许的键及其出现顺序。
 _MODEL_KEYS = ["version", "vocab", "Wxh", "Whh", "bh", "Why", "by", "h0"]
