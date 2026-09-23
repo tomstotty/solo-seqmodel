@@ -1346,6 +1346,304 @@ class MHA(object):
 
         return dx, dWq, dWk, dWv, dWo
 
+    def forward_cross_padded(self, qxs, kvxs, q_lengths, kv_lengths,
+                             mask=None):
+        """变长批投影多头交叉注意力前向，返回 (y, w) 并保存各样本独立快照。
+
+        qxs 须为非空 B×Tq×D、kvxs 须为非空 B×Tk×D 的 F 嵌套列表（B、Tq、
+        Tk>0，两输入各含 B 个等长样本、每行等长 D，padding 位同样须为 F，
+        校验后忽略）；q_lengths、kv_lengths 均须为 B 长 list，各项 type 为非
+        bool 的 int 且分别满足 1<=值<=Tq、1<=值<=Tk；mask 须为 None 或
+        B×Tq×Tk 的嵌套 list，元素 type 恰为 bool，padding 行、列仅校验后
+        忽略；样本 b 令 Lq=q_lengths[b]、Lk=kv_lengths[b]，其有效 Lq×Lk 块
+        每行至少一个 True（None 等价全 True，由现有 forward_cross 校验），
+        否则抛 ValueError。任何失败都使既有缓存失效（其后的
+        backward_cross_padded 必须重新 forward_cross_padded）。
+
+        样本按 b 升序、仅对有效前缀逐样本执行现有交叉注意力（即对
+        qx=qxs[b][:Lq]、kvx=kvxs[b][:Lk] 与有效 Lq×Lk mask 块调用现有
+        forward_cross 语义），其缓存原样存为该样本的独立快照。y 为
+        B×Tq×D，w 为 B×heads×Tq×Tk：有效区写入各样本结果，padding 行（及
+        w 的 padding 列）均为 0.0。输出均为逐层新建的 float 列表，不修改或
+        复用输入与投影属性；任一中间量非有限抛 ValueError。实参数量错误沿用
+        Python 自带的 TypeError。
+        """
+        D, heads = self.D, self.heads
+        # 任何失败的 forward_cross_padded 都使既有缓存（含其他 forward 类
+        # 缓存）失效。
+        self._cache = None
+        try:
+            # qxs：非空 B×Tq×D 的 F 嵌套列表，B、Tq>0，矩形且每行等长 D。
+            if type(qxs) is not list or len(qxs) == 0:
+                raise ValueError("qxs must be a non-empty list")
+            B = len(qxs)
+            qfirst = qxs[0]
+            if type(qfirst) is not list or len(qfirst) == 0:
+                raise ValueError(
+                    "qxs must be a list of shape B×Tq×%d with Tq>0" % D)
+            Tq = len(qfirst)
+            checked_qxs = []
+            for b in range(B):
+                seq = qxs[b]
+                if type(seq) is not list or len(seq) != Tq:
+                    raise ValueError("qxs must be a list of shape %d×%d×%d"
+                                     % (B, Tq, D))
+                checked_seq = []
+                for row in seq:
+                    if type(row) is not list or len(row) != D:
+                        raise ValueError("qxs must be a list of shape %d×%d×%d"
+                                         % (B, Tq, D))
+                    for v in row:
+                        if not _is_f(v):
+                            raise ValueError(
+                                "qxs entries must be finite numbers, got %r"
+                                % (v,))
+                    checked_seq.append([float(v) for v in row])
+                checked_qxs.append(checked_seq)
+
+            # kvxs：与 qxs 同 B 的 B×Tk×D F 嵌套列表，B、Tk>0，矩形。
+            if type(kvxs) is not list or len(kvxs) != B:
+                raise ValueError(
+                    "kvxs must be a list of shape %d×Tk×%d" % (B, D))
+            kfirst = kvxs[0]
+            if type(kfirst) is not list or len(kfirst) == 0:
+                raise ValueError(
+                    "kvxs must be a list of shape %d×Tk×%d with Tk>0"
+                    % (B, D))
+            Tk = len(kfirst)
+            checked_kvxs = []
+            for b in range(B):
+                seq = kvxs[b]
+                if type(seq) is not list or len(seq) != Tk:
+                    raise ValueError("kvxs must be a list of shape %d×%d×%d"
+                                     % (B, Tk, D))
+                checked_seq = []
+                for row in seq:
+                    if type(row) is not list or len(row) != D:
+                        raise ValueError("kvxs must be a list of shape %d×%d×%d"
+                                         % (B, Tk, D))
+                    for v in row:
+                        if not _is_f(v):
+                            raise ValueError(
+                                "kvxs entries must be finite numbers, got %r"
+                                % (v,))
+                    checked_seq.append([float(v) for v in row])
+                checked_kvxs.append(checked_seq)
+
+            # q_lengths：B 长 list，各项为非 bool int 且 1<=值<=Tq。
+            if type(q_lengths) is not list or len(q_lengths) != B:
+                raise ValueError("q_lengths must be a list of length %d" % B)
+            for Lq in q_lengths:
+                if type(Lq) is bool or type(Lq) is not int \
+                        or Lq < 1 or Lq > Tq:
+                    raise ValueError(
+                        "q_lengths entries must be non-bool integers in "
+                        "[1, %d], got %r" % (Tq, Lq))
+
+            # kv_lengths：B 长 list，各项为非 bool int 且 1<=值<=Tk。
+            if type(kv_lengths) is not list or len(kv_lengths) != B:
+                raise ValueError("kv_lengths must be a list of length %d" % B)
+            for Lk in kv_lengths:
+                if type(Lk) is bool or type(Lk) is not int \
+                        or Lk < 1 or Lk > Tk:
+                    raise ValueError(
+                        "kv_lengths entries must be non-bool integers in "
+                        "[1, %d], got %r" % (Tk, Lk))
+
+            # mask：None 或 B×Tq×Tk 的嵌套 list，元素 type 恰为 bool；
+            # padding 行、列在此一并校验，随后忽略。
+            if mask is not None:
+                if type(mask) is not list or len(mask) != B:
+                    raise ValueError(
+                        "mask must be a list of shape %d×%d×%d"
+                        % (B, Tq, Tk))
+                for b in range(B):
+                    mb = mask[b]
+                    if type(mb) is not list or len(mb) != Tq:
+                        raise ValueError(
+                            "mask must be a list of shape %d×%d×%d"
+                            % (B, Tq, Tk))
+                    for row in mb:
+                        if type(row) is not list or len(row) != Tk:
+                            raise ValueError(
+                                "mask must be a list of shape %d×%d×%d"
+                                % (B, Tq, Tk))
+                        for m in row:
+                            if type(m) is not bool:
+                                raise ValueError(
+                                    "mask entries must be exactly bool, got %r"
+                                    % (m,))
+
+            # 输出先铺零：有效区随后覆写，padding 行（及 w 的 padding 列）
+            # 保持全新零行；w 每样本含 heads 个 Tq×Tk 矩阵。
+            y = [[[0.0] * D for _ in range(Tq)] for _ in range(B)]
+            w = [[[[0.0] * Tk for _ in range(Tq)] for _ in range(heads)]
+                 for _ in range(B)]
+            snaps = [None] * B
+            for b in range(B):
+                Lq = q_lengths[b]
+                Lk = kv_lengths[b]
+                qxb = [checked_qxs[b][t] for t in range(Lq)]
+                kvxb = [checked_kvxs[b][s] for s in range(Lk)]
+                if mask is None:
+                    block = None
+                else:
+                    block = [list(mask[b][i][:Lk]) for i in range(Lq)]
+
+                # 现有 forward_cross 完成全部投影、多头注意力与输出投影，并
+                # 自行校验 W 矩阵与有效块每行至少一个 True；成功后其缓存即
+                # 该样本的独立快照。其内部失败已自行清空缓存。
+                yb, wb = self.forward_cross(qxb, kvxb, block)
+                snaps[b] = self._cache
+
+                yb_row = y[b]
+                wb_pad = w[b]
+                for t in range(Lq):
+                    for a in range(D):
+                        yv = float(yb[t][a])
+                        if not math.isfinite(yv):
+                            raise ValueError(
+                                "padded cross-attention output became "
+                                "non-finite")
+                        yb_row[t][a] = yv
+                    for h in range(heads):
+                        wbht = wb[h][t]
+                        wrow = wb_pad[h][t]
+                        for s in range(Lk):
+                            wv = float(wbht[s])
+                            if not math.isfinite(wv):
+                                raise ValueError(
+                                    "padded cross-attention weight became "
+                                    "non-finite")
+                            wrow[s] = wv
+        except ValueError:
+            self._cache = None
+            raise
+
+        self._cache = ("mha_cross_padded", B, Tq, Tk,
+                       list(q_lengths), list(kv_lengths), snaps)
+        return y, w
+
+    def backward_cross_padded(self, dy):
+        """变长批投影多头交叉注意力反向，返回
+        (dqxs, dkvxs, dWq, dWk, dWv, dWo)。
+
+        须紧随一次成功的 forward_cross_padded（其后缓存未被任何其他
+        forward 类调用替换或被失败清空），否则抛 ValueError；dy 须为
+        B×Tq×D 的 F 嵌套列表（与前向 y 同形，padding 位经校验后忽略），
+        否则抛 ValueError。实参数量错误沿用 Python 自带的 TypeError。
+
+        样本按 b 升序、各以其独立快照调用现有 backward_cross：dqxs 为
+        B×Tq×D、dkvxs 为 B×Tk×D（有效前缀写入各样本梯度，padding 行为
+        D 个 0.0）；dWq、dWk、dWv、dWo 四个 D×D 梯度均自 0.0 起按 b、行、
+        列升序累加。所有结果均为逐层新建的 float 列表，不修改 dy、缓存或
+        投影属性；成功时缓存保留，可重复调用且结果确定。任一中间量非有限
+        或反向失败均抛 ValueError 并清空缓存。
+        """
+        D = self.D
+        cache = self._cache
+        try:
+            if type(cache) is not tuple or len(cache) != 7 \
+                    or cache[0] != "mha_cross_padded":
+                raise ValueError(
+                    "backward_cross_padded requires a successful "
+                    "forward_cross_padded pass before it")
+            (_, B, Tq, Tk, q_lengths_c, kv_lengths_c, snaps) = cache
+
+            # dy：B×Tq×D 的 F 嵌套列表；padding 位在此一并校验，随后忽略。
+            if type(dy) is not list or len(dy) != B:
+                raise ValueError("dy must be a list of shape %d×%d×%d"
+                                 % (B, Tq, D))
+            checked_dy = []
+            for b in range(B):
+                seq = dy[b]
+                if type(seq) is not list or len(seq) != Tq:
+                    raise ValueError("dy must be a list of shape %d×%d×%d"
+                                     % (B, Tq, D))
+                checked_seq = []
+                for row in seq:
+                    if type(row) is not list or len(row) != D:
+                        raise ValueError("dy must be a list of shape %d×%d×%d"
+                                         % (B, Tq, D))
+                    for v in row:
+                        if not _is_f(v):
+                            raise ValueError(
+                                "dy entries must be finite numbers, got %r"
+                                % (v,))
+                    checked_seq.append([float(v) for v in row])
+                checked_dy.append(checked_seq)
+
+            dqxs = [[[0.0] * D for _ in range(Tq)] for _ in range(B)]
+            dkvxs = [[[0.0] * D for _ in range(Tk)] for _ in range(B)]
+            dWq = [[0.0] * D for _ in range(D)]
+            dWk = [[0.0] * D for _ in range(D)]
+            dWv = [[0.0] * D for _ in range(D)]
+            dWo = [[0.0] * D for _ in range(D)]
+
+            for b in range(B):
+                Lq = q_lengths_c[b]
+                Lk = kv_lengths_c[b]
+                dyb = [checked_dy[b][t] for t in range(Lq)]
+
+                # 以该样本的独立快照调用现有 backward_cross；失败时其内部
+                # 已清空 self._cache，由本方法外层 except 统一处理。
+                self._cache = snaps[b]
+                dqxb, dkvxb, gWq, gWk, gWv, gWo = self.backward_cross(dyb)
+
+                dq_b = dqxs[b]
+                for t in range(Lq):
+                    dqt = dq_b[t]
+                    gqt = dqxb[t]
+                    for a in range(D):
+                        gv = float(gqt[a])
+                        if not math.isfinite(gv):
+                            raise ValueError(
+                                "dqxs accumulated to a non-finite value")
+                        dqt[a] = gv
+
+                dkv_b = dkvxs[b]
+                for s in range(Lk):
+                    dkvs = dkv_b[s]
+                    gkvs = dkvxb[s]
+                    for a in range(D):
+                        gv = float(gkvs[a])
+                        if not math.isfinite(gv):
+                            raise ValueError(
+                                "dkvxs accumulated to a non-finite value")
+                        dkvs[a] = gv
+
+                # 四个参数梯度自 0.0 起按 b、行、列升序累加。
+                for a in range(D):
+                    dWqa, dWka, dWva, dWoa = (
+                        dWq[a], dWk[a], dWv[a], dWo[a])
+                    gWqa, gWka, gWva, gWoa = (
+                        gWq[a], gWk[a], gWv[a], gWo[a])
+                    for j in range(D):
+                        dWqa[j] += float(gWqa[j])
+                        if not math.isfinite(dWqa[j]):
+                            raise ValueError(
+                                "dWq accumulated to a non-finite value")
+                        dWka[j] += float(gWka[j])
+                        if not math.isfinite(dWka[j]):
+                            raise ValueError(
+                                "dWk accumulated to a non-finite value")
+                        dWva[j] += float(gWva[j])
+                        if not math.isfinite(dWva[j]):
+                            raise ValueError(
+                                "dWv accumulated to a non-finite value")
+                        dWoa[j] += float(gWoa[j])
+                        if not math.isfinite(dWoa[j]):
+                            raise ValueError(
+                                "dWo accumulated to a non-finite value")
+
+            # 恢复批缓存，保证可重复反向。
+            self._cache = cache
+        except ValueError:
+            self._cache = None
+            raise
+
+        return dqxs, dkvxs, dWq, dWk, dWv, dWo
+
 
 class VanillaRNN(object):
     """单隐藏层 Vanilla RNN，参数 Wxh/Whh/bh 初始化为全 0.0。
