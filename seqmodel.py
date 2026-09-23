@@ -476,6 +476,132 @@ def attention_backward(q, k, v, dc, mask=None):
     return dq, dk, dv
 
 
+def _multihead_check_heads(heads, D, Dv):
+    """multihead_attention(_backward) 共用的 heads 契约校验。
+
+    heads 的 type 须恰为 int（不含 bool）且为正，并同时整除查询维 D 与值维
+    Dv，否则抛 ValueError。
+    """
+    if type(heads) is bool or type(heads) is not int or heads <= 0:
+        raise ValueError(
+            "heads must be a non-bool positive int, got %r" % (heads,))
+    if D % heads != 0 or Dv % heads != 0:
+        raise ValueError(
+            "heads (%d) must divide both query dim D=%d and value dim Dv=%d"
+            % (heads, D, Dv))
+
+
+def _slice_columns(matrix, rows, width, offset):
+    """取 matrix 各行 [offset, offset+width) 的逐行新建子矩阵。"""
+    return [[matrix[i][offset + d] for d in range(width)] for i in range(rows)]
+
+
+def multihead_attention(q, k, v, heads, mask=None):
+    """多头缩放点积注意力，返回 (c, w)，不修改或复用任何输入。
+
+    q、k、v、mask 完全沿用 attention 的契约（q 为 Tq×D、k 为 Tk×D、v 为
+    Tk×Dv 的非空 F 列表矩阵，mask 为 None 或元素 type 恰为 bool 的
+    Tq×Tk 矩阵，全屏蔽行抛 ValueError）；heads 须为非 bool 的正 int，并
+    同时整除 D 与 Dv，否则抛 ValueError。实参数量错误沿用 Python 自带的
+    TypeError。
+
+    按连续列将 q、k 均分为 heads 个 D/heads 维子矩阵、v 均分为 heads 个
+    Dv/heads 维子矩阵，各头按索引升序以同一 mask 调用 attention；各头
+    上下文按头序、维序拼回 Tq×Dv 的 c，w 形状为 heads×Tq×Tk
+    （w[h] 即第 h 头的注意力权重）。所有输出逐层新建、元素均为 float。
+    任一校验或中间有限性失败均抛 ValueError；相同输入结果确定。
+    """
+    Tq, Tk, D, Dv, active = _attention_check(q, k, v, mask)
+    _multihead_check_heads(heads, D, Dv)
+
+    Hd = D // heads
+    Hdv = Dv // heads
+    c = [[0.0] * Dv for _ in range(Tq)]
+    w = []
+    for h in range(heads):
+        qh = _slice_columns(q, Tq, Hd, h * Hd)
+        kh = _slice_columns(k, Tk, Hd, h * Hd)
+        vh = _slice_columns(v, Tk, Hdv, h * Hdv)
+        ch, wh = attention(qh, kh, vh, active)
+
+        # c 按头序拼回；attention 已保证有限，此处再经 float 转换与有限性
+        # 校验后写入全新行。
+        coff = h * Hdv
+        for i in range(Tq):
+            chi = ch[i]
+            crow = c[i]
+            for a in range(Hdv):
+                cv = float(chi[a])
+                if not math.isfinite(cv):
+                    raise ValueError(
+                        "multihead context became non-finite")
+                crow[coff + a] = cv
+        w.append(wh)
+
+    return c, w
+
+
+def multihead_attention_backward(q, k, v, dc, heads, mask=None):
+    """多头缩放点积注意力的反向传播，返回 (dq, dk, dv)，不修改或复用输入。
+
+    q、k、v、heads、mask 完全沿用 multihead_attention 的契约；dc 须为
+    Tq×Dv 的 F 列表矩阵，否则抛 ValueError。实参数量错误沿用 Python 自带
+    的 TypeError。
+
+    按连续列切分 q、k、v（各头维度同前向），dc 同样按 Dv/heads 切分，各
+    头按索引升序调用 attention_backward；dq、dk、dv 按各梯度原来的列位拼
+    回，形状分别同 q、k、v。所有结果逐层新建、元素均为 float。任一校验或
+    中间有限性失败均抛 ValueError；相同输入结果确定。
+    """
+    Tq, Tk, D, Dv, active = _attention_check(q, k, v, mask)
+    _multihead_check_heads(heads, D, Dv)
+
+    # dc：Tq×Dv 的 F 列表矩阵（逐行浅拷贝，读取用，不修改原输入）。
+    dcc = _check_matrix(dc, Tq, Dv, "dc")
+
+    Hd = D // heads
+    Hdv = Dv // heads
+    dq = [[0.0] * D for _ in range(Tq)]
+    dk = [[0.0] * D for _ in range(Tk)]
+    dv = [[0.0] * Dv for _ in range(Tk)]
+    for h in range(heads):
+        qh = _slice_columns(q, Tq, Hd, h * Hd)
+        kh = _slice_columns(k, Tk, Hd, h * Hd)
+        vh = _slice_columns(v, Tk, Hdv, h * Hdv)
+        dch = _slice_columns(dcc, Tq, Hdv, h * Hdv)
+        dqh, dkh, dvh = attention_backward(qh, kh, vh, dch, active)
+
+        # 各头梯度按原列位拼回；attention_backward 已保证有限，此处再经
+        # float 转换与有限性校验。
+        qoff = h * Hd
+        for i in range(Tq):
+            dqhi = dqh[i]
+            dqi = dq[i]
+            for d in range(Hd):
+                gv = float(dqhi[d])
+                if not math.isfinite(gv):
+                    raise ValueError("dq became non-finite")
+                dqi[qoff + d] = gv
+        for j in range(Tk):
+            dkhj = dkh[j]
+            dkj = dk[j]
+            dvhj = dvh[j]
+            dvj = dv[j]
+            for d in range(Hd):
+                gv = float(dkhj[d])
+                if not math.isfinite(gv):
+                    raise ValueError("dk became non-finite")
+                dkj[qoff + d] = gv
+            voff = h * Hdv
+            for a in range(Hdv):
+                gv = float(dvhj[a])
+                if not math.isfinite(gv):
+                    raise ValueError("dv became non-finite")
+                dvj[voff + a] = gv
+
+    return dq, dk, dv
+
+
 def attention_context_backward(n, memory, du):
     """注意力上下文加残差 u = n + attention([n], memory, memory)[0] 的反向。
 
@@ -2106,6 +2232,10 @@ class BidirectionalGRU(object):
         B×T×2H 的 F 嵌套列表（与前向 c 同形，padding 位经校验后忽略），
         否则抛 ValueError。实参数量错误沿用 Python 自带的 TypeError。
 
+        反向中任何 ValueError（dc 校验、attention_backward、dy 累加或批
+        GRU 反传失败）都使缓存失效：失败后未重新前向再调用本方法仍抛
+        ValueError；成功时缓存保留，可重复调用且结果不变。
+
         对样本 b 令 L=lengths[b]，以缓存的有效前缀 v（长 L）与有效块掩码
         对 dc 的有效前缀调用 attention_backward(v, v, v, dc[:L], 有效块)
         得 (gq, gk, gv)（形状均为 L×2H）：有效前缀输出梯度 dy 按 t、维
@@ -2125,44 +2255,50 @@ class BidirectionalGRU(object):
                 "forward_self_attn_masked pass before it")
         _, B, T, lengths, cfs, cbs, vs, blocks = cache
 
-        # dc：B×T×2H 的 F 嵌套列表；padding 位在此一并校验，随后忽略。
-        dc = self._check_padded_3d(dc, B, T, 2 * H, "dc")
+        try:
+            # dc：B×T×2H 的 F 嵌套列表；padding 位在此一并校验，随后忽略。
+            dc = self._check_padded_3d(dc, B, T, 2 * H, "dc")
 
-        # 各样本有效前缀的输出梯度 dy：按 t、维升序自 0.0 依次累加 gq、gk、
-        # gv；padding 位不构造（反传只取有效前缀，dxs 的 padding 行由反传
-        # 铺零）。
-        dy_valid = [None] * B
-        for b in range(B):
-            L = lengths[b]
-            dc_prefix = [dc[b][t] for t in range(L)]
-            gq, gk, gv = attention_backward(
-                vs[b], vs[b], vs[b], dc_prefix, blocks[b])
-            dy_b = [[0.0] * (2 * H) for _ in range(L)]
-            for t in range(L):
-                row = dy_b[t]
-                gqt = gq[t]
-                gkt = gk[t]
-                gvt = gv[t]
-                for a in range(2 * H):
-                    acc = 0.0
-                    acc += gqt[a]
-                    if not math.isfinite(acc):
-                        raise ValueError(
-                            "dy accumulated to a non-finite value")
-                    acc += gkt[a]
-                    if not math.isfinite(acc):
-                        raise ValueError(
-                            "dy accumulated to a non-finite value")
-                    acc += gvt[a]
-                    if not math.isfinite(acc):
-                        raise ValueError(
-                            "dy accumulated to a non-finite value")
-                    row[a] = acc
-            dy_valid[b] = dy_b
+            # 各样本有效前缀的输出梯度 dy：按 t、维升序自 0.0 依次累加 gq、
+            # gk、gv；padding 位不构造（反传只取有效前缀，dxs 的 padding
+            # 行由反传铺零）。
+            dy_valid = [None] * B
+            for b in range(B):
+                L = lengths[b]
+                dc_prefix = [dc[b][t] for t in range(L)]
+                gq, gk, gv = attention_backward(
+                    vs[b], vs[b], vs[b], dc_prefix, blocks[b])
+                dy_b = [[0.0] * (2 * H) for _ in range(L)]
+                for t in range(L):
+                    row = dy_b[t]
+                    gqt = gq[t]
+                    gkt = gk[t]
+                    gvt = gv[t]
+                    for a in range(2 * H):
+                        acc = 0.0
+                        acc += gqt[a]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dy accumulated to a non-finite value")
+                        acc += gkt[a]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dy accumulated to a non-finite value")
+                        acc += gvt[a]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dy accumulated to a non-finite value")
+                        row[a] = acc
+                dy_valid[b] = dy_b
 
-        # 批 GRU 反传完全沿用 backward_padded 的语义；padding 位梯度为零。
-        return self._padded_backprop(
-            B, T, lengths, cfs, cbs, dy_valid)
+            # 批 GRU 反传完全沿用 backward_padded 的语义；padding 位梯度为零。
+            return self._padded_backprop(
+                B, T, lengths, cfs, cbs, dy_valid)
+        except ValueError:
+            # 任何失败（dc 校验、attention_backward、dy 累加或批反传）都使
+            # 缓存失效：未重新前向再调用本方法仍抛 ValueError。
+            self._cache = None
+            raise
 
 
 # 模型 JSON 顶层唯一允许的键及其出现顺序。
