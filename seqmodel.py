@@ -6116,6 +6116,225 @@ def _perplexity_lstm_attn(model_path, corpus_path, window_text):
     return format(perplexity, ".17g") + "\n"
 
 
+# LSTM+MHA 模型 JSON 顶层唯一允许的键及其出现顺序。
+_LSTM_MHA_MODEL_KEYS = ["version", "vocab", "W", "b", "Wq", "Wk", "Wv",
+                        "Wo", "heads", "Why", "by", "h0", "c0"]
+
+
+def _load_perplexity_lstm_mha_model(path):
+    """读取并校验 perplexity-lstm-mha 模型文件，返回解包后的十二元组。
+
+    文件须为 UTF-8 编码的 JSON 对象，顶层键恰为 version、vocab、W、b、
+    Wq、Wk、Wv、Wo、heads、Why、by、h0、c0 且按此顺序出现（重复或多余
+    均非法）：version 的 type 恰为 int 且值为 4；vocab、W、b、Why、by、
+    h0、c0 的契约与 perplexity-lstm 相同（W 形状 4H×(V+H)、b 形状 4H、
+    Why 形状 V×H、by 形状 V、h0/c0 形状 H，V=len(vocab)、H=len(h0)>0）；
+    Wq、Wk、Wv、Wo 均为 H×H 的 F 矩阵；heads 为非 bool 的正 int 且整除
+    H。任何读取、UTF-8、JSON 或校验失败均抛 ValueError（或 OSError）。
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+    # 先按严格 UTF-8 解码，再交由 json 解析（object_pairs_hook 保留键序与
+    # 重复键，root 非对象时不会得到 (key, value) 二元组列表）。
+    text = raw.decode("utf-8")
+    pairs = json.loads(text, object_pairs_hook=list)
+    if type(pairs) is not list or len(pairs) != len(_LSTM_MHA_MODEL_KEYS):
+        raise ValueError("model must be a JSON object with exactly 13 keys")
+    for pair, key in zip(pairs, _LSTM_MHA_MODEL_KEYS):
+        if type(pair) is not tuple or len(pair) != 2 or pair[0] != key:
+            raise ValueError("model keys must be exactly %r in order"
+                             % _LSTM_MHA_MODEL_KEYS)
+    model = dict(pairs)
+
+    version = model["version"]
+    if type(version) is not int or version != 4:
+        raise ValueError("version must be exactly int 4, got %r" % (version,))
+
+    vocab = model["vocab"]
+    if type(vocab) is not list or len(vocab) == 0:
+        raise ValueError("vocab must be a non-empty list")
+    for ch in vocab:
+        # len(str) 按码点计数，组合字符序列等多码点串在此被拒。
+        if type(ch) is not str or len(ch) != 1:
+            raise ValueError("vocab entries must be single-codepoint strings, "
+                             "got %r" % (ch,))
+    if len(set(vocab)) != len(vocab) or vocab != sorted(vocab):
+        raise ValueError("vocab entries must be unique and sorted by codepoint")
+    V = len(vocab)
+
+    h0 = model["h0"]
+    if type(h0) is not list or len(h0) == 0:
+        raise ValueError("h0 must be a non-empty list")
+    H = len(h0)
+    for v in h0:
+        if not _is_f(v):
+            raise ValueError("h0 entries must be finite numbers, got %r" % (v,))
+
+    W = model["W"]
+    if type(W) is not list or len(W) != 4 * H:
+        raise ValueError("W must be a list of shape %d×%d" % (4 * H, V + H))
+    for row in W:
+        if type(row) is not list or len(row) != V + H:
+            raise ValueError("W must be a list of shape %d×%d" % (4 * H, V + H))
+        for v in row:
+            if not _is_f(v):
+                raise ValueError("W entries must be finite numbers, got %r"
+                                 % (v,))
+
+    b = model["b"]
+    if type(b) is not list or len(b) != 4 * H:
+        raise ValueError("b must be a list of length %d" % (4 * H))
+    for v in b:
+        if not _is_f(v):
+            raise ValueError("b entries must be finite numbers, got %r" % (v,))
+
+    Wq = _check_matrix(model["Wq"], H, H, "Wq")
+    Wk = _check_matrix(model["Wk"], H, H, "Wk")
+    Wv = _check_matrix(model["Wv"], H, H, "Wv")
+    Wo = _check_matrix(model["Wo"], H, H, "Wo")
+
+    heads = model["heads"]
+    if type(heads) is not int or heads <= 0:
+        raise ValueError("heads must be a non-bool positive int, got %r"
+                         % (heads,))
+    if H % heads != 0:
+        raise ValueError("heads (%d) must divide H=%d" % (heads, H))
+
+    Why = model["Why"]
+    if type(Why) is not list or len(Why) != V:
+        raise ValueError("Why must be a list of shape %d×H" % V)
+    for row in Why:
+        if type(row) is not list or len(row) != H:
+            raise ValueError("Why must be a list of shape %d×%d" % (V, H))
+        for v in row:
+            if not _is_f(v):
+                raise ValueError("Why entries must be finite numbers, got %r"
+                                 % (v,))
+
+    by = model["by"]
+    if type(by) is not list or len(by) != V:
+        raise ValueError("by must be a list of length %d" % V)
+    for v in by:
+        if not _is_f(v):
+            raise ValueError("by entries must be finite numbers, got %r" % (v,))
+
+    c0 = model["c0"]
+    if type(c0) is not list or len(c0) != H:
+        raise ValueError("c0 must be a list of length %d" % H)
+    for v in c0:
+        if not _is_f(v):
+            raise ValueError("c0 entries must be finite numbers, got %r" % (v,))
+
+    return vocab, W, b, Wq, Wk, Wv, Wo, heads, Why, by, h0, c0
+
+
+def _perplexity_lstm_mha(model_path, corpus_path, window_text):
+    """LSTM 加投影多头注意力上下文的困惑度，返回待写出的字符串。
+
+    MODEL 沿用 perplexity-lstm 的 vocab、F 与六组数组契约，但顶层键恰为
+    version、vocab、W、b、Wq、Wk、Wv、Wo、heads、Why、by、h0、c0
+    （version 恰为 int 4，四个投影均为 H×H 的 F 矩阵，heads 为非 bool 正
+    int 且整除 H）；CORPUS 沿用 perplexity-lstm 的严格 UTF-8、词表及至少
+    2 码点契约；WINDOW 的词法与任意位数安全截取完全沿用
+    perplexity-lstm-attn（整串匹配 [1-9][0-9]*，不转 int），否则抛
+    ValueError。
+
+    置 h=h0、c=c0、L=0.0、T=len(CORPUS)-1、memory=[h0]，t 升序：以当前
+    字符的 V 长 one-hot 为 x，调用装入 W、b 的 LSTMCell.forward(x, h, c)，
+    取前两项更新 h、c；M 取 memory 末尾至多 WINDOW 项（顺序从旧到新），
+    以装入 Wq、Wk、Wv、Wo 的 MHA(H, heads).forward_cross([h], M, None)
+    得 (ctx, w)，按 i 升序令 u[i] = h[i] + ctx[0][i]。logit 仅以 u 替代
+    perplexity-lstm 中的 h，其余 Why/by 仿射、稳定 log-sum-exp 及下一字符
+    负对数似然的下标与累加顺序均与 perplexity-lstm 相同；随后向 memory
+    追加 h 的 float 副本。任一运算非有限（含最终 exp(L/T) 溢出）均抛
+    ValueError。成功返回 format(exp(L/T), '.17g') + '\\n'。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    (vocab, W, b, Wq, Wk, Wv, Wo, heads, Why, by, h0, c0) = \
+        _load_perplexity_lstm_mha_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    mha = MHA(H, heads)
+    mha.Wq = [list(row) for row in Wq]
+    mha.Wk = [list(row) for row in Wk]
+    mha.Wv = [list(row) for row in Wv]
+    mha.Wo = [list(row) for row in Wo]
+
+    # 记忆序列 [h0, h_0, ..., h_{t-1}]；h0 保留模型原值（F 允许 int），
+    # forward_cross 内部逐行新建 float 拷贝，不修改其输入，故直接共享行。
+    memory = [h0]
+    h = list(h0)
+    c = list(c0)
+    L = 0.0
+    T = len(ids) - 1
+    for t in range(T):
+        y = ids[t + 1]
+
+        # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c = cell.forward(x, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        ctx, _w = mha.forward_cross([h], M, None)
+        ctx0 = ctx[0]
+        u = [0.0] * H
+        for i in range(H):
+            ui = h[i] + ctx0[i]
+            if not math.isfinite(ui):
+                raise ValueError("attention-adjusted hidden state became "
+                                 "non-finite")
+            u[i] = ui
+
+        # z_k = by_k + Σ_j Why_k,j*u_j，依 j 升序自 float 偏置累加。
+        z = _output_logits(Why, by, u)
+
+        # log-sum-exp：m=max(z)，d 从 0.0 依 k 升序累加 exp(z_k-m)。
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        d = 0.0
+        for k in range(V):
+            d += math.exp(z[k] - m)
+            if not math.isfinite(d):
+                raise ValueError("softmax denominator accumulated non-finitely")
+
+        step = m + math.log(d) - z[y]
+        if not math.isfinite(step):
+            raise ValueError("cross-entropy step is non-finite")
+        L += step
+        if not math.isfinite(L):
+            raise ValueError("total cross-entropy accumulated non-finitely")
+
+        memory.append([float(v) for v in h])
+
+    perplexity = math.exp(L / T)
+    if not math.isfinite(perplexity):
+        raise ValueError("perplexity is non-finite")
+    return format(perplexity, ".17g") + "\n"
+
+
 def _perplexity_gru_attn(model_path, corpus_path, window_text):
     """GRU 加注意力上下文的困惑度，返回待写出的字符串。
 
@@ -11042,6 +11261,19 @@ def main(argv):
     为键/值调用 attention，用 h 与首行上下文之和作为 logit 隐状态，随后向
     memory 追加 h 的 float 副本；输出契约与 perplexity 相同，不写文件。
 
+    python seqmodel.py perplexity-lstm-mha MODEL CORPUS WINDOW：MODEL 沿用
+    perplexity-lstm 的 vocab、F 及六组数组契约，但键无重复且依次恰为
+    version,vocab,W,b,Wq,Wk,Wv,Wo,heads,Why,by,h0,c0；version 恰为 int 4，
+    Wq、Wk、Wv、Wo 均为 H×H 的 F 矩阵，heads 为非 bool 正 int 且整除 H。
+    CORPUS 沿用 perplexity-lstm 契约；WINDOW 沿用 perplexity-attn 的词法
+    及任意位数安全截取。置 h=h0、c=c0、memory=[h0]，t 升序以当前字符
+    one-hot 调用装入 W、b 的 LSTMCell.forward 推进 h、c；M 取 memory
+    末尾至多 WINDOW 项（从旧到新），装入四个投影后调用
+    MHA(H,heads).forward_cross([h],M,None) 取首行 ctx，按 i 升序令
+    u[i]=h[i]+ctx[0][i]；以 u 沿用 Why/by、稳定 log-sum-exp 与 NLL 次序
+    预测下一字符，再向 memory 追加 h 的 float 副本；输出契约与
+    perplexity 相同，不写任何文件。
+
     python seqmodel.py perplexity-lstm-attn-trace MODEL CORPUS WINDOW：
     MODEL、CORPUS、WINDOW 的校验与逐步计算均沿用 perplexity-lstm-attn。
     令 T=语料码点数-1；按 t 升序计算 loss=m+log(d)-z_y，L 从 0.0 依序
@@ -11583,6 +11815,9 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 5 and argv[1] == "perplexity-lstm-attn":
             output = _perplexity_lstm_attn(argv[2], argv[3], argv[4])
+            sys.stdout.buffer.write(output.encode("ascii"))
+        elif len(argv) == 5 and argv[1] == "perplexity-lstm-mha":
+            output = _perplexity_lstm_mha(argv[2], argv[3], argv[4])
             sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 5 and argv[1] == "perplexity-lstm-attn-trace":
             output = _perplexity_lstm_attn_trace(argv[2], argv[3], argv[4])
