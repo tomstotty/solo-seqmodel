@@ -5344,6 +5344,45 @@ def _gru_cell_loaded(V, H, W, b):
     return cell
 
 
+def _lstm_cell_loaded(V, H, W, b):
+    """不经随机初始化构造一个已装入模型 W、b 的 LSTMCell。
+
+    LSTMCell.__init__ 会以 random.Random(seed) 生成一份随即被覆盖的 W，使
+    装载 version 4 模型参数的入口因此构造一个与采样无关的随机源；此处以
+    object.__new__ 跳过该随机初始化，仅设置 forward/backward 所需的 I、H、
+    W、b，令这类入口不构造任何随机源（采样入口对 random.Random 的唯一一次
+    构造恰为 random.Random(int(SEED))）。W 逐行复制为新列表、b 复制为新
+    列表，行为与“LSTMCell(V,H) 后覆盖 W、b”逐值一致。
+    """
+    cell = object.__new__(LSTMCell)
+    cell.I = V
+    cell.H = H
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+    return cell
+
+
+def _mha_loaded(H, heads, Wq, Wk, Wv, Wo):
+    """不经随机初始化构造一个已装入四组投影的 MHA。
+
+    MHA.__init__ 本身不使用随机源，但为使“装载 version 4 模型参数不得构造
+    任何随机源”的装载路径单一且不依赖各构造器的实现细节，此处与
+    _lstm_cell_loaded 同样以 object.__new__ 跳过 __init__，仅设置
+    forward_cross/backward_cross 所需的 D、heads、四组投影与缓存槽。四组
+    投影逐行复制为新列表，行为与“MHA(H,heads) 后覆盖 Wq/Wk/Wv/Wo”逐值
+    一致。
+    """
+    mha = object.__new__(MHA)
+    mha.D = H
+    mha.heads = heads
+    mha.Wq = [list(row) for row in Wq]
+    mha.Wk = [list(row) for row in Wk]
+    mha.Wv = [list(row) for row in Wv]
+    mha.Wo = [list(row) for row in Wo]
+    mha._cache = None
+    return mha
+
+
 def _sample_gru_attn_topp(model_path, start, seed_text, start_t_text,
                           end_t_text, top_p_text, length_text, window_text):
     """以线性退火温度、top-p 核选样、带注意力上下文从 GRU 语言模型采样。
@@ -6301,15 +6340,9 @@ def _perplexity_lstm_mha(model_path, corpus_path, window_text):
             raise ValueError("corpus contains an out-of-vocab character")
         ids[t] = ix
 
-    cell = LSTMCell(V, H)
-    cell.W = [list(row) for row in W]
-    cell.b = list(b)
-
-    mha = MHA(H, heads)
-    mha.Wq = [list(row) for row in Wq]
-    mha.Wk = [list(row) for row in Wk]
-    mha.Wv = [list(row) for row in Wv]
-    mha.Wo = [list(row) for row in Wo]
+    # 以 model 参数直接装入 cell/MHA，跳过构造器中随即被覆盖的随机 W 初始化。
+    cell = _lstm_cell_loaded(V, H, W, b)
+    mha = _mha_loaded(H, heads, Wq, Wk, Wv, Wo)
 
     # 记忆序列 [h0, h_0, ..., h_{t-1}]；h0 保留模型原值（F 允许 int），
     # forward_cross 会先复制再投影；各步 h 本就是 float。
@@ -8531,15 +8564,9 @@ def _sample_lstm_mha(model_path, start, seed_text, temperature_text,
         raise ValueError("LENGTH must match 0|[1-9][0-9]*")
     length = int(length_text)
 
-    cell = LSTMCell(V, H)
-    cell.W = [list(row) for row in W]
-    cell.b = list(b)
-
-    mha = MHA(H, heads)
-    mha.Wq = [list(row) for row in Wq]
-    mha.Wk = [list(row) for row in Wk]
-    mha.Wv = [list(row) for row in Wv]
-    mha.Wo = [list(row) for row in Wo]
+    # 以 model 参数直接装入 cell/MHA，跳过构造器中随即被覆盖的随机 W 初始化。
+    cell = _lstm_cell_loaded(V, H, W, b)
+    mha = _mha_loaded(H, heads, Wq, Wk, Wv, Wo)
 
     rng = random.Random(seed)
     # 与 perplexity-lstm-mha 相同：h0 保留模型原值，forward_cross 会先复制
@@ -8551,6 +8578,145 @@ def _sample_lstm_mha(model_path, start, seed_text, temperature_text,
     out = []
 
     for _t in range(length):
+        # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+        xvec = [0.0] * V
+        xvec[x] = 1.0
+        h, c = cell.forward(xvec, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        u = _mha_cross_context(h, M, mha)
+
+        # logit 仅以 u 替代 h；下标与累加顺序同 _sample_lstm。
+        z = _output_logits(Why, by, u)
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # u=r.random()*d；自 0.0 依 k 升序累加 e_k，选首个累计值严格大于
+        # u 者；无则取词表末项。
+        threshold = rng.random() * d
+        if not math.isfinite(threshold):
+            raise ValueError("sample threshold became non-finite")
+        chosen = V - 1
+        cum = 0.0
+        for k in range(V):
+            cum += e[k]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > threshold:
+                chosen = k
+                break
+
+        out.append(vocab[chosen])
+        x = chosen
+        memory.append([float(v) for v in h])
+
+    return "".join(out) + "\n"
+
+
+def _sample_lstm_mha_anneal(model_path, start, seed_text, start_t_text,
+                            end_t_text, length_text, window_text):
+    """以线性退火温度从 version 4 的 LSTM-MHA 模型采样 LENGTH 个码点。
+
+    MODEL、START、SEED、LENGTH、WINDOW 的校验，以及 LSTM 状态、MHA 窗口、
+    Why/by logit、稳定 softmax、词表升序阈值抽样的次序均完全沿用
+    _sample_lstm_mha；模型 LSTM、MHA 参数经 _lstm_cell_loaded/_mha_loaded
+    直接装入，不构造任何随机源，整次调用对 random.Random 的唯一一次构造
+    恰为 r=random.Random(int(SEED))，不写任何文件。
+
+    START_T、END_T 各经 float() 解析，结果须有限且严格大于 0。LENGTH 为 0
+    时不计算温度，仅输出一个 LF；为 1 时仅用 START_T；否则 t 自 0 升序，
+    第 t 步温度严格按 Python 表达式
+    START_T+(END_T-START_T)*t/(LENGTH-1) 求值，结果非有限或不大于 0 即抛
+    ValueError，并以该温度替换 _sample_lstm_mha 的固定温度。置 h=h0、
+    c=c0、x=START 索引、memory=[h0]，h、c、x、memory 与随机源均跨步连续，
+    生成后更新 x 并向 memory 追加 h 的 float 副本。任一中间量非有限均抛
+    ValueError。成功返回 LENGTH 个码点再加一个 LF。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    (vocab, W, b, Wq, Wk, Wv, Wo, heads,
+     Why, by, h0, c0) = _load_perplexity_lstm_mha_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # START_T、END_T：float() 可解析且有限、严格大于 0。
+    start_t = float(start_t_text)
+    if not math.isfinite(start_t) or start_t <= 0.0:
+        raise ValueError("START_T must be a finite positive float")
+    end_t = float(end_t_text)
+    if not math.isfinite(end_t) or end_t <= 0.0:
+        raise ValueError("END_T must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    if length == 1:
+        # 仅用 START_T，不求值退火表达式。
+        def temperature_at(t):
+            return start_t
+    elif length >= 2:
+        def temperature_at(t):
+            # 严格按 START_T+(END_T-START_T)*t/(LENGTH-1) 的运算顺序求值。
+            temp = start_t + (end_t - start_t) * t / (length - 1)
+            if not math.isfinite(temp) or temp <= 0.0:
+                raise ValueError(
+                    "annealed temperature became non-finite or non-positive")
+            return temp
+    else:
+        temperature_at = None  # LENGTH 为 0：循环不执行，不计算温度。
+
+    # 直接装入模型参数，不构造任何随机源。
+    cell = _lstm_cell_loaded(V, H, W, b)
+    mha = _mha_loaded(H, heads, Wq, Wk, Wv, Wo)
+
+    # 整次调用唯一的随机源。
+    rng = random.Random(seed)
+    # 与 _sample_lstm_mha 相同：h0 保留模型原值，forward_cross 会先复制
+    # 再投影；各步 h 本就是 float。
+    memory = [h0]
+    h = list(h0)
+    c = list(c0)
+    x = vocab.index(start)
+    out = []
+
+    for t in range(length):
+        temperature = temperature_at(t)
         # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
         xvec = [0.0] * V
         xvec[x] = 1.0
@@ -8765,15 +8931,9 @@ def _score_lstm_mha(model_path, start, text, temperature_text, window_text):
             raise ValueError("TEXT contains an out-of-vocab character")
         ids[t] = ix
 
-    cell = LSTMCell(V, H)
-    cell.W = [list(row) for row in W]
-    cell.b = list(b)
-
-    mha = MHA(H, heads)
-    mha.Wq = [list(row) for row in Wq]
-    mha.Wk = [list(row) for row in Wk]
-    mha.Wv = [list(row) for row in Wv]
-    mha.Wo = [list(row) for row in Wo]
+    # 以 model 参数直接装入 cell/MHA，跳过构造器中随即被覆盖的随机 W 初始化。
+    cell = _lstm_cell_loaded(V, H, W, b)
+    mha = _mha_loaded(H, heads, Wq, Wk, Wv, Wo)
 
     memory = [h0]
     h = list(h0)
@@ -11240,15 +11400,9 @@ def _train_lstm_mha(model_path, corpus_path, out_path, window_text):
 
     T = len(ids) - 1
 
-    cell = LSTMCell(V, H)
-    cell.W = [list(row) for row in W]
-    cell.b = list(b)
-
-    mha = MHA(H, heads)
-    mha.Wq = [list(row) for row in Wq]
-    mha.Wk = [list(row) for row in Wk]
-    mha.Wv = [list(row) for row in Wv]
-    mha.Wo = [list(row) for row in Wo]
+    # 以 model 参数直接装入 cell/MHA，跳过构造器中随即被覆盖的随机 W 初始化。
+    cell = _lstm_cell_loaded(V, H, W, b)
+    mha = _mha_loaded(H, heads, Wq, Wk, Wv, Wo)
 
     # 前向严格复用 perplexity-lstm-mha：t 升序以 (h0, c0) 为初态逐步推进
     # h、c，缓存每步 cache 与该次交叉注意力的独立快照；M_t 为 memory 末尾
@@ -12007,6 +12161,19 @@ def main(argv):
     h 的 float 副本；任一中间量非有限即失败；输出契约与 sample 相同，不
     写文件。
 
+    python seqmodel.py sample-lstm-mha-anneal MODEL START SEED START_T
+    END_T LENGTH WINDOW：MODEL、START、SEED、LENGTH、WINDOW 的校验，以及
+    LSTM 状态、MHA 窗口、Why/by、softmax 与抽样次序完全沿用
+    sample-lstm-mha；模型 LSTM、MHA 参数直接装入，不构造任何随机源，整次
+    仅构造一次 random.Random(int(SEED))。START_T、END_T 各经 float()
+    解析且须有限、>0。LENGTH 为 0 不求温度且仅输出 LF，为 1 仅用
+    START_T；否则第 t 步严格以
+    START_T+(END_T-START_T)*t/(LENGTH-1) 求温度，结果须有限、>0，并替换
+    sample-lstm-mha 的固定温度；h、c、x、memory 与随机源跨步连续。成功
+    返回 0、stderr 空，stdout 恰为 LENGTH 个 UTF-8 码点加 LF，不写文件；
+    参数数量、词法、I/O、UTF-8/JSON、模型或非有限计算错误均返回 2、
+    stdout 空、stderr 恰为 error\n 且无回溯。
+
     python seqmodel.py score-lstm-mha MODEL START TEXT TEMPERATURE WINDOW：
     确定性评分指定候选 TEXT。MODEL、START、TEMPERATURE、WINDOW 与 CLI 协议
     沿用 sample-lstm-mha；TEXT 为可空 Unicode 字符串且每个码点须在 vocab，
@@ -12494,6 +12661,11 @@ def main(argv):
         elif len(argv) == 8 and argv[1] == "sample-lstm-mha":
             output = _sample_lstm_mha(argv[2], argv[3], argv[4], argv[5],
                                       argv[6], argv[7])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 9 and argv[1] == "sample-lstm-mha-anneal":
+            output = _sample_lstm_mha_anneal(argv[2], argv[3], argv[4],
+                                             argv[5], argv[6], argv[7],
+                                             argv[8])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 7 and argv[1] == "score-lstm-mha":
             output = _score_lstm_mha(argv[2], argv[3], argv[4], argv[5],
