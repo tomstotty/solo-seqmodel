@@ -1598,29 +1598,70 @@ class BidirectionalGRU(object):
         _, B, T, lengths, cfs, cbs = cache
 
         # dys：B×T×2H 的 F 嵌套列表；padding 位在此一并校验，随后忽略。
-        if type(dys) is not list or len(dys) != B:
-            raise ValueError("dys must be a list of shape %d×%d×%d"
-                             % (B, T, 2 * H))
-        checked_dys = []
+        dys = self._check_padded_3d(dys, B, T, 2 * H, "dys")
+
+        # 各样本有效前缀的输出梯度直接取自 dys（padding 行忽略）。
+        return self._padded_backprop(
+            B, T, lengths, cfs, cbs,
+            [[dys[b][t] for t in range(lengths[b])] for b in range(B)])
+
+    @staticmethod
+    def _check_padded_3d(values, B, T, cols, name):
+        """校验 values 为 B×T×cols 的 F 嵌套列表，返回逐层 float 拷贝。"""
+        if type(values) is not list or len(values) != B:
+            raise ValueError("%s must be a list of shape %d×%d×%d"
+                             % (name, B, T, cols))
+        checked = []
         for b in range(B):
-            seq = dys[b]
+            seq = values[b]
             if type(seq) is not list or len(seq) != T:
-                raise ValueError("dys must be a list of shape %d×%d×%d"
-                                 % (B, T, 2 * H))
+                raise ValueError("%s must be a list of shape %d×%d×%d"
+                                 % (name, B, T, cols))
             checked_seq = []
             for row in seq:
-                if type(row) is not list or len(row) != 2 * H:
-                    raise ValueError("dys must be a list of shape %d×%d×%d"
-                                     % (B, T, 2 * H))
+                if type(row) is not list or len(row) != cols:
+                    raise ValueError("%s must be a list of shape %d×%d×%d"
+                                     % (name, B, T, cols))
                 for v in row:
                     if not _is_f(v):
                         raise ValueError(
-                            "dys entries must be finite numbers, got %r"
-                            % (v,))
+                            "%s entries must be finite numbers, got %r"
+                            % (name, v))
                 checked_seq.append([float(v) for v in row])
-            checked_dys.append(checked_seq)
-        dys = checked_dys
+            checked.append(checked_seq)
+        return checked
 
+    @staticmethod
+    def _check_padded_2d(values, B, cols, name):
+        """校验 values 为 B×cols 的 F 列表，返回逐层 float 拷贝。"""
+        if type(values) is not list or len(values) != B:
+            raise ValueError("%s must be a list of shape %d×%d"
+                             % (name, B, cols))
+        checked = []
+        for row in values:
+            if type(row) is not list or len(row) != cols:
+                raise ValueError("%s must be a list of shape %d×%d"
+                                 % (name, B, cols))
+            for v in row:
+                if not _is_f(v):
+                    raise ValueError(
+                        "%s entries must be finite numbers, got %r"
+                        % (name, v))
+            checked.append([float(v) for v in row])
+        return checked
+
+    def _padded_backprop(self, B, T, lengths, cfs, cbs, dy_valid):
+        """forward_padded 与 forward_attn_padded 共用的批 GRU 反传。
+
+        dy_valid[b] 为样本 b 有效前缀（长 L_b、行长 2H）的输出梯度，按
+        backward_padded 的既有语义沿两支反传。固定返回
+        (dxs, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b)：dxs 为 B×T×I
+        （padding 行为 I 个 0.0），dh0_f、dh0_b 为 B×H，dW_f、dW_b 形状
+        3H×(I+H)，db_f、db_b 长 3H，参数梯度自 0.0 起按 b 升序逐元素累加。
+        所有结果均为逐层新建的 float 列表，不修改 dy_valid、缓存或单元
+        参数；任一中间量非有限抛 ValueError。
+        """
+        I, H = self.I, self.H
         dxs = [[[0.0] * I for _ in range(T)] for _ in range(B)]
         dh0_f = [None] * B
         dh0_b = [None] * B
@@ -1632,8 +1673,9 @@ class BidirectionalGRU(object):
         # 参数梯度自 0.0 起按 b 升序、行列升序逐元素累加。
         for b in range(B):
             L = lengths[b]
-            dhf = [[float(v) for v in dys[b][t][:H]] for t in range(L)]
-            dhb = [[float(v) for v in dys[b][t][H:]] for t in range(L)]
+            dy_b = dy_valid[b]
+            dhf = [[float(v) for v in dy_b[t][:H]] for t in range(L)]
+            dhb = [[float(v) for v in dy_b[t][H:]] for t in range(L)]
 
             dxs_f, dh0f_b, sdW_f, sdb_f = \
                 self.forward_cell.backward_sequence(dhf, cfs[b])
@@ -1685,6 +1727,127 @@ class BidirectionalGRU(object):
                         "db_b accumulated to a non-finite value")
 
         return dxs, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b
+
+    def forward_attn_padded(self, xs, lengths, q):
+        """变长批注意力汇聚前向，返回 (c, w) 并保存 attn 批缓存。
+
+        xs、lengths 完全沿用 forward_padded 的契约（xs 为非空 B×T×I 的 F
+        嵌套列表，lengths 各项为 1<=值<=T 的非 bool int）；q 须为 B×2H 的
+        F 列表（每样本一行长度 2H 的查询），否则抛 ValueError。任何失败都
+        使既有缓存（含 forward、forward_padded 缓存）失效。
+
+        先按 forward_padded 的同一前向语义求批双向输出 y（有效前缀为真实
+        输出、padding 行为 2H 个 0.0）；对样本 b 取 v = y[b][:lengths[b]]
+        （逐行新建的 float 行），调用 attention([q[b]], v, v, None) 得
+        (c_b, w_b)：c 为 B×2H，c[b] 即 c_b[0]；w 为 B×T，w[b] 有效前缀
+        为 w_b[0]，padding 位为 0.0。缓存须足以支撑
+        backward_attn_padded：保存批 GRU 缓存及 v、q 的快照。结果均为逐层
+        新建的 float 列表，不修改或复用输入与单元参数；任一中间量非有限
+        同样抛 ValueError，实参数量错误沿用 Python 自带的 TypeError。
+        """
+        I, H = self.I, self.H
+        # 任何失败的 forward_attn_padded 都使既有缓存失效。
+        self._cache = None
+
+        # y 复用 forward_padded 的全部校验与前向计算；成功后其缓存即当前
+        # 缓存（标签 "padded"），随后改写为带 v、q 快照的 attn 缓存。其内
+        # 部失败已自行清空缓存；其后任一步失败也须清掉它留下的 padded 缓存。
+        y = self.forward_padded(xs, lengths)
+        try:
+            _, B, T, lengths, cfs, cbs = self._cache
+
+            # q：B×2H 的 F 列表，逐层拷贝；反向 attention_backward 需用。
+            q = self._check_padded_2d(q, B, 2 * H, "q")
+
+            c = [None] * B
+            w = [[0.0] * T for _ in range(B)]
+            vs = [None] * B
+            for b in range(B):
+                L = lengths[b]
+                # v 为 y[b] 有效前缀的逐行新建 float 快照，独立于返回的 y。
+                v = [[float(x) for x in y[b][t]] for t in range(L)]
+                vs[b] = v
+                cb, wb = attention([q[b]], v, v, None)
+                c[b] = [float(x) for x in cb[0]]
+                wb0 = wb[0]
+                row = w[b]
+                for t in range(L):
+                    wv = wb0[t]
+                    if not math.isfinite(wv):
+                        raise ValueError("attention weight became non-finite")
+                    row[t] = float(wv)
+        except ValueError:
+            self._cache = None
+            raise
+
+        self._cache = ("attn", B, T, list(lengths), cfs, cbs, vs, q)
+        return c, w
+
+    def backward_attn_padded(self, dc):
+        """变长批注意力汇聚反向，固定返回
+        (dxs, dq, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b)。
+
+        最近一次成功前向须为 forward_attn_padded，且其后无任何其他 forward
+        类调用（forward、forward_padded、forward_attn_padded 自身的成功或
+        失败调用均会替换或使缓存失效），否则抛 ValueError；dc 须为 B×2H
+        的 F 列表，否则抛 ValueError。实参数量错误沿用 Python 自带的
+        TypeError。
+
+        对样本 b 以缓存的查询 q[b]、有效前缀 v（长 L_b=lengths[b]）调用
+        attention_backward([q[b]], v, v, [dc[b]], None) 得
+        (gq, gk, gv)（形状分别为 1×2H、L_b×2H、L_b×2H）：dq[b] = gq[0]
+        （长 2H）；有效前缀输出梯度 dy 自 0.0 起依次加 gk[t]、gv[t]（两行
+        长均 2H，按 t、维升序），padding 位置 0.0 并随后忽略。再以该 dy 按
+        backward_padded 的同一语义反传批双向 GRU。dxs 形状 B×T×I（padding
+        行为 I 个 0.0），dq 形状 B×2H；dh0_f、dh0_b、dW_f、db_f、dW_b、
+        db_b 六项完全沿用 backward_padded 的形状与累加语义。所有结果均为
+        逐层新建的 float 列表，不修改 dc、缓存或单元参数，重复调用结果确定；
+        任一中间量非有限抛 ValueError。
+        """
+        I, H = self.I, self.H
+        cache = self._cache
+        if type(cache) is not tuple or len(cache) != 8 \
+                or cache[0] != "attn":
+            raise ValueError(
+                "backward_attn_padded requires a successful "
+                "forward_attn_padded pass before it")
+        _, B, T, lengths, cfs, cbs, vs, qs = cache
+
+        # dc：B×2H 的 F 列表，逐层 float 拷贝。
+        dc = self._check_padded_2d(dc, B, 2 * H, "dc")
+
+        dq = [None] * B
+        # 各样本有效前缀的输出梯度 dy：自 0.0 起依次加 gk[t]、gv[t]，padding
+        # 位不构造（反传只取有效前缀，dxs 的 padding 行由反传铺零）。
+        dy_valid = [None] * B
+        for b in range(B):
+            L = lengths[b]
+            gq, gk, gv = attention_backward(
+                [qs[b]], vs[b], vs[b], [dc[b]], None)
+            dq[b] = [float(x) for x in gq[0]]
+            dy_b = [[0.0] * (2 * H) for _ in range(L)]
+            for t in range(L):
+                row = dy_b[t]
+                gkt = gk[t]
+                gvt = gv[t]
+                for a in range(2 * H):
+                    acc = 0.0
+                    acc += gkt[a]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "dy accumulated to a non-finite value")
+                    acc += gvt[a]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "dy accumulated to a non-finite value")
+                    row[a] = acc
+            dy_valid[b] = dy_b
+
+        # 批 GRU 反传完全沿用 backward_padded 的语义；padding 位梯度为零。
+        dxs, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b = self._padded_backprop(
+            B, T, lengths, cfs, cbs, dy_valid)
+
+        return dxs, dq, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b
 
 
 # 模型 JSON 顶层唯一允许的键及其出现顺序。
