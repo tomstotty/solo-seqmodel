@@ -2735,6 +2735,108 @@ def _sample_lstm(model_path, start, seed_text, temperature_text, length_text):
     return "".join(out) + "\n"
 
 
+def _sample_gru(model_path, start, seed_text, temperature_text, length_text):
+    """从 GRU 语言模型采样 LENGTH 个码点，返回待写出的字符串。
+
+    MODEL 严格沿用 perplexity-gru 的 version 3 七键顺序、F、形状及 UTF-8
+    契约；START、SEED、TEMPERATURE、LENGTH 的词法与校验完全沿用 _sample。
+    整次调用仅初始化一次 r=random.Random(int(SEED))，不写任何文件。
+
+    置 h=list(h0)、x=START 索引。循环 LENGTH 次：以 x 的 V 长 one-hot 调用
+    装入 W、b 的 GRUCell.forward(x, h)，取返回的首项更新 h；按 k、j 升序
+    自 float(by[k]) 累加 Why[k][j]*h[j] 计算 logit z；温度缩放、稳定
+    softmax、随机阈值、k 升序累计与选中规则逐项沿用 _sample；追加
+    vocab[k] 并令 x=k。任一中间量非有限均抛 ValueError。成功返回 LENGTH
+    个码点再加一个 LF。
+    """
+    vocab, W, b, Why, by, h0 = _load_perplexity_gru_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # TEMPERATURE：float() 可解析且有限、严格大于 0；inf/nan/0/负数均失败。
+    temperature = float(temperature_text)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    cell = GRUCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    rng = random.Random(seed)
+    h = list(h0)
+    x = vocab.index(start)
+    out = []
+
+    for _t in range(length):
+        # 当前字符的 V 长 one-hot 输入，推进 GRU 隐状态。
+        xvec = [0.0] * V
+        xvec[x] = 1.0
+        h, _cache = cell.forward(xvec, h)
+
+        # z_k = by_k + Σ_j Why_k,j*h_j，依 j 升序自 float 偏置累加。
+        z = _output_logits(Why, by, h)
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+        m = max(a)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # u=r.random()*d；自 0.0 依 k 升序累加 e_k，选首个累计值严格大于
+        # u 者；无则取词表末项。
+        u = rng.random() * d
+        if not math.isfinite(u):
+            raise ValueError("sample threshold became non-finite")
+        chosen = V - 1
+        cum = 0.0
+        for k in range(V):
+            cum += e[k]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > u:
+                chosen = k
+                break
+
+        out.append(vocab[chosen])
+        x = chosen
+
+    return "".join(out) + "\n"
+
+
 def _sample_lstm_anneal(model_path, start, seed_text, start_t_text,
                         end_t_text, length_text):
     """以线性退火温度从 LSTM 语言模型采样 LENGTH 个码点，返回待写出的字符串。
@@ -7651,6 +7753,13 @@ def main(argv):
     装入 W、b 的 LSTMCell.forward 推进 h、c，logit、温度缩放、稳定
     softmax 与抽样规则同 sample；输出契约与 sample 相同，不写任何文件。
 
+    python seqmodel.py sample-gru MODEL START SEED TEMPERATURE LENGTH：
+    MODEL 沿用 perplexity-gru 的 version 3 七键顺序、F、形状及严格 UTF-8
+    契约（键 version、vocab、W、b、Why、by、h0，W 形状 3H×(V+H)、
+    b 形状 3H），置 h=list(h0)、x=START 索引，每步以 x 的 V 长 one-hot
+    调用装入 W、b 的 GRUCell.forward 取首项更新 h，logit、温度缩放、稳定
+    softmax 与抽样规则同 sample；输出契约与 sample 相同，不写任何文件。
+
     python seqmodel.py sample-anneal MODEL START SEED START_T END_T LENGTH：
     以线性退火温度采样，第 t 步温度为
     START_T+(END_T-START_T)*t/(LENGTH-1)（LENGTH 为 1 时仅用 START_T，
@@ -8108,6 +8217,10 @@ def main(argv):
         elif len(argv) == 7 and argv[1] == "sample-lstm":
             output = _sample_lstm(argv[2], argv[3], argv[4], argv[5],
                                   argv[6])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 7 and argv[1] == "sample-gru":
+            output = _sample_gru(argv[2], argv[3], argv[4], argv[5],
+                                 argv[6])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 8 and argv[1] == "sample-anneal":
             output = _sample_anneal(argv[2], argv[3], argv[4], argv[5],
