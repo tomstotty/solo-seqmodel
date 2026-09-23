@@ -916,6 +916,239 @@ class MHA(object):
 
         return dx, dWq, dWk, dWv, dWo
 
+    def forward_padded(self, xs, lengths, mask=None):
+        """变长批投影多头自注意力前向，返回 (y, w) 并保存各样本独立快照。
+
+        xs 须为非空 B×T×D 的 F 嵌套列表（B、T>0，各样本等长 T、每行等长
+        D，padding 位同样须为 F）；lengths 须为 B 长 list，各项 type 为非
+        bool 的 int 且 1<=值<=T；mask 须为 None 或 B×T×T 的嵌套 list，元素
+        type 恰为 bool，padding 行、列仅校验后忽略；样本 b 令 L=lengths[b]，
+        其有效 L×L 块每行至少一个 True（None 等价全 True），否则抛
+        ValueError。任何失败都使既有缓存失效（其后的 backward_padded 必须
+        重新 forward_padded）。
+
+        样本按 b 升序、仅对有效前缀逐样本执行现有投影与多头注意力（即对
+        x=xs[b][:L] 与有效 L×L mask 块调用现有 forward 语义），其缓存原样
+        存为该样本的独立快照。y 为 B×T×D，w 为 B×heads×T×T：有效区写入
+        各样本结果，padding 行（及 w 的 padding 列）均为 0.0。输出均为逐层
+        新建的 float 列表，不修改或复用输入与投影属性；任一中间量非有限抛
+        ValueError。实参数量错误沿用 Python 自带的 TypeError。
+        """
+        D = self.D
+        # 任何失败的 forward_padded 都使既有缓存（含普通 forward 缓存）失效。
+        self._cache = None
+        try:
+            # xs：非空 B×T×D 的 F 嵌套列表，B、T>0，矩形且每行等长 D。
+            if type(xs) is not list or len(xs) == 0:
+                raise ValueError("xs must be a non-empty list")
+            B = len(xs)
+            first = xs[0]
+            if type(first) is not list or len(first) == 0:
+                raise ValueError("xs must be a list of shape B×T×D with T>0")
+            T = len(first)
+            checked_xs = []
+            for b in range(B):
+                seq = xs[b]
+                if type(seq) is not list or len(seq) != T:
+                    raise ValueError("xs must be a list of shape %d×%d×%d"
+                                     % (B, T, D))
+                checked_seq = []
+                for row in seq:
+                    if type(row) is not list or len(row) != D:
+                        raise ValueError("xs must be a list of shape %d×%d×%d"
+                                         % (B, T, D))
+                    for v in row:
+                        if not _is_f(v):
+                            raise ValueError(
+                                "xs entries must be finite numbers, got %r"
+                                % (v,))
+                    checked_seq.append([float(v) for v in row])
+                checked_xs.append(checked_seq)
+
+            # lengths：B 长 list，各项为非 bool int 且 1<=值<=T。
+            if type(lengths) is not list or len(lengths) != B:
+                raise ValueError("lengths must be a list of length %d" % B)
+            for L in lengths:
+                if type(L) is bool or type(L) is not int or L < 1 or L > T:
+                    raise ValueError(
+                        "lengths entries must be non-bool integers in [1, %d], "
+                        "got %r" % (T, L))
+
+            # mask：None 或 B×T×T 的嵌套 list，元素 type 恰为 bool；padding
+            # 行、列在此一并校验，随后忽略。
+            if mask is not None:
+                if type(mask) is not list or len(mask) != B:
+                    raise ValueError(
+                        "mask must be a list of shape %d×%d×%d" % (B, T, T))
+                for b in range(B):
+                    mb = mask[b]
+                    if type(mb) is not list or len(mb) != T:
+                        raise ValueError(
+                            "mask must be a list of shape %d×%d×%d"
+                            % (B, T, T))
+                    for row in mb:
+                        if type(row) is not list or len(row) != T:
+                            raise ValueError(
+                                "mask must be a list of shape %d×%d×%d"
+                                % (B, T, T))
+                        for m in row:
+                            if type(m) is not bool:
+                                raise ValueError(
+                                    "mask entries must be exactly bool, got %r"
+                                    % (m,))
+
+            heads = self.heads
+            # 输出先铺零：有效区随后覆写，padding 行（及 w 的 padding 列）
+            # 保持全新零行；w 每样本含 heads 个 T×T 矩阵。
+            y = [[[0.0] * D for _ in range(T)] for _ in range(B)]
+            w = [[[[0.0] * T for _ in range(T)] for _ in range(heads)]
+                 for _ in range(B)]
+            snaps = [None] * B
+            for b in range(B):
+                L = lengths[b]
+                xb = [checked_xs[b][t] for t in range(L)]
+                if mask is None:
+                    block = None
+                else:
+                    block = [list(mask[b][i][:L]) for i in range(L)]
+
+                # 现有 forward 完成全部投影、多头注意力与输出投影，并自行
+                # 校验 W 矩阵与有效块每行至少一个 True；成功后其缓存即该样本
+                # 的独立快照。其内部失败已自行清空缓存。
+                yb, wb = self.forward(xb, block)
+                snaps[b] = self._cache
+
+                yb_row = y[b]
+                wb_pad = w[b]
+                for t in range(L):
+                    for a in range(D):
+                        yv = float(yb[t][a])
+                        if not math.isfinite(yv):
+                            raise ValueError(
+                                "padded attention output became non-finite")
+                        yb_row[t][a] = yv
+                    for h in range(heads):
+                        wbht = wb[h][t]
+                        wrow = wb_pad[h][t]
+                        for s in range(L):
+                            wv = float(wbht[s])
+                            if not math.isfinite(wv):
+                                raise ValueError(
+                                    "padded attention weight became non-finite")
+                            wrow[s] = wv
+        except ValueError:
+            self._cache = None
+            raise
+
+        self._cache = ("mha_padded", B, T, list(lengths), snaps)
+        return y, w
+
+    def backward_padded(self, dy):
+        """变长批投影多头自注意力反向，返回
+        (dx, dWq, dWk, dWv, dWo)。
+
+        须紧随一次成功的 forward_padded（其后缓存未被任何其他 forward 类
+        调用替换或被失败清空），否则抛 ValueError；dy 须为 B×T×D 的 F 嵌套
+        列表（与前向 y 同形，padding 位经校验后忽略），否则抛 ValueError。
+        实参数量错误沿用 Python 自带的 TypeError。
+
+        逐样本以其独立快照调用现有 backward：dx 为 B×T×D（有效前缀写入各
+        样本 dx，padding 行为 D 个 0.0）；dWq、dWk、dWv、dWo 四个 D×D 梯度
+        均自 0.0 起按 b、行、列升序累加。所有结果均为逐层新建的 float 列表，
+        不修改 dy、缓存或投影属性；成功时缓存保留，可重复调用且结果确定。
+        任一中间量非有限或反向失败均抛 ValueError 并清空缓存。
+        """
+        D = self.D
+        cache = self._cache
+        try:
+            if type(cache) is not tuple or len(cache) != 5 \
+                    or cache[0] != "mha_padded":
+                raise ValueError(
+                    "backward_padded requires a successful forward_padded "
+                    "pass before it")
+            _, B, T, lengths_c, snaps = cache
+
+            # dy：B×T×D 的 F 嵌套列表；padding 位在此一并校验，随后忽略。
+            if type(dy) is not list or len(dy) != B:
+                raise ValueError("dy must be a list of shape %d×%d×%d"
+                                 % (B, T, D))
+            checked_dy = []
+            for b in range(B):
+                seq = dy[b]
+                if type(seq) is not list or len(seq) != T:
+                    raise ValueError("dy must be a list of shape %d×%d×%d"
+                                     % (B, T, D))
+                checked_seq = []
+                for row in seq:
+                    if type(row) is not list or len(row) != D:
+                        raise ValueError("dy must be a list of shape %d×%d×%d"
+                                         % (B, T, D))
+                    for v in row:
+                        if not _is_f(v):
+                            raise ValueError(
+                                "dy entries must be finite numbers, got %r"
+                                % (v,))
+                    checked_seq.append([float(v) for v in row])
+                checked_dy.append(checked_seq)
+
+            dx = [[[0.0] * D for _ in range(T)] for _ in range(B)]
+            dWq = [[0.0] * D for _ in range(D)]
+            dWk = [[0.0] * D for _ in range(D)]
+            dWv = [[0.0] * D for _ in range(D)]
+            dWo = [[0.0] * D for _ in range(D)]
+
+            for b in range(B):
+                L = lengths_c[b]
+                dyb = [checked_dy[b][t] for t in range(L)]
+
+                # 以该样本的独立快照调用现有 backward；失败时其内部已清空
+                # self._cache，由本方法外层 except 统一处理。
+                self._cache = snaps[b]
+                dxb, gWq, gWk, gWv, gWo = self.backward(dyb)
+
+                dx_b = dx[b]
+                for t in range(L):
+                    dxt = dx_b[t]
+                    gxt = dxb[t]
+                    for a in range(D):
+                        gv = float(gxt[a])
+                        if not math.isfinite(gv):
+                            raise ValueError(
+                                "dx accumulated to a non-finite value")
+                        dxt[a] = gv
+
+                # 四个参数梯度自 0.0 起按 b、行、列升序累加。
+                for a in range(D):
+                    dWqa, dWka, dWva, dWoa = (
+                        dWq[a], dWk[a], dWv[a], dWo[a])
+                    gWqa, gWka, gWva, gWoa = (
+                        gWq[a], gWk[a], gWv[a], gWo[a])
+                    for j in range(D):
+                        dWqa[j] += float(gWqa[j])
+                        if not math.isfinite(dWqa[j]):
+                            raise ValueError(
+                                "dWq accumulated to a non-finite value")
+                        dWka[j] += float(gWka[j])
+                        if not math.isfinite(dWka[j]):
+                            raise ValueError(
+                                "dWk accumulated to a non-finite value")
+                        dWva[j] += float(gWva[j])
+                        if not math.isfinite(dWva[j]):
+                            raise ValueError(
+                                "dWv accumulated to a non-finite value")
+                        dWoa[j] += float(gWoa[j])
+                        if not math.isfinite(dWoa[j]):
+                            raise ValueError(
+                                "dWo accumulated to a non-finite value")
+
+            # 恢复批缓存，保证可重复反向。
+            self._cache = cache
+        except ValueError:
+            self._cache = None
+            raise
+
+        return dx, dWq, dWk, dWv, dWo
+
 
 class VanillaRNN(object):
     """单隐藏层 Vanilla RNN，参数 Wxh/Whh/bh 初始化为全 0.0。
