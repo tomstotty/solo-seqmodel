@@ -1362,6 +1362,135 @@ class GRUCell(object):
         return dxs, dh0, dW, db
 
 
+class BidirectionalGRU(object):
+    """双向单层 GRU：前支、后支各持一个独立的 GRUCell。
+
+        forward_cell  = GRUCell(I, H, seed)
+        backward_cell = GRUCell(I, H, seed + 1)
+
+    前向时两支均以全零的 H 长向量为初态：前支按 t=0..T-1 正序调用
+    forward_cell，后支按 t=T-1..0 倒序调用 backward_cell；输出行 t 为
+    前支 h_t 与“映射至 t”的后支 h_t 拼接（长度 2H）。
+    """
+
+    def __init__(self, I, H, seed=0):
+        # 与 GRUCell 一致：type(x) is int 天然排除 bool。
+        if type(I) is not int or type(H) is not int or I <= 0 or H <= 0:
+            raise ValueError("I and H must be positive integers")
+        if type(seed) is not int:
+            raise ValueError("seed must be an integer")
+        self.I = I
+        self.H = H
+        self.forward_cell = GRUCell(I, H, seed)
+        self.backward_cell = GRUCell(I, H, seed + 1)
+        self._cache = None
+
+    def forward(self, xs):
+        """双向前向传播，返回 T×2H 的 list[list[float]] 并缓存。
+
+        xs 须为非空 T×I 的 F 列表（T 由 len(xs) 确定，T≥1，每行恰长 I），
+        否则抛 ValueError；非法调用同时使既有缓存失效。两支均以零 H 向量
+        为初态：前支正序、后支倒序依次调用各自 cell 的 forward，后支各步
+        输出按其时间下标 t 落位。返回行 t 为前支 h_t 拼接后支 h_t（各 H 项
+        float），全部为新建列表，不修改或复用输入。
+        """
+        I, H = self.I, self.H
+
+        # 先使旧缓存失效：此后任何校验或计算失败，缓存都保持无效。
+        self._cache = None
+
+        if type(xs) is not list or len(xs) == 0:
+            raise ValueError("xs must be a non-empty list")
+        T = len(xs)
+        xs = _check_matrix(xs, T, I, "xs")
+
+        # 前支：零初态，t=0..T-1 正序扫描。
+        hf = [None] * T
+        caches_f = [None] * T
+        h = [0.0] * H
+        for t in range(T):
+            h, cache = self.forward_cell.forward(xs[t], h)
+            hf[t] = h
+            caches_f[t] = cache
+
+        # 后支：零初态，t=T-1..0 倒序扫描；h 与 cache 均按 t 落位。
+        hb = [None] * T
+        caches_b = [None] * T
+        h = [0.0] * H
+        for t in range(T - 1, -1, -1):
+            h, cache = self.backward_cell.forward(xs[t], h)
+            hb[t] = h
+            caches_b[t] = cache
+
+        ys = [[float(v) for v in hf[t]] + [float(v) for v in hb[t]]
+              for t in range(T)]
+
+        self._cache = {
+            "T": T,
+            "caches_f": caches_f,
+            "caches_b": caches_b,
+        }
+        return ys
+
+    def backward(self, dys):
+        """双向反向传播，固定返回
+        (dxs, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b)。
+
+        须先有一次成功的 forward 缓存，且 dys 须为 T×2H 的 F 列表（T 为
+        forward 时的序列长），否则抛 ValueError；实参数量错误沿用 Python
+        自带的 TypeError。dys 每行前 H 项为前支梯度、后 H 项为后支梯度。
+
+        前支以原序梯度、原序缓存调用 forward_cell.backward_sequence；后支
+        的梯度与缓存均按 t=T-1..0 倒序后再调用
+        backward_cell.backward_sequence，其返回的 dx 序列再倒回原时间序。
+        dxs 为 T×I，每个元素从 0.0 起依次加前支 dx、后支 dx。后六个返回值
+        形状依次为 H、H、3H×(I+H)、3H、3H×(I+H)、3H（dh0_b 为后支零初态
+        即 t=T-1 端的状态梯度）。所有结果均为全新 float 列表（矩阵逐层
+        新建），不修改输入、缓存或参数；中间量非有限同样抛 ValueError，
+        重复调用结果确定。
+        """
+        I, H = self.I, self.H
+
+        cache = self._cache
+        if cache is None:
+            raise ValueError("backward requires a successful forward")
+        T = cache["T"]
+
+        dys = _check_matrix(dys, T, 2 * H, "dys")
+
+        # 前支梯度保持原序；后支梯度按其扫描方向倒序（s=0 对应 t=T-1）。
+        dhs_f = [[float(v) for v in dys[t][:H]] for t in range(T)]
+        dhs_b = [[float(v) for v in dys[t][H:]]
+                 for t in range(T - 1, -1, -1)]
+        caches_b_rev = [cache["caches_b"][t]
+                        for t in range(T - 1, -1, -1)]
+
+        dxs_f, dh0_f, dW_f, db_f = \
+            self.forward_cell.backward_sequence(
+                dhs_f, cache["caches_f"])
+        dxs_b_rev, dh0_b, dW_b, db_b = \
+            self.backward_cell.backward_sequence(
+                dhs_b, caches_b_rev)
+
+        # 后支 dx 倒回原时间序；dxs 每元素从 0.0 起依次加两支 dx。
+        dxs = [[0.0] * I for _ in range(T)]
+        for t in range(T):
+            row = dxs[t]
+            row_f = dxs_f[t]
+            row_b = dxs_b_rev[T - 1 - t]
+            for j in range(I):
+                row[j] += row_f[j]
+                if not math.isfinite(row[j]):
+                    raise ValueError(
+                        "dxs accumulated to a non-finite value")
+                row[j] += row_b[j]
+                if not math.isfinite(row[j]):
+                    raise ValueError(
+                        "dxs accumulated to a non-finite value")
+
+        return dxs, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b
+
+
 # 模型 JSON 顶层唯一允许的键及其出现顺序。
 _MODEL_KEYS = ["version", "vocab", "Wxh", "Whh", "bh", "Why", "by", "h0"]
 
