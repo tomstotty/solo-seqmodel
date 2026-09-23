@@ -1985,6 +1985,181 @@ class BidirectionalGRU(object):
         return self._padded_backprop(
             B, T, lengths, cfs, cbs, dy_valid)
 
+    def forward_self_attn_masked(self, xs, lengths, mask):
+        """变长批掩码自注意力前向，返回 (c, w) 并保存 selfattnmasked 缓存。
+
+        xs、lengths 完全沿用 forward_padded 的契约（xs 为非空 B×T×I 的 F
+        嵌套列表，lengths 各项为 1<=值<=T 的非 bool int）；mask 须为
+        B×T×T 的嵌套 list 且每个元素 type 恰为 bool（True 参与、False
+        屏蔽），否则抛 ValueError。任何失败都使既有缓存（含 forward、
+        forward_padded、forward_attn_padded、forward_self_attn_padded
+        缓存）失效；本前向使用独立的缓存标签，不与其他前向共用缓存。
+
+        先按 forward_padded 的同一前向语义求批双向输出 y（有效前缀为真实
+        输出、padding 行为 2H 个 0.0）。mask 的 padding 行、列（下标 >=
+        L_b=lengths[b]）同样逐元素校验为 bool 后忽略；样本 b 的有效
+        L_b×L_b 块逐行复制，且每行至少一个 True，否则抛 ValueError。对
+        样本 b 取 v = y[b][:L_b]（逐行新建的 float 行），调用
+        attention(v, v, v, 有效块) 得 (c_b, w_b)（形状分别为 L_b×2H、
+        L_b×L_b）。c 为 B×T×2H，c[b] 有效前缀逐行取自 c_b，padding 行是
+        2H 个 0.0；w 为 B×T×T，w[b] 的 L_b×L_b 有效块取自 w_b，padding
+        行、列均为 0.0。缓存保存批 GRU 缓存及 v、有效 mask 块的快照，足以
+        支撑 backward_self_attn_masked。结果均为逐层新建的 float 列表，不
+        修改或复用输入与单元参数；任一中间量非有限同样抛 ValueError，实参
+        数量错误沿用 Python 自带的 TypeError。
+        """
+        I, H = self.I, self.H
+        # 任何失败的 forward_self_attn_masked 都使既有缓存失效。
+        self._cache = None
+
+        # y 复用 forward_padded 的全部校验与前向计算；成功后其缓存即当前
+        # 缓存（标签 "padded"），随后改写为带 v、mask 快照的 selfattnmasked
+        # 缓存。其内部失败已自行清空缓存；其后任一步失败也须清掉它留下的
+        # padded 缓存。
+        y = self.forward_padded(xs, lengths)
+        try:
+            _, B, T, lengths, cfs, cbs = self._cache
+
+            # mask：B×T×T 的嵌套 list，元素 type 恰为 bool。padding 行列在
+            # 此一并校验（type 仍须为 bool），随后忽略；仅逐行复制有效
+            # L×L 块入缓存。
+            if type(mask) is not list or len(mask) != B:
+                raise ValueError("mask must be a list of shape %d×%d×%d"
+                                 % (B, T, T))
+            masks = [None] * B
+            for b in range(B):
+                mb = mask[b]
+                if type(mb) is not list or len(mb) != T:
+                    raise ValueError("mask must be a list of shape %d×%d×%d"
+                                     % (B, T, T))
+                for row in mb:
+                    if type(row) is not list or len(row) != T:
+                        raise ValueError(
+                            "mask must be a list of shape %d×%d×%d"
+                            % (B, T, T))
+                    for m in row:
+                        if type(m) is not bool:
+                            raise ValueError(
+                                "mask entries must be exactly bool, got %r"
+                                % (m,))
+                L = lengths[b]
+                block = [[mb[i][j] for j in range(L)] for i in range(L)]
+                # 有效块每行至少一个 True（全屏蔽行在调用 attention 前判定）。
+                for i in range(L):
+                    if not any(block[i]):
+                        raise ValueError(
+                            "mask row %d is entirely False" % i)
+                masks[b] = block
+
+            # 输出先铺零：有效块随后覆写，padding 行（及 w 的 padding 列）
+            # 保持全新的零行。
+            c = [[[0.0] * (2 * H) for _ in range(T)] for _ in range(B)]
+            w = [[[0.0] * T for _ in range(T)] for _ in range(B)]
+            vs = [None] * B
+            for b in range(B):
+                L = lengths[b]
+                # v 为 y[b] 有效前缀的逐行新建 float 快照，独立于返回的 y；
+                # 掩码自注意力中 q、k、v 同为 v。
+                v = [[float(x) for x in y[b][t]] for t in range(L)]
+                vs[b] = v
+                cb, wb = attention(v, v, v, masks[b])
+                c_b = c[b]
+                w_b = w[b]
+                for t in range(L):
+                    cbt = cb[t]
+                    crow = c_b[t]
+                    wbrow = w_b[t]
+                    wbt = wb[t]
+                    for a in range(2 * H):
+                        cv = float(cbt[a])
+                        if not math.isfinite(cv):
+                            raise ValueError(
+                                "self-attention context became non-finite")
+                        crow[a] = cv
+                    for s in range(L):
+                        wv = float(wbt[s])
+                        if not math.isfinite(wv):
+                            raise ValueError(
+                                "attention weight became non-finite")
+                        wbrow[s] = wv
+        except ValueError:
+            self._cache = None
+            raise
+
+        self._cache = ("selfattnmasked", B, T, list(lengths), cfs, cbs,
+                       vs, masks)
+        return c, w
+
+    def backward_self_attn_masked(self, dc):
+        """变长批掩码自注意力反向，固定返回
+        (dxs, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b)。
+
+        最近一次成功前向须为 forward_self_attn_masked，且其后无任何其他
+        forward 类调用（forward、forward_padded、forward_attn_padded、
+        forward_self_attn_padded、forward_self_attn_masked 自身的成功或
+        失败调用均会替换或使缓存失效），否则抛 ValueError；dc 须为
+        B×T×2H 的 F 嵌套列表（与前向 c 同形，padding 位经校验后忽略），
+        否则抛 ValueError。实参数量错误沿用 Python 自带的 TypeError。
+
+        对样本 b 令 L=lengths[b]，以缓存的有效前缀 v（长 L）与有效 mask
+        块对 dc 的有效前缀调用
+        attention_backward(v, v, v, dc[:L], 有效块) 得 (gq, gk, gv)（形状
+        均为 L×2H）：有效前缀输出梯度 dy 按 t、维升序自 0.0 起依次累加
+        gq[t][a]、gk[t][a]、gv[t][a]，padding 位置 0.0 并随后忽略。再以
+        该 dy 按 backward_padded 的同一语义反传批双向 GRU。dxs 形状
+        B×T×I（padding 行为 I 个 0.0）；dh0_f、dh0_b、dW_f、db_f、dW_b、
+        db_b 六项完全沿用 backward_padded 的形状与按 b 升序累加语义。所有
+        结果均为逐层新建的 float 列表，不修改 dc、缓存或单元参数，重复调用
+        结果确定；任一中间量非有限抛 ValueError。
+        """
+        I, H = self.I, self.H
+        cache = self._cache
+        if type(cache) is not tuple or len(cache) != 8 \
+                or cache[0] != "selfattnmasked":
+            raise ValueError(
+                "backward_self_attn_masked requires a successful "
+                "forward_self_attn_masked pass before it")
+        _, B, T, lengths, cfs, cbs, vs, masks = cache
+
+        # dc：B×T×2H 的 F 嵌套列表；padding 位在此一并校验，随后忽略。
+        dc = self._check_padded_3d(dc, B, T, 2 * H, "dc")
+
+        # 各样本有效前缀的输出梯度 dy：按 t、维升序自 0.0 依次累加 gq、gk、
+        # gv；padding 位不构造（反传只取有效前缀，dxs 的 padding 行由反传
+        # 铺零）。
+        dy_valid = [None] * B
+        for b in range(B):
+            L = lengths[b]
+            dc_prefix = [dc[b][t] for t in range(L)]
+            gq, gk, gv = attention_backward(
+                vs[b], vs[b], vs[b], dc_prefix, masks[b])
+            dy_b = [[0.0] * (2 * H) for _ in range(L)]
+            for t in range(L):
+                row = dy_b[t]
+                gqt = gq[t]
+                gkt = gk[t]
+                gvt = gv[t]
+                for a in range(2 * H):
+                    acc = 0.0
+                    acc += gqt[a]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "dy accumulated to a non-finite value")
+                    acc += gkt[a]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "dy accumulated to a non-finite value")
+                    acc += gvt[a]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "dy accumulated to a non-finite value")
+                    row[a] = acc
+            dy_valid[b] = dy_b
+
+        # 批 GRU 反传完全沿用 backward_padded 的语义；padding 位梯度为零。
+        return self._padded_backprop(
+            B, T, lengths, cfs, cbs, dy_valid)
+
 
 # 模型 JSON 顶层唯一允许的键及其出现顺序。
 _MODEL_KEYS = ["version", "vocab", "Wxh", "Whh", "bh", "Why", "by", "h0"]
