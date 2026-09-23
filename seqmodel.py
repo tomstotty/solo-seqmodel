@@ -16,6 +16,7 @@ import os
 import random
 import re
 import sys
+import tempfile
 
 
 def _is_f(value):
@@ -8483,6 +8484,131 @@ def _sample_lstm_attn(model_path, start, seed_text, temperature_text,
     return "".join(out) + "\n"
 
 
+def _sample_lstm_mha(model_path, start, seed_text, temperature_text,
+                     length_text, window_text):
+    """带投影多头交叉注意力从 version 4 LSTM 模型采样，返回待写出的字符串。
+
+    MODEL、WINDOW 沿用 perplexity-lstm-mha（version 4 十三键、F、形状、四组
+    H×H 投影与 heads 整除 H 契约；WINDOW 整串匹配 [1-9][0-9]*，任意位数均
+    合法、不转 int 的安全截取）；START、SEED、TEMPERATURE、LENGTH 的读取、
+    词法、形状、唯一随机源、温度缩放、稳定 softmax、rng.random()*d 的随机
+    阈值、k 升序累计与选中、输出及失败协议均完全沿用 sample-lstm-attn。
+
+    置 h=h0、c=c0、x=START 索引、memory=[h0]。循环 LENGTH 次：以 x 的 V
+    长 one-hot 调用装入 W、b 的 LSTMCell.forward(xvec, h, c)，取前两项更新
+    h、c；M 取 memory 末尾 min(WINDOW, len(memory)) 项（顺序从旧到新），装
+    入 Wq、Wk、Wv、Wo 构造 MHA(H, heads)，以其 forward_cross([h], M, None)
+    返回首项 ctx，按 i 升序令 u[i]=h[i]+ctx[0][i]。logit 以 u 经 Why/by 求
+    z，温度缩放、稳定 softmax、随机阈值与词表升序累计抽样逐项沿用
+    sample-lstm-attn；追加 vocab[k]，令 x=k，再向 memory 追加 h 的 float
+    副本。任一中间量非有限均抛 ValueError。成功返回 LENGTH 个码点再加 LF。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    (vocab, W, b, Wq, Wk, Wv, Wo, heads,
+     Why, by, h0, c0) = _load_perplexity_lstm_mha_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # TEMPERATURE：float() 可解析且有限、严格大于 0；inf/nan/0/负数均失败。
+    temperature = float(temperature_text)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    mha = MHA(H, heads)
+    mha.Wq = [list(row) for row in Wq]
+    mha.Wk = [list(row) for row in Wk]
+    mha.Wv = [list(row) for row in Wv]
+    mha.Wo = [list(row) for row in Wo]
+
+    # 整次调用仅初始化一次随机源。h0 保留模型原值（F 允许 int），
+    # forward_cross 会先复制再投影；各步 h 本就是 float。
+    rng = random.Random(seed)
+    memory = [h0]
+    h = list(h0)
+    c = list(c0)
+    x = vocab.index(start)
+    out = []
+
+    for _t in range(length):
+        # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+        xvec = [0.0] * V
+        xvec[x] = 1.0
+        h, c = cell.forward(xvec, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        u = _mha_cross_context(h, M, mha)
+
+        # logit 仅以 u 替代 h；下标与累加顺序同 sample-lstm-attn。
+        z = _output_logits(Why, by, u)
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # u=r.random()*d；自 0.0 依 k 升序累加 e_k，选首个累计值严格大于
+        # u 者；无则取词表末项。
+        threshold = rng.random() * d
+        if not math.isfinite(threshold):
+            raise ValueError("sample threshold became non-finite")
+        chosen = V - 1
+        cum = 0.0
+        for k in range(V):
+            cum += e[k]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > threshold:
+                chosen = k
+                break
+
+        out.append(vocab[chosen])
+        x = chosen
+        memory.append([float(v) for v in h])
+
+    return "".join(out) + "\n"
+
+
 def _score_lstm_attn(model_path, start, text, temperature_text, window_text):
     """确定性评分指定候选 TEXT，返回待写出的字符串。
 
@@ -10969,7 +11095,9 @@ def _train_lstm_mha(model_path, corpus_path, out_path, window_text):
     OUT 复用 perplexity-lstm-mha 的十三个键与键序（version 恰为 int 4，
     heads 仍为非 bool int），数值数组元素均转为 float；文件内容恰为
     json.dumps(obj, ensure_ascii=True, separators=(',', ':'),
-    allow_nan=False) 的 UTF-8 编码再加一个 LF，负零保留为 -0.0。
+    allow_nan=False) 的 UTF-8 编码再加一个 LF，负零保留为 -0.0。写入为
+    原子操作：在 OUT 同目录建临时文件，写全并关闭后以 os.replace 替换，
+    替换前任一失败均保持 OUT 原状态并清理该临时文件。
     """
     if not _WINDOW_RE.match(window_text):
         raise ValueError("WINDOW must match [1-9][0-9]*")
@@ -11218,8 +11346,24 @@ def _train_lstm_mha(model_path, corpus_path, out_path, window_text):
     }
     text = json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
                       allow_nan=False) + "\n"
-    with open(out_path, "wb") as f:
-        f.write(text.encode("utf-8"))
+    payload = text.encode("utf-8")
+
+    # 原子写出：在 OUT 同目录建临时文件，写全并关闭后以 os.replace 替换。
+    # 替换前任一失败都保持 OUT 原状态并清理临时文件；os.replace 成功后临时
+    # 文件即已成为 OUT，无需再清理。
+    out_dir = os.path.dirname(out_path)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp-train-lstm-mha-",
+                                    dir=out_dir)
+    try:
+        with os.fdopen(fd, "wb") as tf:
+            tf.write(payload)
+        os.replace(tmp_path, out_path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _train_gru_attn_tbptt(model_path, corpus_path, out_path, window_text,
@@ -11726,6 +11870,17 @@ def main(argv):
     h 与首行上下文之和 u 替代 h 计算 logit 并抽样，随后向 memory 追加
     h 的 float 副本；输出契约与 sample 相同，不写文件。
 
+    python seqmodel.py sample-lstm-mha MODEL START SEED TEMPERATURE
+    LENGTH WINDOW：MODEL、WINDOW 沿用 perplexity-lstm-mha（version 4 十三
+    键、四组 H×H 投影与 heads、WINDOW 词法及任意位数安全截取），其余参数
+    校验、唯一随机源、温度缩放、稳定 softmax、随机阈值与词表升序累计抽样、
+    输出及错误协议均沿用 sample-lstm-attn。置 h=h0、c=c0、x=START 索引、
+    memory=[h0]，每步以 x 的 V 长 one-hot 推进装入 W、b 的 LSTMCell，M 取
+    memory 末尾 min(WINDOW, len(memory)) 项，装入 Wq、Wk、Wv、Wo 构造
+    MHA(H, heads)，以 forward_cross([h], M, None) 的首行上下文按 i 升序令
+    u=h+ctx，以 u 经 Why/by 求 logit 并抽样，更新 x 后向 memory 追加 h 的
+    float 副本；任一计算非有限即失败。输出契约与 sample 相同，不写文件。
+
     python seqmodel.py score-lstm-attn MODEL START TEXT TEMPERATURE
     WINDOW：确定性评分指定候选 TEXT。MODEL、START、TEMPERATURE、WINDOW
     与 CLI 协议沿用 sample-lstm-attn；TEXT 为可空 Unicode 字符串且每个
@@ -12193,6 +12348,10 @@ def main(argv):
         elif len(argv) == 8 and argv[1] == "sample-lstm-attn":
             output = _sample_lstm_attn(argv[2], argv[3], argv[4], argv[5],
                                        argv[6], argv[7])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 8 and argv[1] == "sample-lstm-mha":
+            output = _sample_lstm_mha(argv[2], argv[3], argv[4], argv[5],
+                                      argv[6], argv[7])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 7 and argv[1] == "score-lstm-attn":
             output = _score_lstm_attn(argv[2], argv[3], argv[4], argv[5],
