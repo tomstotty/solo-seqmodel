@@ -673,6 +673,250 @@ def attention_context_backward(n, memory, du):
     return dn, dmemory
 
 
+class MHA(object):
+    """可训练的投影多头自注意力（四组 D 阶投影均初始化为单位矩阵）。
+
+    Wq、Wk、Wv、Wo 各自独立，形状均为 D×D 的 float 单位矩阵（对角 1.0、
+    其余 0.0），互不共享行或别名。D、heads 须为非 bool 的正 int 且 heads
+    整除 D，否则抛 ValueError。
+    """
+
+    def __init__(self, D, heads):
+        if type(D) is bool or type(D) is not int or D <= 0:
+            raise ValueError("D must be a non-bool positive int, got %r"
+                             % (D,))
+        if type(heads) is bool or type(heads) is not int or heads <= 0:
+            raise ValueError(
+                "heads must be a non-bool positive int, got %r" % (heads,))
+        if D % heads != 0:
+            raise ValueError(
+                "heads (%d) must divide D=%d" % (heads, D))
+        self.D = D
+        self.heads = heads
+        # 四个投影各自逐层新建，互不共享。
+        self.Wq = [[1.0 if a == j else 0.0 for j in range(D)]
+                   for a in range(D)]
+        self.Wk = [[1.0 if a == j else 0.0 for j in range(D)]
+                   for a in range(D)]
+        self.Wv = [[1.0 if a == j else 0.0 for j in range(D)]
+                   for a in range(D)]
+        self.Wo = [[1.0 if a == j else 0.0 for j in range(D)]
+                   for a in range(D)]
+        self._cache = None
+
+    def _check_x(self, x):
+        """校验 x 为非空 T×D 的 F 矩阵，返回逐行新建的 float 拷贝。"""
+        D = self.D
+        if type(x) is not list or len(x) == 0:
+            raise ValueError("x must be a non-empty list")
+        T = len(x)
+        xc = []
+        for row in x:
+            if type(row) is not list or len(row) != D:
+                raise ValueError("x must be a list of shape %d×%d" % (T, D))
+            nrow = []
+            for v in row:
+                if not _is_f(v):
+                    raise ValueError(
+                        "x entries must be finite numbers, got %r" % (v,))
+                nrow.append(float(v))
+            xc.append(nrow)
+        return xc
+
+    @staticmethod
+    def _project(W, x, T, D, what):
+        """q[t][a]=Σ_j W[a][j]*x[t][j]（j 自 0.0 升序），返回全新 float 矩阵。"""
+        out = [[0.0] * D for _ in range(T)]
+        for t in range(T):
+            xt = x[t]
+            row_out = out[t]
+            for a in range(D):
+                Wa = W[a]
+                acc = 0.0
+                for j in range(D):
+                    acc += Wa[j] * xt[j]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "%s projection accumulated to a non-finite value"
+                            % what)
+                row_out[a] = acc
+        return out
+
+    def forward(self, x, mask=None):
+        """投影多头自注意力前向，返回 (y, w) 并缓存反向所需快照。
+
+        x 须为非空 T×D 的 F 矩阵；mask 须为 None 或 T×T、元素 type 恰为
+        bool 且每行至少一个 True 的矩阵；self.Wq/Wk/Wv/Wo 须仍为 D×D 的 F
+        矩阵，否则抛 ValueError。依次求 q=xWqᵀ、k=xWkᵀ、v=xWvᵀ，调用
+        multihead_attention(q, k, v, heads, mask) 得 (c, w)，再求 y=cWoᵀ。
+        y 为 T×D、w 为 heads×T×T 的逐层新建 float 列表，不修改或复用输入
+        与投影属性。任一中间量非有限抛 ValueError；任何失败都清空缓存。
+        实参数量错误沿用 Python 自带的 TypeError。
+        """
+        D, heads = self.D, self.heads
+        # 任何失败的 forward 都使既有缓存失效。
+        self._cache = None
+        T = 0
+        try:
+            xc = self._check_x(x)
+            T = len(xc)
+            Wq = _check_matrix(self.Wq, D, D, "Wq")
+            Wk = _check_matrix(self.Wk, D, D, "Wk")
+            Wv = _check_matrix(self.Wv, D, D, "Wv")
+            Wo = _check_matrix(self.Wo, D, D, "Wo")
+            Wq = [[float(v) for v in row] for row in Wq]
+            Wk = [[float(v) for v in row] for row in Wk]
+            Wv = [[float(v) for v in row] for row in Wv]
+            Wo = [[float(v) for v in row] for row in Wo]
+
+            q = self._project(Wq, xc, T, D, "q")
+            k = self._project(Wk, xc, T, D, "k")
+            v = self._project(Wv, xc, T, D, "v")
+
+            # mask 的形状、bool 类型与全屏蔽行契约由 multihead_attention 沿用
+            # attention 的同一校验保证。
+            c, w = multihead_attention(q, k, v, heads, mask)
+
+            # y[t][a] = Σ_j Wo[a][j]*c[t][j]，j 自 0.0 升序。
+            y = [[0.0] * D for _ in range(T)]
+            for t in range(T):
+                ct = c[t]
+                yt = y[t]
+                for a in range(D):
+                    Woa = Wo[a]
+                    acc = 0.0
+                    for j in range(D):
+                        acc += Woa[j] * ct[j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "output projection accumulated to a "
+                                "non-finite value")
+                    yt[a] = acc
+
+            # mask 独立快照：None 保持 None，否则逐行新建 bool 拷贝。
+            if mask is None:
+                mask_c = None
+            else:
+                mask_c = [list(mask[t]) for t in range(T)]
+        except ValueError:
+            self._cache = None
+            raise
+
+        self._cache = ("mha", T, D, heads, xc, q, k, v, c, w, mask_c,
+                       Wq, Wk, Wv, Wo)
+        return y, w
+
+    def backward(self, dy):
+        """投影多头自注意力反向，返回 (dx, dWq, dWk, dWv, dWo)。
+
+        须紧随一次成功的 forward（其后缓存未被失败清空），否则抛
+        ValueError；dy 须为与前向 y 同形的 T×D F 矩阵，否则抛 ValueError。
+        先按链式求
+            dWo[a][j] = Σ_t dy[t][a]*c[t][j]
+            dc[t][j]  = Σ_a dy[t][a]*Wo[a][j]
+        （求和下标分别按 t、a 自 0.0 升序），调用
+        multihead_attention_backward(q, k, v, dc, heads, mask) 得
+        (dq, dk, dv)，再求
+            dWq[a][j] = Σ_t dq[t][a]*x[t][j]（dWk、dWv 同理）
+            dx[t][j]  = Σ_a (dq[t][a]Wq[a][j] + dk[t][a]Wk[a][j]
+                             + dv[t][a]Wv[a][j])
+        （求和下标按 a 自 0.0 升序，三条路径之和）。dx 为 T×D，其余四个为
+        D×D 的逐层新建 float 列表，不修改 dy、缓存或投影属性；成功时缓存
+        保留，重复调用结果相同。任一中间量非有限或反向失败均抛 ValueError
+        并清空缓存。实参数量错误沿用 Python 自带的 TypeError。
+        """
+        cache = self._cache
+        try:
+            if type(cache) is not tuple or len(cache) != 15 \
+                    or cache[0] != "mha":
+                raise ValueError(
+                    "backward requires a successful forward pass before it")
+            (_, T, D, heads, xc, q, k, v, c, w, mask_c,
+             Wq, Wk, Wv, Wo) = cache
+            dy = _check_matrix(dy, T, D, "dy")
+            dy = [[float(z) for z in row] for row in dy]
+
+            # dWo[a][j] = Σ_t dy[t][a]*c[t][j]，t 自 0.0 升序。
+            dWo = [[0.0] * D for _ in range(D)]
+            for a in range(D):
+                dWoa = dWo[a]
+                for j in range(D):
+                    acc = 0.0
+                    for t in range(T):
+                        acc += dy[t][a] * c[t][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dWo accumulated to a non-finite value")
+                    dWoa[j] = acc
+
+            # dc[t][j] = Σ_a dy[t][a]*Wo[a][j]，a 自 0.0 升序。
+            dc = [[0.0] * D for _ in range(T)]
+            for t in range(T):
+                dyt = dy[t]
+                dct = dc[t]
+                for j in range(D):
+                    acc = 0.0
+                    for a in range(D):
+                        acc += dyt[a] * Wo[a][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dc accumulated to a non-finite value")
+                    dct[j] = acc
+
+            dq, dk, dv = multihead_attention_backward(
+                q, k, v, dc, heads, mask_c)
+
+            # dWq/dWk/dWv[a][j] = Σ_t d{q,k,v}[t][a]*x[t][j]，t 升序。
+            dWq = [[0.0] * D for _ in range(D)]
+            dWk = [[0.0] * D for _ in range(D)]
+            dWv = [[0.0] * D for _ in range(D)]
+            for a in range(D):
+                dWqa, dWka, dWva = dWq[a], dWk[a], dWv[a]
+                for j in range(D):
+                    aq = ak = av = 0.0
+                    for t in range(T):
+                        aq += dq[t][a] * xc[t][j]
+                        if not math.isfinite(aq):
+                            raise ValueError(
+                                "dWq accumulated to a non-finite value")
+                        ak += dk[t][a] * xc[t][j]
+                        if not math.isfinite(ak):
+                            raise ValueError(
+                                "dWk accumulated to a non-finite value")
+                        av += dv[t][a] * xc[t][j]
+                        if not math.isfinite(av):
+                            raise ValueError(
+                                "dWv accumulated to a non-finite value")
+                    dWqa[j], dWka[j], dWva[j] = aq, ak, av
+
+            # dx[t][j]：q、k、v 三路径之和，按 a 自 0.0 升序累加。
+            dx = [[0.0] * D for _ in range(T)]
+            for t in range(T):
+                dqt, dkt, dvt = dq[t], dk[t], dv[t]
+                dxt = dx[t]
+                for j in range(D):
+                    acc = 0.0
+                    for a in range(D):
+                        acc += dqt[a] * Wq[a][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dx accumulated to a non-finite value")
+                        acc += dkt[a] * Wk[a][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dx accumulated to a non-finite value")
+                        acc += dvt[a] * Wv[a][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dx accumulated to a non-finite value")
+                    dxt[j] = acc
+        except ValueError:
+            self._cache = None
+            raise
+
+        return dx, dWq, dWk, dWv, dWo
+
+
 class VanillaRNN(object):
     """单隐藏层 Vanilla RNN，参数 Wxh/Whh/bh 初始化为全 0.0。
 
