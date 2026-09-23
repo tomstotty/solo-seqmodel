@@ -1621,6 +1621,16 @@ class BidirectionalGRU(object):
             checked_dys.append(checked_seq)
         dys = checked_dys
 
+        return self._backward_padded_core(dys, B, T, lengths, cfs, cbs)
+
+    def _backward_padded_core(self, dys, B, T, lengths, cfs, cbs):
+        """backward_padded 与 backward_attn_padded 共用的反传核心。
+
+        dys 须为已通过校验的 B×T×2H 数值列表（padding 位忽略），其余实参
+        取自批缓存；返回 (dxs, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b)，
+        语义与 backward_padded 文档一致。
+        """
+        I, H = self.I, self.H
         dxs = [[[0.0] * I for _ in range(T)] for _ in range(B)]
         dh0_f = [None] * B
         dh0_b = [None] * B
@@ -1685,6 +1695,108 @@ class BidirectionalGRU(object):
                         "db_b accumulated to a non-finite value")
 
         return dxs, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b
+
+    def forward_attn_padded(self, xs, lengths, q):
+        """变长批注意力汇聚前向，返回 (c, w) 并保存注意力批缓存。
+
+        xs、lengths 完全沿用 forward_padded 的契约；q 须为 B×2H 的 F
+        列表，否则抛 ValueError。任何失败都使既有缓存失效（其后的
+        backward_attn_padded 必须重新 forward_attn_padded）。先按
+        forward_padded 求批输出 y（B×T×2H，padding 行为 2H 个 0.0），
+        再对每个样本取 v = y[b][:lengths[b]]，调用
+        attention([q[b]], v, v, None) 得 1×2H 的上下文与 1×L_b 的权重。
+        c 为 B×2H，第 b 行即样本 b 的上下文；w 为 B×T，第 b 行前 L_b
+        项为注意力权重、padding 位为 0.0。输出为逐层新建的 float 列表，
+        不修改或复用输入与单元参数；缓存后续反传所需的 q、y 等数据；
+        任一中间量非有限抛 ValueError，实参数量错误沿用 Python 自带的
+        TypeError。
+        """
+        H = self.H
+        # 任何失败的 forward_attn_padded 都使既有缓存失效。
+        self._cache = None
+
+        # 先求批输出 y（同时完成 xs、lengths 校验并留下批缓存）。
+        y = self.forward_padded(xs, lengths)
+        try:
+            _, B, T, lengths, cfs, cbs = self._cache
+            # q：B×2H 的 F 列表（逐行浅拷贝，按原值参与注意力运算）。
+            q = _check_matrix(q, B, 2 * H, "q")
+
+            c = [None] * B
+            w = [None] * B
+            for b in range(B):
+                L = lengths[b]
+                v = y[b][:L]
+                c_b, w_b = attention([q[b]], v, v, None)
+                c[b] = [float(val) for val in c_b[0]]
+                # 有效前缀为注意力权重，padding 位为 0.0。
+                w[b] = [float(val) for val in w_b[0]] + [0.0] * (T - L)
+        except ValueError:
+            # 失败的前向不得留下可用缓存。
+            self._cache = None
+            raise
+
+        self._cache = ("attn_padded", B, T, lengths, cfs, cbs, q, y)
+        return c, w
+
+    def backward_attn_padded(self, dc):
+        """变长批注意力汇聚反向，固定返回
+        (dx, dq, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b)。
+
+        最近一次成功前向须为 forward_attn_padded（其后无任何其他
+        forward 类调用使缓存失效），否则抛 ValueError；dc 须为 B×2H 的
+        F 列表，否则抛 ValueError。每个样本按缓存的 q、y 取
+        v = y[b][:lengths[b]]，调用
+        attention_backward([q[b]], v, v, [dc[b]], None) 得 gq、gk、gv；
+        dq[b] 为 gq[0]（长 2H）。样本 b 的有效位置 t<L_b 处 dy 自 0.0
+        起依次加 gk[t]、gv[t]，padding 行为 2H 个 0.0；随后按
+        backward_padded 的语义对 dy 反传。
+
+        dx 为 B×T×I（padding 行为 I 个 0.0），dq 为 B×2H；dh0_f、dh0_b
+        为 B×H，dW_f、dW_b 形状 3H×(I+H)，db_f、db_b 长 3H，均与
+        backward_padded 一致。所有结果均为逐层新建的 float 列表，不修改
+        dc、缓存或单元参数，重复调用结果确定；任一中间量非有限抛
+        ValueError，实参数量错误沿用 Python 自带的 TypeError。
+        """
+        H = self.H
+        cache = self._cache
+        if type(cache) is not tuple or len(cache) != 8 \
+                or cache[0] != "attn_padded":
+            raise ValueError(
+                "backward_attn_padded requires a successful "
+                "forward_attn_padded pass before it")
+        _, B, T, lengths, cfs, cbs, q, y = cache
+
+        # dc：B×2H 的 F 列表（逐行浅拷贝，按原值参与注意力反传）。
+        dc = _check_matrix(dc, B, 2 * H, "dc")
+
+        dq = [None] * B
+        dys = [[[0.0] * (2 * H) for _ in range(T)] for _ in range(B)]
+        for b in range(B):
+            L = lengths[b]
+            v = y[b][:L]
+            gq, gk, gv = attention_backward([q[b]], v, v, [dc[b]], None)
+            dq[b] = [float(val) for val in gq[0]]
+            dy_b = dys[b]
+            for t in range(L):
+                row = dy_b[t]
+                gk_t = gk[t]
+                gv_t = gv[t]
+                for a in range(2 * H):
+                    acc = 0.0
+                    acc += float(gk_t[a])
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "dy accumulated to a non-finite value")
+                    acc += float(gv_t[a])
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "dy accumulated to a non-finite value")
+                    row[a] = acc
+
+        dxs, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b = \
+            self._backward_padded_core(dys, B, T, lengths, cfs, cbs)
+        return dxs, dq, dh0_f, dh0_b, dW_f, db_f, dW_b, db_b
 
 
 # 模型 JSON 顶层唯一允许的键及其出现顺序。
