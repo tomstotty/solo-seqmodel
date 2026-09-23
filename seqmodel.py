@@ -10937,6 +10937,289 @@ def _train_lstm_attn(model_path, corpus_path, out_path, window_text):
         f.write(text.encode("utf-8"))
 
 
+def _train_lstm_mha(model_path, corpus_path, out_path, window_text):
+    """带投影多头注意力对 LSTM 模型做一次全语料 SGD 更新并写入 OUT。
+
+    MODEL、CORPUS 完全沿用 perplexity-lstm-mha version 4 的十三键、F、严格
+    UTF-8、形状、词表及语料至少 2 码点契约；WINDOW 整串匹配
+    [1-9][0-9]*（任意位数均合法，不转 int），安全截取沿用
+    perplexity-lstm-mha，否则抛 ValueError。
+
+    前向严格复用 perplexity-lstm-mha：置 h=h0、c=c0、memory=[h0]，t 升序
+    以当前字符的 V 长 one-hot 调用装入 W、b 的 LSTMCell.forward 更新 h、c
+    并缓存每步 cache；M_t 取 memory 末尾至多 WINDOW 项（顺序从旧到新），
+    装入四组投影构造 MHA(H, heads)，u_t 逐项等于 h 加
+    forward_cross([h], M_t, None) 的首行上下文，随后向 memory 追加 h 的
+    float 副本；logit 仅以 u_t 替代隐状态，其余下标、稳定 softmax 顺序均
+    与 train-lstm 相同。
+
+    令 g_t = p_t - onehot(y_t)，按 t 升序累加 dWhy += g_t⊗u_t、dby += g_t
+    （组内下标顺序同 train-lstm），并对每个 j 自 0.0 按 k 升序求
+    du_t = Whyᵀg_t。置 dhs 为全零，按 t 降序调用
+    mha.backward_cross([du_t]) 得 dqx、dkvx 与四组投影梯度：dqx 仅一行，
+    残差直连与查询路径之和 du_t + dqx[0] 按 i 升序加至 dhs[t]；dkvx 再按
+    M_t 从旧到新、i 升序映射到完整记忆 [h0, h_0, ..., h_{t-1}]——首行
+    若为 h0 则梯度丢弃，第 q（q>=1）行加至 dhs[q-1]；dWq、dWk、dWv、dWo
+    各自 0.0 起按 t 降序、组内行（a）列（j）序累加。任一累加非有限抛
+    ValueError。随后调用 LSTMCell.backward_sequence(dhs, caches) 取得
+    dW、db。梯度组序依次为 dW、db、dWq、dWk、dWv、dWo、dWhy、dby，
+    5.0 全局裁剪、0.1 更新、h0/c0/heads 不变；OUT 键序恰为
+    version、vocab、W、b、Wq、Wk、Wv、Wo、heads、Why、by、h0、c0
+    （version 为 int 4，heads 沿用原 int，其余数组元素均转为 float），
+    紧凑 JSON 加 LF 及负零口径均沿用 train-lstm。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    (vocab, W, b, Wq, Wk, Wv, Wo, heads,
+     Why, by, h0, c0) = _load_perplexity_lstm_mha_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    T = len(ids) - 1
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    mha = MHA(H, heads)
+    mha.Wq = [list(row) for row in Wq]
+    mha.Wk = [list(row) for row in Wk]
+    mha.Wv = [list(row) for row in Wv]
+    mha.Wo = [list(row) for row in Wo]
+
+    # 前向严格复用 perplexity-lstm-mha：t 升序以 (h0, c0) 为初态逐步
+    # 推进 h、c 并缓存每步 cache；M_t 为 memory 末尾至多 WINDOW 项，
+    # u_t = h + 首行交叉注意力上下文，随后向 memory 追加 h 的 float 副本。
+    hs = []
+    caches = []
+    m_list = []
+    u_list = []
+    cross_caches = []
+    memory = [h0]
+    h = list(h0)
+    c = list(c0)
+    for t in range(T):
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+        h, c, cache = cell.forward(x, h, c)
+        hs.append(h)
+        caches.append(cache)
+        M = _window_tail(memory, window_text)
+        u = _mha_cross_context(h, M, mha)
+        m_list.append(M)
+        u_list.append(u)
+        # 每步 forward_cross 都会替换 mha 的缓存；逐份留存快照，反向按 t
+        # 装回（backward_cross 成功后保留缓存而不推进）。
+        cross_caches.append(mha._cache)
+        memory.append([float(v) for v in h])
+
+    dWhy = [[0.0] * H for _ in range(V)]
+    dby = [0.0] * V
+    du_list = [None] * T
+
+    for t in range(T):
+        u = u_list[t]
+        y = ids[t + 1]
+
+        # logit：仅以 u 替代 h，其余与 train-lstm 相同。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(H):
+                acc += why_row[j] * u[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # softmax：m=max(z)，d 从 0.0 依 k 升序累加 exp(z_k-m)。
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            ev = math.exp(z[k] - m)
+            if not math.isfinite(ev):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ev
+            d += ev
+            if not math.isfinite(d):
+                raise ValueError("softmax denominator accumulated non-finitely")
+
+        # g = p - onehot(y)。
+        g = [0.0] * V
+        for k in range(V):
+            gk = e[k] / d
+            if k == y:
+                gk -= 1.0
+            if not math.isfinite(gk):
+                raise ValueError("output gradient became non-finite")
+            g[k] = gk
+
+        # 按 t 升序累加 dWhy += g⊗u、dby += g（组内顺序同 train-lstm）。
+        for k in range(V):
+            gk = g[k]
+            dby[k] += gk
+            if not math.isfinite(dby[k]):
+                raise ValueError("dby accumulated to a non-finite value")
+            dw_row = dWhy[k]
+            for j in range(H):
+                dw_row[j] += gk * u[j]
+                if not math.isfinite(dw_row[j]):
+                    raise ValueError("dWhy accumulated to a non-finite value")
+
+        # du = Whyᵀg：每个 j 独立以 0.0 起按 k 升序累加。
+        du = [0.0] * H
+        for j in range(H):
+            acc = 0.0
+            for k in range(V):
+                acc += Why[k][j] * g[k]
+                if not math.isfinite(acc):
+                    raise ValueError("du accumulated to a non-finite value")
+            du[j] = acc
+        du_list[t] = du
+
+    # 交叉注意力残差与记忆的反向：dhs 置零，按 t 降序累加；四组投影梯度
+    # 各自 0.0 起按 t 降序、行列序累加。
+    dhs = [[0.0] * H for _ in range(T)]
+    dWq = [[0.0] * H for _ in range(H)]
+    dWk = [[0.0] * H for _ in range(H)]
+    dWv = [[0.0] * H for _ in range(H)]
+    dWo = [[0.0] * H for _ in range(H)]
+    for t in range(T - 1, -1, -1):
+        du = du_list[t]
+        # 装回该步前向留存的快照（同 backward_cross_padded 的用法），
+        # backward_cross 成功后保留缓存而不推进，故每步均须显式装回。
+        mha._cache = cross_caches[t]
+        dqx, dkvx, step_dWq, step_dWk, step_dWv, step_dWo = \
+            mha.backward_cross([du])
+
+        # 残差直连 du 与查询路径 dqx[0] 之和按 i 升序加至 dhs[t]。
+        dqx0 = dqx[0]
+        dh_row = dhs[t]
+        for i in range(H):
+            dh_row[i] += du[i] + dqx0[i]
+            if not math.isfinite(dh_row[i]):
+                raise ValueError("dhs accumulated to a non-finite value")
+
+        # dkvx 按 M_t 从旧到新映射：base 为其首行在完整记忆
+        # [h0, h_0, ..., h_{t-1}] 中的下标；0 即 h0（梯度丢弃），
+        # q>=1 对应 h_{q-1}。
+        base = t + 1 - len(m_list[t])
+        for p, dm_row in enumerate(dkvx):
+            q = base + p
+            if q == 0:
+                continue
+            target = dhs[q - 1]
+            for i in range(H):
+                target[i] += dm_row[i]
+                if not math.isfinite(target[i]):
+                    raise ValueError("dhs accumulated to a non-finite value")
+
+        # 四组投影梯度按 t 降序、行（a）列（j）序累加。
+        for a in range(H):
+            sum_q, sum_k, sum_v, sum_o = dWq[a], dWk[a], dWv[a], dWo[a]
+            step_q, step_k = step_dWq[a], step_dWk[a]
+            step_v, step_o = step_dWv[a], step_dWo[a]
+            for j in range(H):
+                sum_q[j] += step_q[j]
+                if not math.isfinite(sum_q[j]):
+                    raise ValueError("dWq accumulated to a non-finite value")
+                sum_k[j] += step_k[j]
+                if not math.isfinite(sum_k[j]):
+                    raise ValueError("dWk accumulated to a non-finite value")
+                sum_v[j] += step_v[j]
+                if not math.isfinite(sum_v[j]):
+                    raise ValueError("dWv accumulated to a non-finite value")
+                sum_o[j] += step_o[j]
+                if not math.isfinite(sum_o[j]):
+                    raise ValueError("dWo accumulated to a non-finite value")
+
+    _dxs, _dh0, _dc0, dW, db = cell.backward_sequence(dhs, caches)
+
+    # 依 dW、db、dWq、dWk、dWv、dWo、dWhy、dby 行序累加平方和求全局范数。
+    sum_sq = 0.0
+    for group in (dW, db, dWq, dWk, dWv, dWo, dWhy, dby):
+        if type(group[0]) is list:
+            for row in group:
+                for v in row:
+                    if not math.isfinite(v):
+                        raise ValueError("gradient is non-finite")
+                    sum_sq += v * v
+                    if not math.isfinite(sum_sq):
+                        raise ValueError(
+                            "global norm accumulated to a non-finite value")
+        else:
+            for v in group:
+                if not math.isfinite(v):
+                    raise ValueError("gradient is non-finite")
+                sum_sq += v * v
+                if not math.isfinite(sum_sq):
+                    raise ValueError(
+                        "global norm accumulated to a non-finite value")
+
+    global_norm = math.sqrt(sum_sq)
+    scale = 5.0 / global_norm if global_norm > 5.0 else 1.0
+
+    # 八组参数减 0.1 倍（裁剪后的）梯度；h0、c0、heads 不变。
+    # 结果非有限即失败。
+    def _updated(old, grad):
+        value = float(old) - 0.1 * (grad * scale)
+        if not math.isfinite(value):
+            raise ValueError("updated parameter became non-finite")
+        return value
+
+    new_W = [[_updated(W[k][j], dW[k][j]) for j in range(V + H)]
+             for k in range(4 * H)]
+    new_b = [_updated(b[k], db[k]) for k in range(4 * H)]
+    new_Wq = [[_updated(Wq[a][j], dWq[a][j]) for j in range(H)]
+              for a in range(H)]
+    new_Wk = [[_updated(Wk[a][j], dWk[a][j]) for j in range(H)]
+              for a in range(H)]
+    new_Wv = [[_updated(Wv[a][j], dWv[a][j]) for j in range(H)]
+              for a in range(H)]
+    new_Wo = [[_updated(Wo[a][j], dWo[a][j]) for j in range(H)]
+              for a in range(H)]
+    new_Why = [[_updated(Why[k][j], dWhy[k][j]) for j in range(H)]
+               for k in range(V)]
+    new_by = [_updated(by[k], dby[k]) for k in range(V)]
+
+    obj = {
+        "version": 4,
+        "vocab": vocab,
+        "W": new_W,
+        "b": new_b,
+        "Wq": new_Wq,
+        "Wk": new_Wk,
+        "Wv": new_Wv,
+        "Wo": new_Wo,
+        "heads": heads,
+        "Why": new_Why,
+        "by": new_by,
+        "h0": [float(v) for v in h0],
+        "c0": [float(v) for v in c0],
+    }
+    text = json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+    with open(out_path, "wb") as f:
+        f.write(text.encode("utf-8"))
+
+
 def _train_gru_attn_tbptt(model_path, corpus_path, out_path, window_text,
                           k_text):
     """带注意力上下文与截断 BPTT 对 GRU 模型做一次全语料 SGD 并写入 OUT。
@@ -11740,6 +12023,19 @@ def main(argv):
     dW、db；梯度组序、5.0 裁剪、0.1 更新、h0/c0 不变与 OUT 写出均沿用
     train-lstm。成功时 stdout 为空并返回 0。
 
+    python seqmodel.py train-lstm-mha MODEL CORPUS OUT WINDOW：MODEL、CORPUS
+    沿用 perplexity-lstm-mha 的 version 4 十三键契约；前向严格复用
+    perplexity-lstm-mha 的 h、c、memory、M_t、四组投影多头交叉注意力与
+    u_t 顺序并缓存每步 cache。反向令 g_t = p_t-onehot(y_t)，按 t 升序
+    累加 dWhy、dby（以 u_t 为隐状态）并求 du_t = Whyᵀg_t；dhs 置零，
+    t 降序调用 mha.backward_cross([du_t])：du_t 加 dqx[0] 加至 dhs[t]，
+    dkvx 按 M_t 顺序映射回完整记忆（h0 项丢弃，其余加至对应 dhs），
+    dWq、dWk、dWv、dWo 按 t 降序、行列序累加；再以
+    backward_sequence(dhs, caches) 取得 dW、db。梯度依次为 dW、db、dWq、
+    dWk、dWv、dWo、dWhy、dby，5.0 全局裁剪、0.1 更新，h0、c0、heads
+    不变；OUT 十三键与键序沿用 perplexity-lstm-mha（version 为 int 4）。
+    成功时 stdout 为空并返回 0。
+
     python seqmodel.py train-gru-attn-tbptt MODEL CORPUS OUT WINDOW K：
     MODEL、CORPUS、OUT、0.1 更新、5.0 裁剪及成败协议沿用 train-gru；
     WINDOW 沿用 perplexity-gru-attn 的词法及任意位数安全截取。K 整串匹配
@@ -11882,6 +12178,8 @@ def main(argv):
             _train_attn(argv[2], argv[3], argv[4], argv[5])
         elif len(argv) == 6 and argv[1] == "train-lstm-attn":
             _train_lstm_attn(argv[2], argv[3], argv[4], argv[5])
+        elif len(argv) == 6 and argv[1] == "train-lstm-mha":
+            _train_lstm_mha(argv[2], argv[3], argv[4], argv[5])
         elif len(argv) == 7 and argv[1] == "train-gru-attn-tbptt":
             _train_gru_attn_tbptt(argv[2], argv[3], argv[4], argv[5],
                                   argv[6])
