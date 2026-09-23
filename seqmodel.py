@@ -3090,6 +3090,175 @@ def _sample_gru_attn_anneal(model_path, start, seed_text, start_t_text,
     return "".join(out) + "\n"
 
 
+def _sample_gru_attn_topp(model_path, start, seed_text, start_t_text,
+                          end_t_text, top_p_text, length_text, window_text):
+    """sample-gru-attn-top-p：线性退火温度、注意力与 top-p 核选样采样。
+
+    除 TOP_P 与核选样外，MODEL、START、SEED、LENGTH、WINDOW 的校验，以及
+    GRU 状态、注意力记忆、Why/by logit、线性温度、稳定 softmax、LENGTH 的
+    0/1 语义与有限性失败协议均沿用 _sample_gru_attn_anneal；WINDOW 整串
+    匹配 [1-9][0-9]*（任意位数均合法，不转 int），安全截取沿用
+    perplexity-gru-attn，否则抛 ValueError。TOP_P 经 float() 解析，结果须
+    有限且 0<TOP_P<=1，否则抛 ValueError。整次调用仅初始化一次
+    r=random.Random(int(SEED))，不写任何文件。
+
+    每步先按原顺序求 a_k=z_k/T、m=max(a)、e_k=exp(a_k-m)，d 自 0.0 依 k
+    升序累加。再将索引按 (-e_k, k) 升序排列（e 降序、并列时 k 升序），依
+    该序自 0.0 累加 e，截取首个使累计值 >=TOP_P*d 的最短前缀；s 为该前缀
+    按该序自 0.0 累加所得之和。浮点求和顺序不同可能令全量累计与 d 相差一
+    ULP，此时以全量索引为前缀（数学上其和恰为 d>=目标）。令
+    u=r.random()*s，再按前缀顺序自 0.0 累加 e，选首个累计值严格大于 u 的
+    索引；无则取前缀末项。其字符追加到输出并作为下一输入 x，随后向 memory
+    追加 h 的 float 副本。任一新增运算非有限均抛 ValueError。成功返回
+    LENGTH 个码点再加一个 LF。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    vocab, W, b, Why, by, h0 = _load_perplexity_gru_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # START_T、END_T：float() 可解析且有限、严格大于 0。
+    start_t = float(start_t_text)
+    if not math.isfinite(start_t) or start_t <= 0.0:
+        raise ValueError("START_T must be a finite positive float")
+    end_t = float(end_t_text)
+    if not math.isfinite(end_t) or end_t <= 0.0:
+        raise ValueError("END_T must be a finite positive float")
+
+    # TOP_P：float() 可解析且有限，0<TOP_P<=1。
+    top_p = float(top_p_text)
+    if not math.isfinite(top_p) or top_p <= 0.0 or top_p > 1.0:
+        raise ValueError("TOP_P must be a finite float with 0<TOP_P<=1")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    if length == 1:
+        # 仅用 START_T，不求值退火表达式。
+        def temperature_at(t):
+            return start_t
+    elif length >= 2:
+        def temperature_at(t):
+            # 严格按 START_T+(END_T-START_T)*t/(LENGTH-1) 的运算顺序求值。
+            temp = start_t + (end_t - start_t) * t / (length - 1)
+            if not math.isfinite(temp) or temp <= 0.0:
+                raise ValueError(
+                    "annealed temperature became non-finite or non-positive")
+            return temp
+    else:
+        temperature_at = None  # LENGTH 为 0：循环不执行，不计算温度。
+
+    cell = GRUCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    rng = random.Random(seed)
+    # 与 _sample_gru_attn 相同：h0 保留模型原值，attention 不修改其
+    # 输入，故直接共享行即可。
+    memory = [h0]
+    h = list(h0)
+    x = vocab.index(start)
+    out = []
+
+    for t in range(length):
+        temperature = temperature_at(t)
+        # 当前字符的 V 长 one-hot 输入，推进 GRU 隐状态。
+        xvec = [0.0] * V
+        xvec[x] = 1.0
+        h, _cache = cell.forward(xvec, h)
+
+        M = _window_tail(memory, window_text)
+        u = _attn_context(h, M)
+
+        # z_k = by_k + Σ_j Why_k,j*u_j，依 j 升序自 float 偏置累加。
+        z = _output_logits(Why, by, u)
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+        m = max(a)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # 核阈值 TOP_P*d 须有限。
+        target = top_p * d
+        if not math.isfinite(target):
+            raise ValueError("top-p target accumulated non-finitely")
+
+        # 索引按 (-e_k, k) 升序：e 降序、并列时 k 升序。
+        order = sorted(range(V), key=lambda k: (-e[k], k))
+
+        # 依该序自 0.0 累加 e，截取首个累计值 >=TOP_P*d 的最短前缀；s 为
+        # 其自 0.0 依该序累加所得之和。浮点求和顺序不同可能令全量累计与 d
+        # 相差一 ULP，此时以全量索引为前缀（数学上其和恰为 d>=目标）。
+        prefix = []
+        s = 0.0
+        reached = False
+        for idx in order:
+            prefix.append(idx)
+            s += e[idx]
+            if not math.isfinite(s):
+                raise ValueError("top-p prefix accumulated non-finitely")
+            if s >= target:
+                reached = True
+                break
+        if not reached:
+            prefix = list(order)
+
+        # u=r.random()*s；按前缀顺序自 0.0 累加 e，选首个累计值严格大于
+        # u 者；无则取前缀末项。
+        threshold = rng.random() * s
+        if not math.isfinite(threshold):
+            raise ValueError("sample threshold became non-finite")
+        chosen = prefix[-1]
+        cum = 0.0
+        for idx in prefix:
+            cum += e[idx]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > threshold:
+                chosen = idx
+                break
+
+        out.append(vocab[chosen])
+        x = chosen
+        memory.append([float(v) for v in h])
+
+    return "".join(out) + "\n"
+
+
 def _sample_lstm_anneal(model_path, start, seed_text, start_t_text,
                         end_t_text, length_text):
     """以线性退火温度从 LSTM 语言模型采样 LENGTH 个码点，返回待写出的字符串。
@@ -8618,6 +8787,20 @@ def main(argv):
     向 memory 追加 h 的 float 副本；任一中间量非有限即失败。输出契约
     与 sample 相同，不写文件。
 
+    python seqmodel.py sample-gru-attn-top-p MODEL START SEED START_T
+    END_T TOP_P LENGTH WINDOW：以线性退火温度、注意力与 top-p 核选样从
+    version 3 的 GRU 模型采样。除 TOP_P 及核选样外，参数校验、LENGTH 的
+    0/1 语义、GRU 状态、注意力记忆、线性温度、Why/by 仿射、稳定 softmax
+    与有限性失败契约均沿用 sample-gru-attn-anneal；TOP_P 经 float() 解
+    析，须有限且 0<TOP_P<=1，否则失败。每步先按原顺序求
+    a_k、m=max(a)、e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加；再将索引按
+    (-e_k,k) 升序排列，依此自 0.0 累加 e，截取首个使累计值 >=TOP_P*d
+    的最短前缀，s 为其按该序自 0.0 累加所得之和。整次仅初始化一次
+    random.Random(int(SEED))；每步令 u=random()*s，再按前缀顺序自 0.0
+    累加 e，选首个累计值严格大于 u 的索引，无则取前缀末项；字符、h 及
+    memory 按原命令更新。任一运算非有限即失败。输出契约与 sample 相同，
+    不写文件。
+
     python seqmodel.py sample-lstm-attn-top-p MODEL START SEED START_T
     END_T TOP_P LENGTH WINDOW：除 TOP_P 及核选样外，参数校验、LENGTH 的
     0/1 语义、线性温度、LSTM 状态、注意力记忆、Why/by logit、稳定
@@ -8876,6 +9059,11 @@ def main(argv):
             output = _sample_gru_attn_anneal(argv[2], argv[3], argv[4],
                                              argv[5], argv[6], argv[7],
                                              argv[8])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 10 and argv[1] == "sample-gru-attn-top-p":
+            output = _sample_gru_attn_topp(argv[2], argv[3], argv[4],
+                                           argv[5], argv[6], argv[7],
+                                           argv[8], argv[9])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 5 and argv[1] == "perplexity-attn":
             output = _perplexity_attn(argv[2], argv[3], argv[4])
