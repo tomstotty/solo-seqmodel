@@ -16858,6 +16858,243 @@ def _train_lstm_mha_relative(model_path, corpus_path, out_path,
                 pass
 
 
+def _train_transformer(model_path, corpus_path, out_path):
+    """对 version 6 字符模型执行一次全语料 SGD 更新并原子写入 OUT。
+
+    MODEL、CORPUS 完全沿用 perplexity-transformer（version 6 十四键、F、
+    严格 UTF-8、形状、词表、heads 整除 V 及语料至少 2 码点契约）。
+
+    前向严格沿用 perplexity-transformer：令 T=len(CORPUS)-1，x 为前 T 个
+    字符的 T×V one-hot 矩阵，mask 为 T×T 且 mask[i][j]=(j<=i)；将 Wq、
+    Wk、Wv、Wo、W1、b1、W2、b2 装入 TransformerBlock(V, heads, P) 后以
+    (x, mask) 前向取 y。t 升序沿用 perplexity-transformer 的 Why/by 次序
+    计算 logits 与 softmax，令 g_t=p_t-onehot(下一字符)，按 t 升序累加
+    dWhy += g_t⊗y_t、dby += g_t，并对每个 j 自 0.0 按 k 升序求
+    dy_t = Whyᵀg_t；随后以同一块缓存调用 block.backward(dy) 取
+    (dx, dWq, dWk, dWv, dWo, dW1, db1, dW2, db2)，dx 丢弃。
+
+    梯度组序为 dWq、dWk、dWv、dWo、dW1、db1、dW2、db2、dWhy、dby，按
+    组、行、列序自 0.0 累加平方和求全局范数（同时校验各梯度有限），超过
+    5.0 即 scale=5.0/norm，否则 1.0。十组参数更新为
+    float(old)-0.1*(grad*scale)，任一结果非有限即失败；version、heads、
+    P 不变。
+
+    OUT 复用 MODEL 十四键的顺序与形状（version、vocab、heads、P、Wq、
+    Wk、Wv、Wo、W1、b1、W2、b2、Why、by），version 恰为 int 6、heads 与
+    P 仍为非 bool int，数值数组元素均转为 float；字节格式、负零口径及
+    OUT 同目录临时文件原子替换的成败协议均沿用 train-lstm-mha。成功时
+    stdout 为空并返回 0。
+    """
+    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why,
+     by) = _load_perplexity_transformer_model(model_path)
+    V = len(vocab)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    T = len(ids) - 1
+
+    # 前 T 个字符的 T×V one-hot 输入矩阵。
+    x = [[0.0] * V for _ in range(T)]
+    for t in range(T):
+        x[t][ids[t]] = 1.0
+
+    # 因果掩码：mask[i][j] = (j <= i)。
+    mask = [[j <= i for j in range(T)] for i in range(T)]
+
+    block = TransformerBlock(V, heads, P)
+    block.attn.Wq = [list(row) for row in Wq]
+    block.attn.Wk = [list(row) for row in Wk]
+    block.attn.Wv = [list(row) for row in Wv]
+    block.attn.Wo = [list(row) for row in Wo]
+    block.W1 = [list(row) for row in W1]
+    block.b1 = list(b1)
+    block.W2 = [list(row) for row in W2]
+    block.b2 = list(b2)
+
+    y = block.forward(x, mask)[0]
+
+    dWhy = [[0.0] * V for _ in range(V)]
+    dby = [0.0] * V
+    dy_all = [[0.0] * V for _ in range(T)]
+
+    for t in range(T):
+        h = y[t]
+        target = ids[t + 1]
+
+        # logit 与 softmax 次序完全沿用 perplexity-transformer：z 自 float
+        # 偏置按 j 升序累加，减最大值后 d 从 0.0 依 k 升序累加 exp。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(V):
+                acc += why_row[j] * h[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            ev = math.exp(z[k] - m)
+            if not math.isfinite(ev):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ev
+            d += ev
+            if not math.isfinite(d):
+                raise ValueError("softmax denominator accumulated non-finitely")
+
+        # g = p - onehot(下一字符)。
+        g = [0.0] * V
+        for k in range(V):
+            gk = e[k] / d
+            if k == target:
+                gk -= 1.0
+            if not math.isfinite(gk):
+                raise ValueError("output gradient became non-finite")
+            g[k] = gk
+
+        # 按 t 升序累加 dWhy += g⊗y、dby += g（组内按 k、j 升序）。
+        for k in range(V):
+            gk = g[k]
+            dby[k] += gk
+            if not math.isfinite(dby[k]):
+                raise ValueError("dby accumulated to a non-finite value")
+            dw_row = dWhy[k]
+            for j in range(V):
+                dw_row[j] += gk * h[j]
+                if not math.isfinite(dw_row[j]):
+                    raise ValueError("dWhy accumulated to a non-finite value")
+
+        # dy = Whyᵀg：每个 j 独立以 0.0 起按 k 升序累加。
+        dy_row = dy_all[t]
+        for j in range(V):
+            acc = 0.0
+            for k in range(V):
+                acc += Why[k][j] * g[k]
+                if not math.isfinite(acc):
+                    raise ValueError("dy accumulated to a non-finite value")
+            dy_row[j] = acc
+
+    # 以同一次前向缓存对整段 dy 反向；dx 为输入 one-hot 梯度，丢弃。
+    _dx, gWq, gWk, gWv, gWo, gW1, gb1, gW2, gb2 = block.backward(dy_all)
+
+    # 块内参数梯度直接取自 backward（新建列表），输出层梯度为上方累加值。
+    dWq, dWk, dWv, dWo = gWq, gWk, gWv, gWo
+    dW1, db1, dW2, db2 = gW1, gb1, gW2, gb2
+
+    # 依 dWq、dWk、dWv、dWo、dW1、db1、dW2、db2、dWhy、dby 的组序及
+    # 行、列序自 0.0 累加平方和求全局范数。
+    groups = (dWq, dWk, dWv, dWo, dW1, db1, dW2, db2, dWhy, dby)
+    sum_sq = 0.0
+    for group in groups:
+        if type(group[0]) is list:
+            for row in group:
+                for v in row:
+                    if not math.isfinite(v):
+                        raise ValueError("gradient is non-finite")
+                    sum_sq += v * v
+                    if not math.isfinite(sum_sq):
+                        raise ValueError(
+                            "global norm accumulated to a non-finite value")
+        else:
+            for v in group:
+                if not math.isfinite(v):
+                    raise ValueError("gradient is non-finite")
+                sum_sq += v * v
+                if not math.isfinite(sum_sq):
+                    raise ValueError(
+                        "global norm accumulated to a non-finite value")
+
+    global_norm = math.sqrt(sum_sq)
+    if not math.isfinite(global_norm):
+        raise ValueError("global norm became non-finite")
+    scale = 5.0 / global_norm if global_norm > 5.0 else 1.0
+
+    # 十组参数减 0.1 倍（裁剪后的）梯度；version、heads、P 不变。
+    def _updated(old, grad):
+        value = float(old) - 0.1 * (grad * scale)
+        if not math.isfinite(value):
+            raise ValueError("updated parameter became non-finite")
+        return value
+
+    new_Wq = [[_updated(Wq[a][j], dWq[a][j]) for j in range(V)]
+              for a in range(V)]
+    new_Wk = [[_updated(Wk[a][j], dWk[a][j]) for j in range(V)]
+              for a in range(V)]
+    new_Wv = [[_updated(Wv[a][j], dWv[a][j]) for j in range(V)]
+              for a in range(V)]
+    new_Wo = [[_updated(Wo[a][j], dWo[a][j]) for j in range(V)]
+              for a in range(V)]
+    new_W1 = [[_updated(W1[p][j], dW1[p][j]) for j in range(V)]
+              for p in range(P)]
+    new_b1 = [_updated(b1[p], db1[p]) for p in range(P)]
+    new_W2 = [[_updated(W2[j][p], dW2[j][p]) for p in range(P)]
+              for j in range(V)]
+    new_b2 = [_updated(b2[j], db2[j]) for j in range(V)]
+    new_Why = [[_updated(Why[k][j], dWhy[k][j]) for j in range(V)]
+               for k in range(V)]
+    new_by = [_updated(by[k], dby[k]) for k in range(V)]
+
+    obj = {
+        "version": 6,
+        "vocab": vocab,
+        "heads": heads,
+        "P": P,
+        "Wq": new_Wq,
+        "Wk": new_Wk,
+        "Wv": new_Wv,
+        "Wo": new_Wo,
+        "W1": new_W1,
+        "b1": new_b1,
+        "W2": new_W2,
+        "b2": new_b2,
+        "Why": new_Why,
+        "by": new_by,
+    }
+    text = json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+    data = text.encode("utf-8")
+
+    # 原子写出：在 OUT 同目录建临时文件，写全并关闭后以 os.replace 替换；
+    # 失败时 OUT 保持原状态，临时文件尽量清理。
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix=".tmp-train-transformer-",
+                                        dir=out_dir)
+    replaced = False
+    try:
+        try:
+            f = os.fdopen(tmp_fd, "wb")
+        except BaseException:
+            # fdopen 失败时 fd 仍由本调用方负责关闭。
+            os.close(tmp_fd)
+            raise
+        with f:
+            f.write(data)
+        os.replace(tmp_path, out_path)
+        replaced = True
+    finally:
+        if not replaced:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 def _train_gru_attn_tbptt(model_path, corpus_path, out_path, window_text,
                           k_text):
     """带注意力上下文与截断 BPTT 对 GRU 模型做一次全语料 SGD 并写入 OUT。
@@ -17918,6 +18155,20 @@ def main(argv):
     Why、by、h0、c0，version 为 int 5，字节格式与 train-lstm-mha
     相同。成功时 stdout 为空并返回 0。
 
+    python seqmodel.py train-transformer MODEL CORPUS OUT：对 version 6
+    字符模型执行一次全语料 SGD。MODEL、CORPUS 沿用 perplexity-transformer
+    的十四键、F、形状、词表、heads 整除 V 与语料至少 2 码点契约。以该入口
+    的 one-hot、因果 mask（mask[i][j]=(j<=i)）调用 TransformerBlock.forward
+    取 y；t 升序沿用 Why/by 与 softmax 次序，令 g_t=p_t-onehot(下一字符)，
+    累加 dWhy、dby，并对每个 j 自 0.0 按 k 升序求 dy_t=Whyᵀg_t，再调用
+    block.backward 得 dWq、dWk、dWv、dWo、dW1、db1、dW2、db2。梯度组序为
+    dWq,dWk,dWv,dWo,dW1,db1,dW2,db2,dWhy,dby，按组、行、列序自 0.0 累加
+    平方和，范数超过 5.0 时 scale=5.0/norm，否则 1.0；参数更新为
+    float(old)-0.1*(grad*scale)，非有限即失败。OUT 复用 MODEL 十四键的
+    顺序与形状，version、heads、P 不变，数值数组元素转 float；JSON 字节、
+    负零与同目录临时文件原子替换均沿用 train-lstm-mha。成功时 stdout 为空
+    并返回 0。
+
     python seqmodel.py train-gru-attn-tbptt MODEL CORPUS OUT WINDOW K：
     MODEL、CORPUS、OUT、0.1 更新、5.0 裁剪及成败协议沿用 train-gru；
     WINDOW 沿用 perplexity-gru-attn 的词法及任意位数安全截取。K 整串匹配
@@ -17960,6 +18211,8 @@ def main(argv):
         elif len(argv) == 4 and argv[1] == "perplexity-transformer":
             output = _perplexity_transformer(argv[2], argv[3])
             sys.stdout.buffer.write(output.encode("ascii"))
+        elif len(argv) == 5 and argv[1] == "train-transformer":
+            _train_transformer(argv[2], argv[3], argv[4])
         elif len(argv) == 4 and argv[1] == "perplexity-gru":
             output = _perplexity_gru(argv[2], argv[3])
             sys.stdout.buffer.write(output.encode("ascii"))
