@@ -6544,59 +6544,19 @@ def _train_transformer(model_path, corpus_path, out_path):
                 pass
 
 
-def _sample_transformer(model_path, start, seed_text, temperature_text,
-                        length_text):
-    """从单层 Transformer 块语言模型采样 LENGTH 个码点，返回待写出的字符串。
+def _transformer_sample_steps(vocab, block, Why, by, prefix, rng,
+                              temperature, length):
+    """从给定 prefix 与 rng 出发，逐项沿用 _sample_transformer 采样 length 步。
 
-    MODEL 沿用 perplexity-transformer 的十四键顺序、形状、F 及严格 UTF-8
-    契约（_load_perplexity_transformer_model）；START、SEED、TEMPERATURE、
-    LENGTH 的词法与校验完全沿用 sample。整次调用仅初始化一次
-    r=random.Random(int(SEED))。
-
-    置 prefix=[START 索引]，循环 LENGTH 次：令 L=len(prefix)，以 prefix
-    构造 L×V one-hot 输入及 mask[i][j]=(j<=i) 的 L×L 因果掩码，调用装入
-    Wq、Wk、Wv、Wo、W1、b1、W2、b2 的 TransformerBlock(V, heads, P)
-    .forward 并取末行 y；从 float(by[k]) 起按 j 升序累加
-    Why[k][j]*y[j] 得 z_k。温度缩放、减最大值 softmax、k 升序分母与累计
-    阈值抽样均沿用 sample；选中字符追加到输出，其索引追加到 prefix。任一
-    中间量非有限均抛 ValueError。成功返回 LENGTH 个码点再加一个 LF。
+    每步以完整 prefix 构造 L×V one-hot 输入与 mask[i][j]=(j<=i) 的因果掩
+    码，调用装参的 TransformerBlock.forward 取末行 y，自 float(by[k]) 按 j
+    升序累加 Why[k][j]*y[j] 得 z，温度缩放、减最大值 softmax、k 升序分母
+    与累计阈值抽样均沿用 sample；选中字符追加到输出、其索引追加到 prefix。
+    返回 (输出码点列表, 终态 prefix)（prefix 原地增长）。任一中间量非有限
+    均抛 ValueError。
     """
-    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
-        _load_perplexity_transformer_model(model_path)
     V = len(vocab)
-
-    # START：恰为词表内的一个码点。
-    if type(start) is not str or len(start) != 1 or start not in vocab:
-        raise ValueError("START must be a single in-vocab codepoint")
-
-    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
-    if not _INT_RE.match(seed_text):
-        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
-    seed = int(seed_text)
-
-    # TEMPERATURE：float() 可解析且有限、严格大于 0；inf/nan/0/负数均失败。
-    temperature = float(temperature_text)
-    if not math.isfinite(temperature) or temperature <= 0.0:
-        raise ValueError("TEMPERATURE must be a finite positive float")
-
-    # LENGTH：整串匹配非负整数词法。
-    if not _NONNEG_INT_RE.match(length_text):
-        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
-    length = int(length_text)
-
-    rng = random.Random(seed)
-    prefix = [vocab.index(start)]
     out = []
-
-    block = TransformerBlock(V, heads, P)
-    block.attn.Wq = [list(row) for row in Wq]
-    block.attn.Wk = [list(row) for row in Wk]
-    block.attn.Wv = [list(row) for row in Wv]
-    block.attn.Wo = [list(row) for row in Wo]
-    block.W1 = [list(row) for row in W1]
-    block.b1 = list(b1)
-    block.W2 = [list(row) for row in W2]
-    block.b2 = list(b2)
 
     for _t in range(length):
         L = len(prefix)
@@ -6667,6 +6627,229 @@ def _sample_transformer(model_path, start, seed_text, temperature_text,
 
         out.append(vocab[chosen])
         prefix.append(chosen)
+
+    return out, prefix
+
+
+def _sample_transformer(model_path, start, seed_text, temperature_text,
+                        length_text):
+    """从单层 Transformer 块语言模型采样 LENGTH 个码点，返回待写出的字符串。
+
+    MODEL 沿用 perplexity-transformer 的十四键顺序、形状、F 及严格 UTF-8
+    契约（_load_perplexity_transformer_model）；START、SEED、TEMPERATURE、
+    LENGTH 的词法与校验完全沿用 sample。整次调用仅初始化一次
+    r=random.Random(int(SEED))。
+
+    置 prefix=[START 索引]，逐步骤采样与有限性契约见
+    _transformer_sample_steps。成功返回 LENGTH 个码点再加一个 LF。
+    """
+    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
+        _load_perplexity_transformer_model(model_path)
+    V = len(vocab)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # TEMPERATURE：float() 可解析且有限、严格大于 0；inf/nan/0/负数均失败。
+    temperature = float(temperature_text)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    rng = random.Random(seed)
+    prefix = [vocab.index(start)]
+
+    block = TransformerBlock(V, heads, P)
+    block.attn.Wq = [list(row) for row in Wq]
+    block.attn.Wk = [list(row) for row in Wk]
+    block.attn.Wv = [list(row) for row in Wv]
+    block.attn.Wo = [list(row) for row in Wo]
+    block.W1 = [list(row) for row in W1]
+    block.b1 = list(b1)
+    block.W2 = [list(row) for row in W2]
+    block.b2 = list(b2)
+
+    out, _prefix = _transformer_sample_steps(
+        vocab, block, Why, by, prefix, rng, temperature, length)
+
+    return "".join(out) + "\n"
+
+
+_TRANSFORMER_RESUME_STATE_KEYS = ("v", "sha", "args", "p", "r")
+
+
+def _load_transformer_resume_state(path, sha_hex, expected_args, vocab_size,
+                                   start_index):
+    """读取并严格校验 sample-transformer-resume 状态文件。
+
+    文件须为严格 UTF-8 编码的 JSON 对象，顶层键依次且仅为
+    v、sha、args、p、r（重复或多余均非法）：v 为非 bool int 且值为 1；
+    sha 为 MODEL 原始字节的小写 SHA-256 且逐字符相等；args 为 3 个原文
+    str 组成的数组且恰等于 [START,SEED,TEMPERATURE]；p 为非空 list，每项
+    为 [0,V) 内的非 bool int 且首项恰为 START 索引；r 符合
+    _resume_getstate_from_json 的结构，并能通过 random.Random.setstate
+    还原。任何读取、UTF-8、JSON、类型、取值、摘要、args 或随机状态校验
+    失败均抛 ValueError。文件不存在时返回 None；其余 OSError 原样传播。
+    成功返回 (prefix, rng)，其中 rng 已 setstate 还原。
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return None
+    # 与模型装载一致：先严格 UTF-8 解码，再以 object_pairs_hook 保留键序与
+    # 重复键（root 非对象时不会得到 (key, value) 二元组列表）。
+    text = raw.decode("utf-8")
+    pairs = json.loads(text, object_pairs_hook=list)
+    if (type(pairs) is not list
+            or len(pairs) != len(_TRANSFORMER_RESUME_STATE_KEYS)):
+        raise ValueError(
+            "resume state must be a JSON object with exactly 5 keys")
+    for pair, key in zip(pairs, _TRANSFORMER_RESUME_STATE_KEYS):
+        if type(pair) is not tuple or len(pair) != 2 or pair[0] != key:
+            raise ValueError(
+                "resume state keys must be exactly %r in order"
+                % (_TRANSFORMER_RESUME_STATE_KEYS,))
+    st = dict(pairs)
+
+    version = st["v"]
+    if type(version) is bool or type(version) is not int or version != 1:
+        raise ValueError("resume v must be non-bool int 1, got %r"
+                         % (version,))
+
+    digest = st["sha"]
+    if type(digest) is not str or digest != sha_hex:
+        raise ValueError("resume sha does not match MODEL bytes")
+
+    args = st["args"]
+    if (type(args) is not list or len(args) != 3
+            or any(type(a) is not str for a in args)
+            or args != expected_args):
+        raise ValueError(
+            "resume args must equal [START,SEED,TEMPERATURE]")
+
+    prefix = st["p"]
+    if type(prefix) is not list or len(prefix) == 0:
+        raise ValueError("resume p must be a non-empty list")
+    for i, idx in enumerate(prefix):
+        if type(idx) is bool or type(idx) is not int:
+            raise ValueError("resume p entries must be non-bool ints")
+        if not 0 <= idx < vocab_size:
+            raise ValueError("resume p entry %d out of range" % i)
+    if prefix[0] != start_index:
+        raise ValueError("resume p first entry must be the START index")
+
+    r_tuple = _resume_getstate_from_json(st["r"])
+    rng = random.Random()
+    try:
+        # setstate 对越界整数等非法内部状态抛 ValueError/OverflowError。
+        rng.setstate(r_tuple)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError("resume r is not a valid getstate tuple") from exc
+
+    return prefix, rng
+
+
+def _sample_transformer_resume(model_path, start, seed_text,
+                               temperature_text, length_text, state_path):
+    """sample-transformer 的可续跑采样：生成 LENGTH 步并原子写出续跑状态。
+
+    除 STATE 外，MODEL、START、SEED、TEMPERATURE、LENGTH 的词法与校验、
+    模型十四键装载、装参 TransformerBlock、每步的 one-hot 输入、因果
+    掩码、Why/by logit、温度缩放、稳定 softmax、词表升序阈值抽样、唯一
+    随机源及有限性失败契约均逐项沿用 sample-transformer。
+
+    STATE 缺失时以 prefix=[START 索引]、rng=random.Random(int(SEED))
+    初始化；STATE 存在时读取严格 UTF-8 JSON，顶层键依次且仅为
+    v,sha,args,p,r：v 为 int 1；sha 为 MODEL 原始字节的小写 SHA-256；
+    args 为保留原文的 [START,SEED,TEMPERATURE] 字符串数组；p 为非空词表
+    索引 list，元素是 [0,V) 内非 bool int 且首项为 START 索引；r 为
+    getstate 递归将 tuple 转 list 所得 [3,625 个非 bool int,null]。
+    类型、取值、sha 摘要、args 或随机状态不符均抛 ValueError。
+
+    生成 LENGTH 步后，状态以
+    json.dumps(ensure_ascii=True,separators=(',',':'),allow_nan=False)
+    序列化为 ASCII 转义、紧凑、禁非有限数的 JSON，编码为 UTF-8 字节并加
+    LF；先写全 STATE 同目录临时文件并 os.replace 原子替换后，stdout 才写
+    本段生成文本加 LF。LENGTH 为 0 时仅创建（STATE 缺失）或校验（STATE
+    存在）状态，stdout 仅为 LF。先跑 p 步再续跑 q 步的文本拼接与终态字
+    节，须与一次跑 p+q 步逐字节相同。
+    """
+    with open(model_path, "rb") as f:
+        model_raw = f.read()
+    sha_hex = hashlib.sha256(model_raw).hexdigest()
+
+    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
+        _load_perplexity_transformer_model(model_path)
+    V = len(vocab)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # TEMPERATURE：float() 可解析且有限、严格大于 0。
+    temperature = float(temperature_text)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    expected_args = [start, seed_text, temperature_text]
+    start_index = vocab.index(start)
+    restored = _load_transformer_resume_state(
+        state_path, sha_hex, expected_args, V, start_index)
+    if restored is None:
+        # 全新初态：对 random.Random 的唯一一次构造即 random.Random(seed)。
+        rng = random.Random(seed)
+        prefix = [start_index]
+    else:
+        prefix, rng = restored
+
+    block = TransformerBlock(V, heads, P)
+    block.attn.Wq = [list(row) for row in Wq]
+    block.attn.Wk = [list(row) for row in Wk]
+    block.attn.Wv = [list(row) for row in Wv]
+    block.attn.Wo = [list(row) for row in Wo]
+    block.W1 = [list(row) for row in W1]
+    block.b1 = list(b1)
+    block.W2 = [list(row) for row in W2]
+    block.b2 = list(b2)
+
+    out, prefix = _transformer_sample_steps(
+        vocab, block, Why, by, prefix, rng, temperature, length)
+
+    state_obj = {
+        "v": 1,
+        "sha": sha_hex,
+        "args": expected_args,
+        "p": prefix,
+        "r": _tuples_to_lists(rng.getstate()),
+    }
+    # ensure_ascii 保证非 ASCII 以 \\uXXXX 转义输出纯 ASCII 文本；allow_nan
+    # 禁止 NaN/Infinity；紧凑分隔。
+    payload = (json.dumps(state_obj, ensure_ascii=True,
+                          separators=(",", ":"), allow_nan=False)
+               .encode("utf-8") + b"\n")
+    # 状态原子落盘成功后，调用方才写 stdout。
+    _atomic_replace_bytes(state_path, payload)
 
     return "".join(out) + "\n"
 
@@ -18491,6 +18674,22 @@ def main(argv):
     分母与累计阈值抽样均沿用 sample；选中字符的索引追加到 prefix。任一中间
     量非有限即失败。输出契约与 sample 相同，不写文件。
 
+    python seqmodel.py sample-transformer-resume MODEL START SEED
+    TEMPERATURE LENGTH STATE：除 STATE 外，MODEL、START、SEED、
+    TEMPERATURE、LENGTH 的校验与采样逐项沿用 sample-transformer，另以 STATE
+    原子读写续跑状态。STATE 缺失时以 prefix=[START 索引] 与
+    random.Random(int(SEED)) 初始化；STATE 存在时读取严格 UTF-8 JSON，顶层
+    键依次且仅为 v,sha,args,p,r：v 为 int 1，sha 为 MODEL 原始字节的小写
+    SHA-256，args 为保留原文的 [START,SEED,TEMPERATURE] 字符串数组，p 为
+    非空词表索引 list（元素为 [0,V) 内非 bool int，首项为 START 索引），
+    r 为 getstate 递归将 tuple 转 list 所得 [3,625 个非 bool int,null]。
+    摘要、args 或状态不符均失败。生成 LENGTH 步后状态写为 ASCII 转义、禁
+    非有限数的紧凑 JSON UTF-8 字节加 LF；先写全 STATE 同目录临时文件并
+    os.replace 后，stdout 才写本段文本加 LF。分段 p、q 步的文本与终态须与
+    一次 p+q 步逐字节相同；LENGTH=0 仅创建或校验 STATE 并输出 LF。失败返
+    回 2、stdout 空、stderr 恰为 "error\\n"，STATE 保持原字节或不存在，并清
+    理临时文件。
+
     python seqmodel.py score-transformer MODEL START TEXT TEMPERATURE：
     MODEL、START、TEMPERATURE 的读取与校验沿用 sample-transformer；TEXT 为
     可空 Unicode 串，逐码点均须在词表内，否则失败；无 SEED、随机源或文件
@@ -19699,6 +19898,10 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 8 and argv[1] == "sample-transformer-anneal":
             output = _sample_transformer_anneal(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 8 and argv[1] == "sample-transformer-resume":
+            output = _sample_transformer_resume(
                 argv[2], argv[3], argv[4], argv[5], argv[6], argv[7])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 9 and argv[1] == "sample-transformer-top-p":
