@@ -103,5 +103,103 @@ class SampleLstmCliTest(unittest.TestCase):
         self.assertEqual(result.stderr, b"error\n")
 
 
+def _tiny_lstm_mha_relative_model():
+    """构造一个合法的 version 5 相对 MHA 模型对象（vocab 2、H=2、2 头、R=1）。"""
+    V, H = 2, 2
+    eye = [[1.0 if a == j else 0.0 for j in range(H)] for a in range(H)]
+    return {
+        "version": 5,
+        "vocab": ["a", "b"],
+        "W": [[0.01 * (k + j + 1) for j in range(V + H)]
+              for k in range(4 * H)],
+        "b": [0.0] * (4 * H),
+        "Wq": [list(row) for row in eye],
+        "Wk": [list(row) for row in eye],
+        "Wv": [list(row) for row in eye],
+        "Wo": [list(row) for row in eye],
+        "heads": 2,
+        "bias": [[0.1, 0.0, -0.1], [0.0, 0.2, 0.0]],
+        "Why": [[0.05, -0.02], [-0.03, 0.04]],
+        "by": [0.0, 0.1],
+        "h0": [0.0, 0.0],
+        "c0": [0.0, 0.0],
+    }
+
+
+class MhaRelativeBucketStatsCliTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.model_path = os.path.join(self._tmp.name, "model.json")
+        text = json.dumps(_tiny_lstm_mha_relative_model(), ensure_ascii=True,
+                          separators=(",", ":"), allow_nan=False) + "\n"
+        with open(self.model_path, "wb") as f:
+            f.write(text.encode("utf-8"))
+        self.corpus_path = os.path.join(self._tmp.name, "corpus.txt")
+        with open(self.corpus_path, "wb") as f:
+            f.write("abbaab".encode("utf-8"))
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, _SEQMODEL, "mha-relative-bucket-stats",
+             self.model_path, self.corpus_path, *args],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def test_success_structure_and_determinism(self):
+        first = self._run("4")
+        second = self._run("4")
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(first.stderr, b"")
+        self.assertEqual(first.stdout, second.stdout)
+        self.assertTrue(first.stdout.endswith(b"\n"))
+        obj = json.loads(first.stdout.decode("utf-8"))
+        self.assertEqual(list(obj.keys()),
+                         ["version", "radius", "steps", "items", "mean"])
+        self.assertEqual(obj["version"], 1)
+        self.assertEqual(obj["radius"], 1)
+        self.assertEqual(obj["steps"], 5)
+        self.assertEqual(len(obj["items"]), 5)
+        for t, rows in enumerate(obj["items"]):
+            self.assertEqual(rows[0], t)
+            self.assertEqual([row[0] for row in rows[1]], [0, 1])
+            for _r, masses in rows[1]:
+                self.assertEqual(len(masses), 3)
+                vals = [float(v) for v in masses]
+                self.assertAlmostEqual(sum(vals), 1.0, places=12)
+        self.assertEqual([row[0] for row in obj["mean"]], [0, 1])
+        for r in range(2):
+            totals = [0.0] * 3
+            for _t, rows in obj["items"]:
+                for bj, v in enumerate(rows[r][1]):
+                    totals[bj] += float(v)
+            for bj in range(3):
+                self.assertAlmostEqual(float(obj["mean"][r][1][bj]),
+                                       totals[bj] / 5, places=12)
+
+    def test_bad_window_fails_with_error_line(self):
+        result = self._run("0")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"error\n")
+
+    def test_out_of_vocab_corpus_fails(self):
+        with open(self.corpus_path, "wb") as f:
+            f.write("abzab".encode("utf-8"))
+        result = self._run("4")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"error\n")
+
+    def test_missing_model_fails(self):
+        result = subprocess.run(
+            [sys.executable, _SEQMODEL, "mha-relative-bucket-stats",
+             os.path.join(self._tmp.name, "nope.json"), self.corpus_path,
+             "4"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"error\n")
+
+
 if __name__ == "__main__":
     unittest.main()
