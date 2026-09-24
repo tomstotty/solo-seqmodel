@@ -10,6 +10,7 @@
 TypeError。
 """
 
+import hashlib
 import json
 import math
 import os
@@ -8643,6 +8644,317 @@ def _sample_lstm_mha(model_path, start, seed_text, temperature_text,
     return "".join(out) + "\n"
 
 
+def _resume_finish_json(obj):
+    """将断点状态对象序列化为紧凑 ASCII 转义 JSON UTF-8 字节并加 LF。
+
+    恰用 json.dumps(ensure_ascii=True,separators=(',',':'),allow_nan=False)：
+    禁非有限数（NaN/Infinity 抛 ValueError），str 一律 ASCII 转义，且 float
+    的 -0.0 序列化为 "-0.0"（重新解析仍为负零，符号得以保留）。
+    """
+    text = json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+    return text.encode("utf-8")
+
+
+def _resume_atomic_write(state_path, data):
+    """在 STATE 同目录写临时文件，关闭后以 os.replace 原子替换。
+
+    替换完成前 STATE 保持原字节（或仍不存在）；任何失败都尽量清理临时文件。
+    data 为待写的完整字节。
+    """
+    out_dir = os.path.dirname(os.path.abspath(state_path))
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix=".tmp-sample-lstm-mha-resume-",
+                                        dir=out_dir)
+    replaced = False
+    try:
+        try:
+            f = os.fdopen(tmp_fd, "wb")
+        except BaseException:
+            # fdopen 失败时 fd 仍由本调用方负责关闭。
+            os.close(tmp_fd)
+            raise
+        with f:
+            f.write(data)
+        os.replace(tmp_path, state_path)
+        replaced = True
+    finally:
+        if not replaced:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def _resume_check_float_row(row, width, name):
+    """校验 m 的一行：恰 width 个有限的 type-float，返回其副本。
+
+    -0.0 是有限 float，允许（h0 等可携带负零，序列化保留其符号）；NaN 与
+    ±Infinity 拒绝。int 与 bool 一律拒绝。
+    """
+    if type(row) is not list or len(row) != width:
+        raise ValueError("%s rows must be lists of length %d" % (name, width))
+    checked = []
+    for v in row:
+        if type(v) is not float or not math.isfinite(v):
+            raise ValueError(
+                "%s entries must be finite floats, got %r" % (name, v))
+        checked.append(v)
+    return checked
+
+
+def _resume_load_state(state_path, model_sha, H, V,
+                       start, seed_text, temperature_text, window_text):
+    """读取并严格校验 STATE，返回恢复出的 (c, x, memory, rng)。
+
+    文件须为严格 UTF-8 的 JSON 对象；顶层键恰且依次为 v,sha,args,c,x,m,r。
+    类型、形状、有限性、sha/args 摘要不符，或随机状态无法无损
+    往返（setstate 后 getstate 逐值不一致）均抛 ValueError。-0.0 为有限值，
+    允许并原样保留符号。
+    """
+    with open(state_path, "rb") as f:
+        raw = f.read()
+    pairs = json.loads(raw.decode("utf-8"), object_pairs_hook=list)
+    if type(pairs) is not list:
+        raise ValueError("state root must be a JSON object")
+    keys = ["v", "sha", "args", "c", "x", "m", "r"]
+    if len(pairs) != len(keys):
+        raise ValueError("state must have exactly 7 top-level keys")
+    for pair, key in zip(pairs, keys):
+        if type(pair) is not tuple or len(pair) != 2 or pair[0] != key:
+            raise ValueError("state keys must be exactly %r in order" % keys)
+    st = dict(pairs)
+
+    # v：恰为 int 1（bool 拒）。
+    v = st["v"]
+    if type(v) is bool or type(v) is not int or v != 1:
+        raise ValueError("state v must be exactly non-bool int 1")
+
+    # sha：MODEL 字节的小写十六进制 SHA-256（64 位 0-9a-f）。
+    sha = st["sha"]
+    if (type(sha) is not str or len(sha) != 64
+            or not re.fullmatch(r"[0-9a-f]{64}", sha)):
+        raise ValueError("state sha must be 64 lowercase hex chars")
+    if sha != model_sha:
+        raise ValueError("state sha does not match MODEL bytes")
+
+    # args：恰为原文 str 数组 [START, SEED, TEMPERATURE, WINDOW]。
+    args = st["args"]
+    expected_args = [start, seed_text, temperature_text, window_text]
+    if (type(args) is not list or len(args) != 4
+            or any(type(a) is not str for a in args)
+            or args != expected_args):
+        raise ValueError("state args must be exactly [START,SEED,"
+                         "TEMPERATURE,WINDOW] original strings")
+
+    # c：H 长 float 列表，有限（-0.0 允许，其为有限值）。
+    c_in = st["c"]
+    if type(c_in) is not list or len(c_in) != H:
+        raise ValueError("state c must be a list of length %d" % H)
+    c = []
+    for cv in c_in:
+        if type(cv) is not float or not math.isfinite(cv):
+            raise ValueError(
+                "state c entries must be finite floats, got %r" % (cv,))
+        c.append(cv)
+
+    # x：[0,V) 内非 bool int。
+    x = st["x"]
+    if type(x) is bool or type(x) is not int or not (0 <= x < V):
+        raise ValueError("state x must be a non-bool int in [0, V)")
+
+    # m：旧到新的非空 H 列 float 矩阵；末行为待恢复的 h。
+    m_in = st["m"]
+    if type(m_in) is not list or len(m_in) == 0:
+        raise ValueError("state m must be a non-empty matrix")
+    memory = [_resume_check_float_row(row, H, "state m") for row in m_in]
+
+    # r：getstate 递归将 tuple 转 list 所得 [3, 625 个非 bool int, null]。
+    r = st["r"]
+    if type(r) is not list or len(r) != 3:
+        raise ValueError("state r must be a 3-element list")
+    r_version, r_words, r_gauss = r[0], r[1], r[2]
+    if type(r_version) is bool or type(r_version) is not int or r_version != 3:
+        raise ValueError("state r version must be non-bool int 3")
+    if type(r_words) is not list or len(r_words) != 625:
+        raise ValueError("state r internal state must have 625 ints")
+    for wv in r_words:
+        if type(wv) is bool or type(wv) is not int:
+            raise ValueError("state r internal entries must be non-bool ints")
+    if r_gauss is not None:
+        raise ValueError("state r gauss-next must be null")
+
+    # 随机状态无损往返校验：拒绝实现不接受、被静默改写（归一化）或还原后
+    # 不能逐值复现的状态。先在临时 Random 上 setstate，再要求 getstate 与
+    # 文件内状态逐值相等。
+    probe = random.Random(0)
+    probe.setstate((r_version, tuple(r_words), r_gauss))
+    got = probe.getstate()
+    if got[0] != r_version or got[2] != r_gauss or list(got[1]) != r_words:
+        raise ValueError("state r failed lossless round-trip")
+
+    return c, x, memory, probe
+
+
+def _resume_build_state(v, sha, args, c, x, memory, rng):
+    """由当前运行态构造待序列化的断点状态对象（tuple 递归转 list）。"""
+    rs = rng.getstate()
+    return {
+        "v": v,
+        "sha": sha,
+        "args": list(args),
+        "c": [float(v) for v in c],
+        "x": int(x),
+        # m 为旧到新的 memory 行；末行恰为当前 h。
+        "m": [[float(v) for v in row] for row in memory],
+        "r": [rs[0], list(rs[1]), rs[2]],
+    }
+
+
+def _sample_lstm_mha_resume(model_path, start, seed_text, temperature_text,
+                            length_text, window_text, state_path):
+    """可断点续采的 sample-lstm-mha：采样 LENGTH 步并原子写出状态文件。
+
+    MODEL、START、SEED、TEMPERATURE、LENGTH、WINDOW 的读取、词法、唯一随机
+    源、LSTM/MHA 推进、温度 softmax、词表升序阈值抽样及输出契约均沿用
+    sample-lstm-mha；额外在采样后把断点状态原子写入 STATE。
+
+    STATE 缺失时从初态（h=h0、c=c0、x=START 索引、memory=[h0]）与
+    r=random.Random(int(SEED)) 初始化；STATE 存在时读取 UTF-8 JSON 恢复。
+    顶层键依次且仅为 v,sha,args,c,x,m,r：v 为 int 1；sha 为 MODEL 字节的
+    小写 SHA-256；args 为原文 [START,SEED,TEMPERATURE,WINDOW]；c 为 H 长
+    float 列表；x 为 [0,V) 内非 bool int；m 为旧到新的非空 H 列 float 矩阵
+    且末行为当前 h；r 为 getstate() 递归把 tuple 转 list 所得
+    [3,625 个非 bool int,null]。类型、形状、有限性、摘要、args 或随机状态
+    不符均失败。
+
+    生成 LENGTH 步后，状态写为 ASCII 转义、禁非有限数、保留 -0.0 的紧凑
+    JSON UTF-8 字节加 LF；写全同目录临时文件并 os.replace 后，stdout 才写
+    本段文本加 LF。分段生成 p、q 步与一次 p+q 步的文本与终态逐字节相同；
+    LENGTH=0 时创建或校验状态，stdout 仅一个 LF。任何失败返回 2、stdout
+    为空、stderr 恰为 "error\\n"，STATE 保持原字节或不存在，临时文件被清理。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    # 先读 MODEL 原始字节（用于 sha）并装载，二者均须成功才可能触碰 STATE。
+    with open(model_path, "rb") as f:
+        model_raw = f.read()
+    model_sha = hashlib.sha256(model_raw).hexdigest()
+
+    (vocab, W, b, Wq, Wk, Wv, Wo, heads,
+     Why, by, h0, c0) = _load_perplexity_lstm_mha_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # TEMPERATURE：float() 可解析且有限、严格大于 0。
+    temperature = float(temperature_text)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    cell = _lstm_cell_loaded(V, H, W, b)
+    mha = _mha_loaded(H, heads, Wq, Wk, Wv, Wo)
+
+    args = [start, seed_text, temperature_text, window_text]
+
+    state_existed = os.path.exists(state_path)
+    if state_existed:
+        # 恢复：所有校验在任何写操作之前完成；失败时 STATE 字节不变。
+        c, x, memory, rng = _resume_load_state(
+            state_path, model_sha, H, V,
+            start, seed_text, temperature_text, window_text)
+        # h 恰为 m（memory）末行。
+        h = list(memory[-1])
+    else:
+        # 初态：整次调用对 random.Random 的唯一一次构造即此处。h0、c0 的元素
+        # 经模型装载允许为 int，这里统一转 float，与持久化后再恢复的状态表示
+        # 逐值、逐类型一致（float 运算下与原值位等价）。
+        rng = random.Random(seed)
+        memory = [[float(v) for v in h0]]
+        h = [float(v) for v in h0]
+        c = [float(v) for v in c0]
+        x = vocab.index(start)
+
+    out = []
+
+    for _t in range(length):
+        # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+        xvec = [0.0] * V
+        xvec[x] = 1.0
+        h, c = cell.forward(xvec, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        u = _mha_cross_context(h, M, mha)
+
+        # logit 仅以 u 替代 h；下标与累加顺序同 _sample_lstm。
+        z = _output_logits(Why, by, u)
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # u=r.random()*d；自 0.0 依 k 升序累加 e_k，选首个累计值严格大于
+        # u 者；无则取词表末项。
+        threshold = rng.random() * d
+        if not math.isfinite(threshold):
+            raise ValueError("sample threshold became non-finite")
+        chosen = V - 1
+        cum = 0.0
+        for k in range(V):
+            cum += e[k]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > threshold:
+                chosen = k
+                break
+
+        out.append(vocab[chosen])
+        x = chosen
+        memory.append([float(v) for v in h])
+
+    # 构造并序列化状态（非有限数会在此抛错）；先完成原子替换，再写 stdout。
+    state_obj = _resume_build_state(1, model_sha, args, c, x, memory, rng)
+    data = _resume_finish_json(state_obj)
+    _resume_atomic_write(state_path, data)
+
+    return "".join(out) + "\n"
+
+
 def _sample_lstm_mha_anneal(model_path, start, seed_text, start_t_text,
                             end_t_text, length_text, window_text):
     """以线性退火温度、带投影多头交叉注意力从 version 4 的 LSTM-MHA 模型采样。
@@ -12855,6 +13167,23 @@ def main(argv):
     整次仅构造一次 random.Random(int(SEED))；任一中间量非有限即失败；输出
     契约与 sample 相同，不写文件。
 
+    python seqmodel.py sample-lstm-mha-resume MODEL START SEED TEMPERATURE
+    LENGTH WINDOW STATE：前六参数的读取、词法、LSTM/MHA 推进、唯一随机源、
+    温度 softmax、词表升序阈值抽样与输出均沿用 sample-lstm-mha，另把断点
+    状态原子写入 STATE。STATE 缺失时从初态（h=h0、c=c0、x=START 索引、
+    memory=[h0]）与 r=random.Random(int(SEED)) 初始化；存在时读取 UTF-8
+    JSON 恢复。顶层键依次且仅为 v,sha,args,c,x,m,r：v 为 int 1；sha 为
+    MODEL 字节的小写 SHA-256；args 为原文 str 数组
+    [START,SEED,TEMPERATURE,WINDOW]；c 为 H 长 float 列表；x 为 [0,V) 内
+    非 bool int；m 为旧到新的非空 H 列 float 矩阵且末行为当前 h；r 为
+    getstate() 递归把 tuple 转 list 所得 [3,625 个非 bool int,null]。类型、
+    形状、有限性、sha/args 摘要或随机状态无损往返不符均失败。生成 LENGTH 步
+    后状态写为 ASCII 转义、禁非有限数、保留 -0.0 的紧凑 JSON UTF-8 字节加
+    LF；写全 STATE 同目录临时文件并 os.replace 后，stdout 才写本段文本加
+    LF。分段 p、q 步与一次 p+q 步的文本与终态逐字节相同；LENGTH=0 时创建
+    或校验状态且仅输出 LF。任何失败返回 2、stdout 为空、stderr 恰为
+    "error\\n"，STATE 保持原字节或不存在，并清理临时文件。
+
     python seqmodel.py sample-lstm-mha-anneal MODEL START SEED START_T
     END_T LENGTH WINDOW：以线性退火温度、带投影多头交叉注意力从 version 4
     的 LSTM-MHA 模型采样。MODEL、START、SEED、LENGTH、WINDOW 的校验及
@@ -13409,6 +13738,11 @@ def main(argv):
         elif len(argv) == 8 and argv[1] == "sample-lstm-mha":
             output = _sample_lstm_mha(argv[2], argv[3], argv[4], argv[5],
                                       argv[6], argv[7])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 9 and argv[1] == "sample-lstm-mha-resume":
+            output = _sample_lstm_mha_resume(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                argv[8])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 9 and argv[1] == "sample-lstm-mha-anneal":
             output = _sample_lstm_mha_anneal(argv[2], argv[3], argv[4],
