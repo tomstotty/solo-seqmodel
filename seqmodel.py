@@ -6359,6 +6359,128 @@ def _perplexity_lstm_mha(model_path, corpus_path, window_text):
     return format(perplexity, ".17g") + "\n"
 
 
+def _mha_head_stats(model_path, corpus_path, window_text):
+    """perplexity-lstm-mha 各头每步注意力熵与回望距离，返回待写出的字符串。
+
+    MODEL、CORPUS、WINDOW 的校验、h/c 推进、memory 截取与
+    MHA.forward_cross([h], M, None) 完全沿用 _perplexity_lstm_mha，但不
+    计算输出层与负对数似然（它们不影响状态）。令 T=语料码点数-1；t 升序
+    先以当前字符 one-hot 调用 LSTMCell.forward 更新 h、c，在向 memory
+    追加 h 前 M 取 memory 末尾至多 WINDOW 项（从旧到新），以
+    mha.forward_cross([h], M, None) 取 w（heads×1×len(M)）。每头 r 令
+    e=0.0、lag=0.0，按 j 升序累加 e-=w[r][0][j]*log(w[r][0][j])（w 恰为
+    0.0 时贡献 0.0，不取对数）与 lag+=w[r][0][j]*float(len(M)-j)，再按
+    t 升序令 E[r]+=e、A[r]+=lag。任一 log、乘加或 E[r]/T、A[r]/T 非有限
+    均抛 ValueError。构造 JSON 对象：顶层键序恰为 version,items,mean；
+    version 为 int 1；items 为 T 长列表，第 t 项为 [t, rows]，rows 按
+    r 升序、每项为 [r, format(e,'.17g'), format(lag,'.17g')]；mean 按
+    r 升序、每项为 [r, format(E[r]/T,'.17g'), format(A[r]/T,'.17g')]。返回
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n'，不写文件。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    (vocab, W, b, Wq, Wk, Wv, Wo, heads,
+     Why, by, h0, c0) = _load_perplexity_lstm_mha_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    mha = MHA(H, heads)
+    mha.Wq = [list(row) for row in Wq]
+    mha.Wk = [list(row) for row in Wk]
+    mha.Wv = [list(row) for row in Wv]
+    mha.Wo = [list(row) for row in Wo]
+
+    # 记忆序列 [h0, h_0, ..., h_{t-1}]；h0 保留模型原值（F 允许 int），
+    # forward_cross 会先复制再投影；各步 h 本就是 float。
+    memory = [h0]
+    h = list(h0)
+    c = list(c0)
+    T = len(ids) - 1
+    E = [0.0] * heads
+    A = [0.0] * heads
+    items = []
+    for t in range(T):
+        # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c = cell.forward(x, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        _ctx, w = mha.forward_cross([h], M, None)
+        n_mem = len(M)
+
+        # 每头 r：e、lag 自 0.0 起按 j 升序累加；w 恰为 0.0 时熵贡献 0.0
+        # （不取对数）。
+        rows = []
+        for r in range(heads):
+            wr = w[r][0]
+            e = 0.0
+            lag = 0.0
+            for j in range(n_mem):
+                wj = wr[j]
+                if wj != 0.0:
+                    lj = math.log(wj)
+                    if not math.isfinite(lj):
+                        raise ValueError("entropy log became non-finite")
+                    e -= wj * lj
+                    if not math.isfinite(e):
+                        raise ValueError(
+                            "entropy accumulated to a non-finite value")
+                lag += wj * float(n_mem - j)
+                if not math.isfinite(lag):
+                    raise ValueError("lag accumulated to a non-finite value")
+            E[r] += e
+            if not math.isfinite(E[r]):
+                raise ValueError(
+                    "total entropy accumulated to a non-finite value")
+            A[r] += lag
+            if not math.isfinite(A[r]):
+                raise ValueError(
+                    "total lag accumulated to a non-finite value")
+            rows.append([r, format(e, ".17g"), format(lag, ".17g")])
+        items.append([t, rows])
+
+        memory.append([float(v) for v in h])
+
+    mean = []
+    for r in range(heads):
+        me = E[r] / T
+        if not math.isfinite(me):
+            raise ValueError("mean entropy is non-finite")
+        ma = A[r] / T
+        if not math.isfinite(ma):
+            raise ValueError("mean lag is non-finite")
+        mean.append([r, format(me, ".17g"), format(ma, ".17g")])
+
+    obj = {
+        "version": 1,
+        "items": items,
+        "mean": mean,
+    }
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+
+
 def _perplexity_gru_attn(model_path, corpus_path, window_text):
     """GRU 加注意力上下文的困惑度，返回待写出的字符串。
 
@@ -13704,6 +13826,9 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 5 and argv[1] == "lstm-attn-mean-lag":
             output = _lstm_attn_mean_lag(argv[2], argv[3], argv[4])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 5 and argv[1] == "mha-head-stats":
+            output = _mha_head_stats(argv[2], argv[3], argv[4])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 6 and argv[1] == "lstm-attn-reach":
             output = _lstm_attn_reach(argv[2], argv[3], argv[4], argv[5])
