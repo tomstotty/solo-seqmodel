@@ -7357,6 +7357,178 @@ def _sample_transformer_top_k_top_p(model_path, start, seed_text,
     return "".join(out) + "\n"
 
 
+def _beam_transformer(model_path, start, start_t_text, end_t_text,
+                      beam_text, length_text):
+    """以线性退火温度对单层 Transformer 块语言模型做定向束搜索。
+
+    除 BEAM 与选束外，MODEL、START、START_T、END_T、LENGTH 的校验，以及
+    LENGTH 的 0/1 语义、prefix 的 one-hot 输入、因果 mask、
+    TransformerBlock.forward、Why/by 仿射、线性温度退火、稳定 softmax 的求
+    值次序与有限性失败契约均沿用 _sample_transformer_anneal；本命令无 SEED
+    或任何随机源，不写任何文件。BEAM 整串匹配 [1-9][0-9]*，超长合法，且无
+    须不超过词表大小。
+
+    初始束恰为 (0.0, "", [START 索引], ())：分数、文本、prefix 索引列表、
+    索引元组。第 t 轮各束沿上轮保留次序，分别按原顺序求 a_k=z_k/T、
+    m=max(a)、e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加；该束每个 k 生成一个
+    子束，分数加 a_k-m-log(d)（即对数概率），文本追加 vocab[k]，prefix 列
+    表与索引元组分别追加 k。任一新运算量非有限均抛 ValueError。
+
+    全部子束按 (-分数, 索引元组) 升序排列（分数降序、并列时元组字典序升序
+    ），保留前 min(BEAM, 候选数) 项；BEAM 不预先转 int：每轮以十进制位数及
+    同长字典序与候选数的十进制文本比较，仅当 BEAM 更小时才 int() 截断，否
+    则全保留。不作长度归一化。成功时 LENGTH=0 返回仅一个 LF，否则返回最终
+    首束文本加一个 LF。
+    """
+    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
+        _load_perplexity_transformer_model(model_path)
+    V = len(vocab)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # START_T、END_T：float() 可解析且有限、严格大于 0。
+    start_t = float(start_t_text)
+    if not math.isfinite(start_t) or start_t <= 0.0:
+        raise ValueError("START_T must be a finite positive float")
+    end_t = float(end_t_text)
+    if not math.isfinite(end_t) or end_t <= 0.0:
+        raise ValueError("END_T must be a finite positive float")
+
+    # BEAM：整串匹配正整数词法（禁止空白、+ 前缀、前导零、下划线）；超长
+    # 合法，且不要求 BEAM<=V。每轮仅在其小于候选数时才 int()，故任何位数
+    # 文本都不会在截断前触发大整数转换。
+    if not _WINDOW_RE.match(beam_text):
+        raise ValueError("BEAM must match [1-9][0-9]*")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    if length == 1:
+        # 仅用 START_T，不求值退火表达式。
+        def temperature_at(t):
+            return start_t
+    elif length >= 2:
+        def temperature_at(t):
+            # 严格按 START_T+(END_T-START_T)*t/(LENGTH-1) 的运算顺序求值。
+            temp = start_t + (end_t - start_t) * t / (length - 1)
+            if not math.isfinite(temp) or temp <= 0.0:
+                raise ValueError(
+                    "annealed temperature became non-finite or non-positive")
+            return temp
+    else:
+        temperature_at = None  # LENGTH 为 0：循环不执行，不计算温度。
+
+    block = TransformerBlock(V, heads, P)
+    block.attn.Wq = [list(row) for row in Wq]
+    block.attn.Wk = [list(row) for row in Wk]
+    block.attn.Wv = [list(row) for row in Wv]
+    block.attn.Wo = [list(row) for row in Wo]
+    block.W1 = [list(row) for row in W1]
+    block.b1 = list(b1)
+    block.W2 = [list(row) for row in W2]
+    block.b2 = list(b2)
+
+    # (分数, 文本, prefix 索引列表, 索引元组)；元组仅供并列时字典序比较。
+    beams = [(0.0, "", [vocab.index(start)], ())]
+    beam_limit = None  # 仅在 BEAM 首次小于候选数时惰性 int()。
+
+    for t in range(length):
+        temperature = temperature_at(t)
+        candidates = []
+
+        # 各束沿原次序独立前向；TransformerBlock.forward 不修改参数，可共用。
+        for score, text, prefix, indices in beams:
+            L = len(prefix)
+
+            # L×V one-hot 输入，第 i 行仅 prefix[i] 列为 1.0。
+            x = [[0.0] * V for _ in range(L)]
+            for i in range(L):
+                x[i][prefix[i]] = 1.0
+
+            # 因果掩码：mask[i][j] = (j <= i)。
+            mask = [[j <= i for j in range(L)] for i in range(L)]
+
+            # TransformerBlock.forward 自身校验非有限并抛 ValueError。
+            y_all = block.forward(x, mask)[0]
+            y = y_all[-1]
+
+            # z_k = by_k + Σ_j Why_k,j*y_j，依 j 升序自 float 偏置累加。
+            z = [0.0] * V
+            for k in range(V):
+                acc = float(by[k])
+                why_row = Why[k]
+                for j in range(V):
+                    acc += why_row[j] * y[j]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "output affine accumulated non-finitely")
+                z[k] = acc
+
+            # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+            a = [0.0] * V
+            m = None
+            for k in range(V):
+                ak = z[k] / temperature
+                if not math.isfinite(ak):
+                    raise ValueError("scaled logit became non-finite")
+                a[k] = ak
+                if m is None or ak > m:
+                    m = ak
+            e = [0.0] * V
+            d = 0.0
+            for k in range(V):
+                try:
+                    ek = math.exp(a[k] - m)
+                except OverflowError:
+                    raise ValueError("softmax exp overflowed")
+                if not math.isfinite(ek):
+                    raise ValueError("softmax exp became non-finite")
+                e[k] = ek
+                d += ek
+                if not math.isfinite(d):
+                    raise ValueError(
+                        "softmax denominator accumulated non-finitely")
+
+            # log(d)：d>=e_argmax=1 必为正有限，仍显式校验有限性。
+            log_d = math.log(d)
+            if not math.isfinite(log_d):
+                raise ValueError("log-partition became non-finite")
+
+            # 每个 k 生成子束；新分数 = 旧分数 + (a_k-m) - log(d)，严格自
+            # 左向右结合，文本、prefix、索引元组各追加 k。
+            for k in range(V):
+                new_score = score + (a[k] - m) - log_d
+                if not math.isfinite(new_score):
+                    raise ValueError("beam score accumulated non-finitely")
+                candidates.append((
+                    new_score,
+                    text + vocab[k],
+                    prefix + [k],
+                    indices + (k,),
+                ))
+
+        # (-分数, 索引元组) 升序：分数降序、并列时元组字典序升序。
+        candidates.sort(key=lambda beam: (-beam[0], beam[3]))
+
+        # 以十进制位数、同长字典序与候选数比较；仅 BEAM 更小时才 int() 截断
+        # ，相等或更大时全保留（min(BEAM, 候选数) 语义）。
+        count_text = str(len(candidates))
+        if len(beam_text) < len(count_text) or (
+                len(beam_text) == len(count_text)
+                and beam_text < count_text):
+            if beam_limit is None:
+                beam_limit = int(beam_text)
+            beams = candidates[:beam_limit]
+        else:
+            beams = candidates
+
+    return beams[0][1] + "\n"
+
+
 _GRU_MODEL_KEYS = ["version", "vocab", "W", "b", "Why", "by", "h0"]
 
 
@@ -19413,6 +19585,10 @@ def main(argv):
             output = _sample_transformer_top_k_top_p(
                 argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
                 argv[8], argv[9])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 8 and argv[1] == "beam-transformer":
+            output = _beam_transformer(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7])
             sys.stdout.buffer.write(output.encode("utf-8"))
         else:
             raise ValueError(
