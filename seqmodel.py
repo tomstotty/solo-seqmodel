@@ -7476,28 +7476,35 @@ def _sample_transformer_top_k(model_path, start, seed_text, start_t_text,
     return "".join(out) + "\n"
 
 
-def _sample_transformer_top_k_top_p(model_path, start, seed_text,
-                                    start_t_text, end_t_text, top_k_text,
-                                    top_p_text, length_text):
-    """以线性退火温度、top-k 截断后 top-p 核选样从单层 Transformer 采样。
+def _sample_transformer_top_k_top_p_run(model_path, start, seed_text,
+                                        start_t_text, end_t_text, top_k_text,
+                                        top_p_text, length_text):
+    """sample-transformer-top-k-top-p 与 -scored 共享的采样核心。
+
+    校验、prefix 的 one-hot 输入、因果 mask、TransformerBlock.forward、
+    Why/by 仿射、线性温度退火、top-k 截断后 top-p 前缀截取、唯一随机源的
+    初始化与消费、选索引规则、prefix 状态更新与有限性失败契约均与
+    _sample_transformer_top_k_top_p 文档一致。返回
+    (text, logprobs, total)：text 为生成字符串（不含尾随 LF）；logprobs
+    为每步选中索引 k 对应的 a[k]-m-log(s)（s 为最终前缀质量）；total 自
+    0.0 按 t 升序累加各 lp。任一 lp 或 total 非有限均抛 ValueError。
 
     除 TOP_P 与下述选样外，MODEL、START、SEED、START_T、END_T、LENGTH 的
-    校验，以及 LENGTH 的 0/1 语义、prefix 的 one-hot 输入、因果 mask、
-    TransformerBlock.forward、Why/by 仿射、线性温度退火、唯一随机源、prefix
-    状态更新与有限性失败契约均沿用 _sample_transformer_top_k；不写任何文件。
-    TOP_K 整串匹配 [1-9][0-9]*，且数学值 K 不超过 V=len(vocab)：先按十进制
-    位数及同长度字典序与 str(V) 比较，越界即失败，通过后才转 int，任意位数
-    文本都不触发整数转换异常。TOP_P 经 float() 解析，结果须有限且
-    0<TOP_P<=1，否则抛 ValueError。
+    校验，以及 LENGTH 的 0/1 语义、Transformer 前向、线性温度退火、唯一
+    随机源、prefix 状态更新与有限性错误协议均沿用 _sample_transformer_top_k
+    ；不写任何文件。TOP_K 整串匹配 [1-9][0-9]*，且数学值 K 不超过
+    V=len(vocab)：先按十进制位数及同长度字典序与 str(V) 比较，越界即失
+    败，通过后才转 int，任意位数文本都不触发整数转换异常。TOP_P 经
+    float() 解析，结果须有限且 0<TOP_P<=1，否则抛 ValueError。
 
     每步先按原顺序求 a_k=z_k/T、m=max(a)、e_k=exp(a_k-m)。再将索引按
     (-e_k, k) 升序排列（e 降序、并列时 k 升序），候选恰为该序前 K 项；sK
     自 0.0 按候选序累加 e，令 target=TOP_P*sK。再按候选序自 0.0 累加 e，
     保留首个使累计值 >=target 的最短前缀，s 为其累计和（与 sK 同序累加，
-    末项累计恰为 sK>=target，前缀必然存在）。令 u=r.random()*s，按前缀顺序
-    自 0.0 累加 e，选首个累计值严格大于 u 的索引；无则取前缀末项。选中字符
-    追加到输出，其索引追加到 prefix。任一新增运算非有限均抛 ValueError。成
-    功返回 LENGTH 个码点再加一个 LF。
+    末项累计恰为 sK>=target，前缀必然存在）。令 u=r.random()*s，按前缀顺
+    序自 0.0 累加 e，选首个累计值严格大于 u 的索引；无则取前缀末项。选中
+    字符追加到输出，其索引追加到 prefix。任一新增运算非有限均抛
+    ValueError。
     """
     (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
         _load_perplexity_transformer_model(model_path)
@@ -7559,6 +7566,8 @@ def _sample_transformer_top_k_top_p(model_path, start, seed_text,
     rng = random.Random(seed)
     prefix = [vocab.index(start)]
     out = []
+    logprobs = []
+    total = 0.0
 
     block = TransformerBlock(V, heads, P)
     block.attn.Wq = [list(row) for row in Wq]
@@ -7659,10 +7668,66 @@ def _sample_transformer_top_k_top_p(model_path, start, seed_text,
                 chosen = idx
                 break
 
+        # 选中索引 k 后，以既有 a、m 与最终前缀质量 s 计算选中项对数概
+        # 率，total 自 0.0 按 t 升序累加；任一结果非有限即失败。
+        lp = a[chosen] - m - math.log(s)
+        if not math.isfinite(lp):
+            raise ValueError("selected log-prob became non-finite")
+        total += lp
+        if not math.isfinite(total):
+            raise ValueError("total log-prob accumulated non-finitely")
+        logprobs.append(lp)
+
         out.append(vocab[chosen])
         prefix.append(chosen)
 
-    return "".join(out) + "\n"
+    return "".join(out), logprobs, total
+
+
+def _sample_transformer_top_k_top_p(model_path, start, seed_text,
+                                    start_t_text, end_t_text, top_k_text,
+                                    top_p_text, length_text):
+    """sample-transformer-top-k-top-p：成功返回 LENGTH 个码点再加一个 LF。
+
+    采样与校验全部沿用 _sample_transformer_top_k_top_p_run，本包装仅取其
+    生成文本。
+    """
+    text, _logprobs, _total = _sample_transformer_top_k_top_p_run(
+        model_path, start, seed_text, start_t_text, end_t_text, top_k_text,
+        top_p_text, length_text)
+    return text + "\n"
+
+
+def _sample_transformer_top_k_top_p_scored(model_path, start, seed_text,
+                                           start_t_text, end_t_text,
+                                           top_k_text, top_p_text,
+                                           length_text):
+    """sample-transformer-top-k-top-p-scored：文本、逐步对数概率与累计值。
+
+    除输出与下述计分外，全部校验、LENGTH 的 0/1 语义、Transformer 前向、
+    Why/by 仿射、线性温度退火、top-k 截断后 top-p 前缀截取、唯一随机源的
+    初始化与消费、选索引规则、prefix 状态更新及错误协议均沿用
+    sample-transformer-top-k-top-p；同参须消费相同随机序列并生成与原入口
+    一致的 text。每步选中索引 k 后，以既有 a、m 和最终前缀质量 s 计算
+    lp=a[k]-m-log(s)；total 从 0.0 按 t 升序累加 lp，任一结果非有限即失
+    败。stdout 恰为单个 JSON 对象加 LF，键序
+    text,logprobs,total_logprob；text 为生成字符串（不含尾随 LF），
+    logprobs 为 LENGTH 长字符串列表、第 t 项为 format(lp,'.17g')，
+    total_logprob 为 format(total,'.17g')；LENGTH 为 0 时三值依次为
+    ""、[]、"0"。序列化恰用
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n' 的 UTF-8 字节。不写文件。
+    """
+    text, logprobs, total = _sample_transformer_top_k_top_p_run(
+        model_path, start, seed_text, start_t_text, end_t_text, top_k_text,
+        top_p_text, length_text)
+    obj = {
+        "text": text,
+        "logprobs": [format(lp, ".17g") for lp in logprobs],
+        "total_logprob": format(total, ".17g"),
+    }
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
 
 
 def _beam_transformer(model_path, start, start_t_text, end_t_text,
@@ -18752,6 +18817,20 @@ def main(argv):
     无则取前缀末项；以该字符更新输出和 prefix。新增运算非有限即失败。输
     出契约与 sample 相同，不写文件。
 
+    python seqmodel.py sample-transformer-top-k-top-p-scored MODEL START
+    SEED START_T END_T TOP_K TOP_P LENGTH：除输出与下述计分外，全部校
+    验、LENGTH 的 0/1 语义、Transformer 前向、线性温度退火、top-k 截断
+    后 top-p 前缀截取、唯一随机源的初始化与消费、选索引规则、prefix 状
+    态更新及成败协议均沿用 sample-transformer-top-k-top-p；同参 text 与
+    随机序列须逐项相同。每步选中索引 k 后，以既有 a、m 与最终前缀质量 s
+    算 lp=a[k]-m-math.log(s)，total 从 0.0 按 t 升序累加 lp，任一结果非
+    有限即失败。stdout 恰为单个 JSON 对象加 LF，键序
+    text,logprobs,total_logprob；text 为生成串（不含尾随 LF），logprobs
+    为 LENGTH 长的 format(lp,'.17g') 字符串列表，total_logprob 为
+    format(total,'.17g')；LENGTH=0 时三值依次为 ""、[]、"0"。序列化恰用
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\n' 的 UTF-8 字节，不写文件。
+
     python seqmodel.py sample-lstm MODEL START SEED TEMPERATURE LENGTH：
     MODEL 为 version 2 的 LSTM 模型（键 version、vocab、W、b、Why、by、
     h0、c0），置 h=h0、c=c0、x=START 索引，每步以 x 的 V 长 one-hot 调用
@@ -19917,6 +19996,12 @@ def main(argv):
         elif (len(argv) == 10
               and argv[1] == "sample-transformer-top-k-top-p"):
             output = _sample_transformer_top_k_top_p(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                argv[8], argv[9])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif (len(argv) == 10
+              and argv[1] == "sample-transformer-top-k-top-p-scored"):
+            output = _sample_transformer_top_k_top_p_scored(
                 argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
                 argv[8], argv[9])
             sys.stdout.buffer.write(output.encode("utf-8"))
