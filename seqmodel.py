@@ -6309,6 +6309,133 @@ def _perplexity_transformer(model_path, corpus_path):
     return format(perplexity, ".17g") + "\n"
 
 
+def _safe_window_min(window_text, limit):
+    """安全求 min(WINDOW, limit)，不先把无界窗口文本转为无界整数。
+
+    WINDOW 为已通过 _WINDOW_RE 词法校验的 [1-9][0-9]* 文本（任意位数均
+    合法）；limit 为正 int。以十进制位数、同位数按字典序与 str(limit)
+    比较：window_text 更大即取 limit，否则仅在此时 int(window_text)
+    （其位数不超过 str(limit)，不触发整数文本位数上限）。
+    """
+    limit_text = str(limit)
+    # 位数多者数值大；同位数则字典序与数值序一致（两者均无前导零）。
+    if len(window_text) > len(limit_text) or (
+            len(window_text) == len(limit_text)
+            and window_text >= limit_text):
+        return limit
+    return int(window_text)
+
+
+def _perplexity_transformer_window(model_path, corpus_path, window_text):
+    """有限上下文版本的 perplexity-transformer，返回待写出的字符串。
+
+    MODEL、CORPUS 完全沿用 perplexity-transformer（version 6 十四键严格
+    JSON、F、形状、heads 整除 V、严格 UTF-8 语料至少 2 码点且无表外字符）；
+    WINDOW 整串匹配 [1-9][0-9]*（任意位数均合法，不先转无界整数），否则
+    抛 ValueError。
+
+    令 T=len(CORPUS)-1、L=0.0。t 升序：以十进制位数和同长字典序安全求
+    n=min(WINDOW,t+1)、s=t+1-n；用语料索引 [s:t+1] 的 n 个字符构造 n×V
+    one-hot 与 n×n 因果 mask（mask[i][j]=(j<=i)），将 Wq、Wk、Wv、Wo、
+    W1、b1、W2、b2 装入 TransformerBlock(V, heads, P) 后以 (x, mask)
+    前向，仅取末行 y[n-1]（对应全局位置 t）；每个 t 重新构造窗口序列并
+    独立前向，不复用任何窗外状态。logit 与损失完全沿用
+    perplexity-transformer：自 float(by[k]) 按 j 升序累加
+    Why_k,j*h_j 得 z，减最大值的稳定 log-sum-exp 按 k 升序累加分母，下一
+    字符 NLL 按 t、k、j 的同样下标与累加顺序加至 L。
+
+    WINDOW 数学值不小于 T 时，各 t 的末行与整序列前向的对应行逐元素
+    相同（注意力对每一行只依赖该行及其之前的行，FFN 逐行独立），故输出
+    与 perplexity-transformer 逐字节相同；较小窗口只在每个 t 独立截断，
+    不携带任何跨 t 状态。任一中间量非有限（含最终 exp(L/T) 溢出）均抛
+    ValueError。成功返回 format(exp(L/T), '.17g') + '\\n'。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
+        _load_perplexity_transformer_model(model_path)
+    V = len(vocab)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    T = len(ids) - 1
+
+    block = TransformerBlock(V, heads, P)
+    block.attn.Wq = [list(row) for row in Wq]
+    block.attn.Wk = [list(row) for row in Wk]
+    block.attn.Wv = [list(row) for row in Wv]
+    block.attn.Wo = [list(row) for row in Wo]
+    block.W1 = [list(row) for row in W1]
+    block.b1 = list(b1)
+    block.W2 = [list(row) for row in W2]
+    block.b2 = list(b2)
+
+    L = 0.0
+    for t in range(T):
+        target = ids[t + 1]
+
+        # 安全求 n=min(WINDOW,t+1)、s=t+1-n；超长 WINDOW 不先转 int。
+        n = _safe_window_min(window_text, t + 1)
+        s = t + 1 - n
+
+        # 窗口 [s:t+1] 的 n×V one-hot 输入矩阵。
+        x = [[0.0] * V for _ in range(n)]
+        for i in range(n):
+            x[i][ids[s + i]] = 1.0
+
+        # 窗口内因果掩码：mask[i][j] = (j <= i)。
+        mask = [[j <= i for j in range(n)] for i in range(n)]
+
+        # 每 t 独立前向，仅取末行；不携带任何跨 t 状态。
+        y = block.forward(x, mask)[0]
+        h = y[n - 1]
+
+        # z_k = by_k + Σ_j Why_k,j*h_j，依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(V):
+                acc += why_row[j] * h[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # log-sum-exp：m=max(z)，d 从 0.0 依 k 升序累加 exp(z_k-m)。
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        d = 0.0
+        for k in range(V):
+            d += math.exp(z[k] - m)
+            if not math.isfinite(d):
+                raise ValueError("softmax denominator accumulated non-finitely")
+
+        step = m + math.log(d) - z[target]
+        if not math.isfinite(step):
+            raise ValueError("cross-entropy step is non-finite")
+        L += step
+        if not math.isfinite(L):
+            raise ValueError("total cross-entropy accumulated non-finitely")
+
+    perplexity = math.exp(L / T)
+    if not math.isfinite(perplexity):
+        raise ValueError("perplexity is non-finite")
+    return format(perplexity, ".17g") + "\n"
+
+
 def _train_transformer(model_path, corpus_path, out_path):
     """对 version 6 单层 Transformer 字符模型做一次全语料 SGD 并写 OUT。
 
@@ -18708,6 +18835,21 @@ def main(argv):
     为键/值调用 attention，用 h 与首行上下文之和作为 logit 隐状态，随后向
     memory 追加 h 的 float 副本；输出契约与 perplexity 相同，不写文件。
 
+    python seqmodel.py perplexity-transformer-window MODEL CORPUS WINDOW：
+    MODEL、CORPUS 完全沿用 perplexity-transformer（version 6 十四键严格
+    JSON、F、形状、heads 整除 V、严格 UTF-8 语料至少 2 码点且无表外字符）；
+    WINDOW 整串匹配 [1-9][0-9]*（任意位数均合法，不先转无界整数）。令
+    T=语料码点数-1、L=0.0，t 升序以十进制位数和同长字典序安全求
+    n=min(WINDOW,t+1)、s=t+1-n，以语料索引 [s:t+1] 构造 n×V one-hot 与
+    局部因果 mask（mask[i][j]=(j<=i)），装参调用
+    TransformerBlock.forward 仅取末行，沿用 perplexity-transformer 的
+    Why/by、稳定 log-sum-exp、下一字符 NLL 及 t、k、j 累加顺序加至 L；每
+    个 t 独立截断，不复用窗外状态。WINDOW 数学值不小于 T 时输出与
+    perplexity-transformer 逐字节相同。成功时 stdout 恰为
+    format(exp(L/T),'.17g')+'\\n'，返回 0；任何输入、I/O、解析、校验或
+    非有限计算错误均返回 2、stdout 空、stderr 恰为 "error\\n" 且无回溯，
+    不写文件。
+
     python seqmodel.py train-lstm MODEL CORPUS OUT：对 version 2 的 LSTM
     模型做一次全语料 SGD 并写出新模型。t 升序以 (h0, c0) 为初态调用装入
     W、b 的 LSTMCell.forward 并缓存；输出层 g、dWhy、dby、dhs 沿用 train
@@ -19659,6 +19801,10 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 4 and argv[1] == "perplexity-transformer":
             output = _perplexity_transformer(argv[2], argv[3])
+            sys.stdout.buffer.write(output.encode("ascii"))
+        elif len(argv) == 5 and argv[1] == "perplexity-transformer-window":
+            output = _perplexity_transformer_window(
+                argv[2], argv[3], argv[4])
             sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 5 and argv[1] == "train-transformer":
             _train_transformer(argv[2], argv[3], argv[4])
