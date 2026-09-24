@@ -2516,6 +2516,268 @@ class MHA(object):
         return dqxs, dkvxs, dWq, dWk, dWv, dWo
 
 
+class TransformerBlock(object):
+    """残差多头自注意力加位置前馈的单层 Transformer 块。
+
+    结构（无归一化层）：
+        c, w = attn(x, mask)          # attn 为 MHA(D, heads)
+        a = x + c                     # 注意力残差
+        f = tanh(b1 + W1 @ a)         # W1: P×D，b1: P
+        y = a + b2 + W2 @ f           # W2: D×P，b2: D
+    初始权重满足 W1[p][j] = W2[j][p] = float(p % D == j)，b1、b2 全 0.0；
+    所有参数逐层新建、互不共享。D、P、heads 须为非 bool 的正 int 且 heads
+    整除 D，否则抛 ValueError。
+    """
+
+    def __init__(self, D, heads, P):
+        if type(D) is bool or type(D) is not int or D <= 0:
+            raise ValueError("D must be a non-bool positive int, got %r"
+                             % (D,))
+        if type(P) is bool or type(P) is not int or P <= 0:
+            raise ValueError("P must be a non-bool positive int, got %r"
+                             % (P,))
+        if type(heads) is bool or type(heads) is not int or heads <= 0:
+            raise ValueError(
+                "heads must be a non-bool positive int, got %r" % (heads,))
+        if D % heads != 0:
+            raise ValueError(
+                "heads (%d) must divide D=%d" % (heads, D))
+        self.D = D
+        self.heads = heads
+        self.P = P
+        self.attn = MHA(D, heads)
+        # W1 第 p 行在 p%D 列为 1.0；W2 第 j 行在所有满足 p%D==j 的 p 列
+        # 为 1.0。逐行新建，偏置全 0.0。
+        self.W1 = [[1.0 if p % D == j else 0.0 for j in range(D)]
+                   for p in range(P)]
+        self.b1 = [0.0] * P
+        self.W2 = [[1.0 if p % D == j else 0.0 for p in range(P)]
+                   for j in range(D)]
+        self.b2 = [0.0] * D
+        self._cache = None
+
+    def forward(self, x, mask=None):
+        """Transformer 块前向，返回 (y, w) 并缓存反向所需快照。
+
+        x、mask 的契约完全沿用 MHA.forward：先取 (c, w) =
+        attn.forward(x, mask)，再求 a = x + c、f = tanh(b1 + W1*a)、
+        y = a + b2 + W2*f。self.W1/self.W2 须分别为 P×D、D×P 的 F 矩阵，
+        self.b1/self.b2 须分别为长度 P、D 的 F 向量（每次前向重新校验并
+        快照，随后的属性改写不影响已缓存的前向）。y 为 T×D、w 为
+        heads×T×T 的逐层新建 float 列表，不修改或复用输入与参数。任一
+        中间量非有限抛 ValueError；任何失败都清空本块缓存。实参数量错误
+        沿用 Python 自带的 TypeError。
+        """
+        D, P = self.D, self.P
+        # 任何失败的 forward 都使既有缓存失效。
+        self._cache = None
+        try:
+            # x、mask 的校验与 attn 自身缓存均由 MHA.forward 保证；c、w
+            # 为逐层新建的 float 列表。
+            c, w = self.attn.forward(x, mask)
+            T = len(c)
+
+            W1 = _check_matrix(self.W1, P, D, "W1")
+            b1 = _check_vector(self.b1, P, "b1")
+            W2 = _check_matrix(self.W2, D, P, "W2")
+            b2 = _check_vector(self.b2, D, "b2")
+            W1 = [[float(v) for v in row] for row in W1]
+            b1 = [float(v) for v in b1]
+            W2 = [[float(v) for v in row] for row in W2]
+            b2 = [float(v) for v in b2]
+
+            # a[t][j] = x[t][j] + c[t][j]，逐元素新建 float。
+            a = [[0.0] * D for _ in range(T)]
+            for t in range(T):
+                xt = x[t]
+                ct = c[t]
+                at = a[t]
+                for j in range(D):
+                    av = float(xt[j]) + ct[j]
+                    if not math.isfinite(av):
+                        raise ValueError(
+                            "a accumulated to a non-finite value")
+                    at[j] = av
+
+            # f[t][p] = tanh(b1[p] + Σ_j W1[p][j]*a[t][j])，j 自 0.0 升序。
+            f = [[0.0] * P for _ in range(T)]
+            for t in range(T):
+                at = a[t]
+                ft = f[t]
+                for p in range(P):
+                    W1p = W1[p]
+                    acc = b1[p]
+                    for j in range(D):
+                        acc += W1p[j] * at[j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "ffn pre-activation accumulated to a "
+                                "non-finite value")
+                    fv = math.tanh(acc)
+                    if not math.isfinite(fv):
+                        raise ValueError("tanh produced a non-finite value")
+                    ft[p] = fv
+
+            # y[t][j] = a[t][j] + b2[j] + Σ_p W2[j][p]*f[t][p]，p 升序。
+            y = [[0.0] * D for _ in range(T)]
+            for t in range(T):
+                at = a[t]
+                ft = f[t]
+                yt = y[t]
+                for j in range(D):
+                    W2j = W2[j]
+                    acc = at[j] + b2[j]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "y accumulated to a non-finite value")
+                    for p in range(P):
+                        acc += W2j[p] * ft[p]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "y accumulated to a non-finite value")
+                    yt[j] = acc
+        except ValueError:
+            self._cache = None
+            raise
+
+        self._cache = ("transformerblock", T, D, P, a, f, W1, W2)
+        return y, w
+
+    def backward(self, dy):
+        """Transformer 块反向，返回九元组梯度。
+
+        须紧随一次成功的 forward（其后缓存未被失败清空），否则抛
+        ValueError；dy 须为与前向 y 同形的 T×D F 矩阵，否则抛 ValueError。
+        按链式求（求和均自 0.0 按下标升序累加）：
+            dW2[j][p] = Σ_t dy[t][j]*f[t][p]
+            db2[j]    = Σ_t dy[t][j]
+            df[t][p]  = Σ_j dy[t][j]*W2[j][p]
+            dz[t][p]  = df[t][p]*(1 - f[t][p]²)
+            dW1[p][j] = Σ_t dz[t][p]*a[t][j]
+            db1[p]    = Σ_t dz[t][p]
+            da[t][j]  = dy[t][j] + Σ_p dz[t][p]*W1[p][j]
+        再调用 attn.backward(da) 得 (dxa, dWq, dWk, dWv, dWo)，令
+            dx[t][j] = da[t][j] + dxa[t][j]
+        返回 (dx, dWq, dWk, dWv, dWo, dW1, db1, dW2, db2)。dx 为 T×D，
+        四个注意力梯度为 D×D，dW1 为 P×D、db1 长 P，dW2 为 D×P、db2 长 D，
+        均为逐层新建 float 列表，不修改 dy、缓存或任何参数；成功时缓存
+        保留，重复调用结果相同。任一中间量非有限或反向失败均抛 ValueError
+        并清空缓存。实参数量错误沿用 Python 自带的 TypeError。
+        """
+        cache = self._cache
+        try:
+            if type(cache) is not tuple or len(cache) != 8 \
+                    or cache[0] != "transformerblock":
+                raise ValueError(
+                    "backward requires a successful forward pass before it")
+            (_, T, D, P, a, f, W1, W2) = cache
+            dy = _check_matrix(dy, T, D, "dy")
+            dy = [[float(z) for z in row] for row in dy]
+
+            # dW2[j][p] = Σ_t dy[t][j]*f[t][p]；db2[j] = Σ_t dy[t][j]，
+            # t 自 0.0 升序。
+            dW2 = [[0.0] * P for _ in range(D)]
+            db2 = [0.0] * D
+            for t in range(T):
+                dyt = dy[t]
+                ft = f[t]
+                for j in range(D):
+                    dyv = dyt[j]
+                    db2[j] += dyv
+                    if not math.isfinite(db2[j]):
+                        raise ValueError(
+                            "db2 accumulated to a non-finite value")
+                    dW2j = dW2[j]
+                    for p in range(P):
+                        dW2j[p] += dyv * ft[p]
+                        if not math.isfinite(dW2j[p]):
+                            raise ValueError(
+                                "dW2 accumulated to a non-finite value")
+
+            # df[t][p] = Σ_j dy[t][j]*W2[j][p]，j 自 0.0 升序。
+            df = [[0.0] * P for _ in range(T)]
+            for t in range(T):
+                dyt = dy[t]
+                dft = df[t]
+                for p in range(P):
+                    acc = 0.0
+                    for j in range(D):
+                        acc += dyt[j] * W2[j][p]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "df accumulated to a non-finite value")
+                    dft[p] = acc
+
+            # dz[t][p] = df[t][p]*(1 - f[t][p]^2)，逐元素新建 float。
+            dz = [[0.0] * P for _ in range(T)]
+            for t in range(T):
+                dft = df[t]
+                ft = f[t]
+                dzt = dz[t]
+                for p in range(P):
+                    fv = ft[p]
+                    zv = dft[p] * (1.0 - fv * fv)
+                    if not math.isfinite(zv):
+                        raise ValueError("dz became a non-finite value")
+                    dzt[p] = zv
+
+            # dW1[p][j] = Σ_t dz[t][p]*a[t][j]；db1[p] = Σ_t dz[t][p]，
+            # t 自 0.0 升序。
+            dW1 = [[0.0] * D for _ in range(P)]
+            db1 = [0.0] * P
+            for t in range(T):
+                dzt = dz[t]
+                at = a[t]
+                for p in range(P):
+                    dzv = dzt[p]
+                    db1[p] += dzv
+                    if not math.isfinite(db1[p]):
+                        raise ValueError(
+                            "db1 accumulated to a non-finite value")
+                    dW1p = dW1[p]
+                    for j in range(D):
+                        dW1p[j] += dzv * at[j]
+                        if not math.isfinite(dW1p[j]):
+                            raise ValueError(
+                                "dW1 accumulated to a non-finite value")
+
+            # da[t][j] = dy[t][j] + Σ_p dz[t][p]*W1[p][j]，p 自 0.0 升序。
+            da = [[0.0] * D for _ in range(T)]
+            for t in range(T):
+                dyt = dy[t]
+                dzt = dz[t]
+                dat = da[t]
+                for j in range(D):
+                    acc = dyt[j]
+                    for p in range(P):
+                        acc += dzt[p] * W1[p][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "da accumulated to a non-finite value")
+                    dat[j] = acc
+
+            # 注意力子层（含其四个投影）的反向沿用 MHA.backward。
+            dxa, dWq, dWk, dWv, dWo = self.attn.backward(da)
+
+            # dx[t][j] = da[t][j] + dxa[t][j]，残差两路逐元素相加。
+            dx = [[0.0] * D for _ in range(T)]
+            for t in range(T):
+                dat = da[t]
+                dxat = dxa[t]
+                dxt = dx[t]
+                for j in range(D):
+                    xv = dat[j] + dxat[j]
+                    if not math.isfinite(xv):
+                        raise ValueError(
+                            "dx accumulated to a non-finite value")
+                    dxt[j] = xv
+        except ValueError:
+            self._cache = None
+            raise
+
+        return dx, dWq, dWk, dWv, dWo, dW1, db1, dW2, db2
+
+
 class VanillaRNN(object):
     """单隐藏层 Vanilla RNN，参数 Wxh/Whh/bh 初始化为全 0.0。
 
