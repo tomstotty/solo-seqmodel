@@ -10028,6 +10028,186 @@ def _sample_lstm_mha_relative(model_path, start, seed_text,
     return "".join(out) + "\n"
 
 
+def _log_softmax_stable(z):
+    """对 V 长 logit 求逐项对数概率 lp，下标、最大值与累加顺序严格固定。
+
+    m=max(z)，d 从 0.0 依 k 升序累加 exp(z[k]-m)，
+    lp[k]=z[k]-m-log(d)；m 与每个 exp、累加值、log(d) 及 lp[k] 均须有
+    限，否则抛 ValueError（exp 溢出亦转 ValueError）。
+    """
+    m = max(z)
+    if not math.isfinite(m):
+        raise ValueError("logit maximum is non-finite")
+    V = len(z)
+    d = 0.0
+    for k in range(V):
+        try:
+            term = math.exp(z[k] - m)
+        except OverflowError:
+            raise ValueError("log-softmax exp overflowed")
+        if not math.isfinite(term):
+            raise ValueError("log-softmax exp became non-finite")
+        d += term
+        if not math.isfinite(d):
+            raise ValueError(
+                "log-softmax denominator accumulated non-finitely")
+    log_d = math.log(d)
+    if not math.isfinite(log_d):
+        raise ValueError("log-softmax log-denominator is non-finite")
+    lp = [0.0] * V
+    for k in range(V):
+        value = z[k] - m - log_d
+        if not math.isfinite(value):
+            raise ValueError("log-probability became non-finite")
+        lp[k] = value
+    return lp
+
+
+def _contrast_lstm_mha(expert_path, amateur_path, start, alpha_text,
+                       top_k_text, length_text, window_text):
+    """以 expert/amateur 对数概率差做对比解码，输出 LENGTH 个码点加 LF。
+
+    EXPERT、AMATEUR 各自沿用 perplexity-lstm-mha-relative 的模型读取、
+    十四键、bias、F 与形状契约（version 5），且两模型 vocab 须同序相等
+    （H、heads、bias 宽度可不同），否则失败；不构造任何随机源，不写文
+    件。START、LENGTH、WINDOW 的校验沿用 sample-lstm-mha-relative：
+    START 恰为词表内一个码点，LENGTH 整串匹配 0|[1-9][0-9]*，WINDOW
+    整串匹配 [1-9][0-9]* 并以位数、同长字典序安全截取。ALPHA 经
+    float() 解析，须有限且 >=0，否则失败。TOP_K 整串匹配
+    [1-9][0-9]* 且 K<=V：先以十进制位数、同长度字典序与 str(V) 比较，
+    仅比较通过后才转 int。
+
+    两轨分别从自身 h0、c0、memory=[h0]、pos=[0] 起步，共享同一字符序
+    列。第 t 步各自沿用相对位置采样的 LSTM、尾窗 MHA 及 h+ctx 次序求
+    z；以稳定 log-softmax 求 lp：m=max(z)，d 从 0.0 依 k 升序累加
+    exp(z[k]-m)，lp[k]=z[k]-m-log(d)。EXPERT 候选为按 (-lp[k],k)
+    升序（lp 降序、并列取小 k）的前 K 项；在候选中取
+    lp_expert[k]-ALPHA*lp_amateur[k] 最大者，并列取较小 k，作为两轨
+    的下一输入；两轨再各自追加自身 h 的 float 副本与 t+1 到 memory、
+    pos。任一中间运算非有限均抛 ValueError。成功返回 LENGTH 个码点再
+    加一个 LF（LENGTH 为 0 时仅 LF）。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    expert = _load_perplexity_lstm_mha_relative_model(expert_path)
+    amateur = _load_perplexity_lstm_mha_relative_model(amateur_path)
+    (vocab, W_e, b_e, Wq_e, Wk_e, Wv_e, Wo_e, heads_e, bias_e,
+     Why_e, by_e, h0_e, c0_e) = expert
+    (vocab_a, W_a, b_a, Wq_a, Wk_a, Wv_a, Wo_a, heads_a, bias_a,
+     Why_a, by_a, h0_a, c0_a) = amateur
+    if vocab_a != vocab:
+        raise ValueError("expert and amateur vocab must be equal and ordered")
+    V = len(vocab)
+    H_e = len(h0_e)
+    H_a = len(h0_a)
+
+    # START：恰为词表内的一个码点（两轨共享）。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # ALPHA：float() 可解析且有限、非负。
+    alpha = float(alpha_text)
+    if not math.isfinite(alpha) or alpha < 0.0:
+        raise ValueError("ALPHA must be a finite non-negative float")
+
+    # TOP_K：整串匹配 [1-9][0-9]* 且 K<=V；位数/同长字典序先行，避免对
+    # 任意长度文本直接 int()。
+    if not _WINDOW_RE.match(top_k_text):
+        raise ValueError("TOP_K must match [1-9][0-9]*")
+    v_text = str(V)
+    if len(top_k_text) > len(v_text) or (
+            len(top_k_text) == len(v_text) and top_k_text > v_text):
+        raise ValueError("TOP_K must not exceed len(vocab)")
+    top_k = int(top_k_text)
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    cell_e = _lstm_cell_loaded(V, H_e, W_e, b_e)
+    mha_e = _mha_loaded(H_e, heads_e, Wq_e, Wk_e, Wv_e, Wo_e)
+    cell_a = _lstm_cell_loaded(V, H_a, W_a, b_a)
+    mha_a = _mha_loaded(H_a, heads_a, Wq_a, Wk_a, Wv_a, Wo_a)
+
+    # 两轨各自独立的 LSTM 状态、记忆与位置序列；h0 保留模型原值，
+    # forward_cross_relative 会先复制再投影。
+    memory_e = [h0_e]
+    pos_e = [0]
+    h_e = list(h0_e)
+    c_e = list(c0_e)
+    memory_a = [h0_a]
+    pos_a = [0]
+    h_a = list(h0_a)
+    c_a = list(c0_a)
+    x = vocab.index(start)
+    out = []
+
+    for t in range(length):
+        xvec = [0.0] * V
+        xvec[x] = 1.0
+
+        # EXPERT 轨：推进 LSTM，尾窗相对位置 MHA，h+ctx 求 z。
+        h_e, c_e = cell_e.forward(xvec, h_e, c_e)[:2]
+        M_e = _window_tail(memory_e, window_text)
+        P_e = pos_e[len(memory_e) - len(M_e):]
+        ctx_e, _w = mha_e.forward_cross_relative(
+            [h_e], M_e, [t + 1], P_e, bias_e, None)
+        ctx0_e = ctx_e[0]
+        u_e = [0.0] * H_e
+        for i in range(H_e):
+            ui = h_e[i] + ctx0_e[i]
+            if not math.isfinite(ui):
+                raise ValueError(
+                    "expert attention-adjusted hidden state became "
+                    "non-finite")
+            u_e[i] = ui
+        z_e = _output_logits(Why_e, by_e, u_e)
+        lp_e = _log_softmax_stable(z_e)
+
+        # AMATEUR 轨：同一输入，独立状态与记忆，完全相同的次序。
+        h_a, c_a = cell_a.forward(xvec, h_a, c_a)[:2]
+        M_a = _window_tail(memory_a, window_text)
+        P_a = pos_a[len(memory_a) - len(M_a):]
+        ctx_a, _w = mha_a.forward_cross_relative(
+            [h_a], M_a, [t + 1], P_a, bias_a, None)
+        ctx0_a = ctx_a[0]
+        u_a = [0.0] * H_a
+        for i in range(H_a):
+            ui = h_a[i] + ctx0_a[i]
+            if not math.isfinite(ui):
+                raise ValueError(
+                    "amateur attention-adjusted hidden state became "
+                    "non-finite")
+            u_a[i] = ui
+        z_a = _output_logits(Why_a, by_a, u_a)
+        lp_a = _log_softmax_stable(z_a)
+
+        # EXPERT 候选：按 (-lp[k], k) 升序的前 K 项。
+        candidates = sorted(range(V), key=lambda k: (-lp_e[k], k))[:top_k]
+
+        # 候选中取 lp_expert-ALPHA*lp_amateur 最大者，并列取较小 k。
+        chosen = None
+        best = None
+        for k in candidates:
+            score = lp_e[k] - alpha * lp_a[k]
+            if not math.isfinite(score):
+                raise ValueError("contrastive score became non-finite")
+            if best is None or score > best or (score == best and k < chosen):
+                best = score
+                chosen = k
+
+        out.append(vocab[chosen])
+        x = chosen
+        memory_e.append([float(v) for v in h_e])
+        pos_e.append(t + 1)
+        memory_a.append([float(v) for v in h_a])
+        pos_a.append(t + 1)
+
+    return "".join(out) + "\n"
+
+
 _RESUME_STATE_KEYS = ("v", "sha", "args", "c", "x", "m", "r")
 
 
@@ -15316,6 +15496,22 @@ def main(argv):
     random.Random(int(SEED))；任一中间量非有限即失败；输出契约与 sample
     相同，不写文件。
 
+    python seqmodel.py contrast-lstm-mha EXPERT AMATEUR START ALPHA TOP_K
+    LENGTH WINDOW：EXPERT、AMATEUR 各自沿用
+    perplexity-lstm-mha-relative 的模型契约（version 5 十四键），两模型
+    vocab 须同序相等（H 可不同）；START、LENGTH、WINDOW 的校验沿用
+    sample-lstm-mha-relative；ALPHA 经 float() 解析，须有限且 >=0；
+    TOP_K 整串匹配 [1-9][0-9]* 且 K<=V，先以位数、同长字典序与 str(V)
+    比较再转 int。两轨分别从自身 h0、c0、memory=[h0]、pos=[0] 起步并
+    共享字符：每步各自沿用相对位置采样的 LSTM、尾窗 MHA 及 h+ctx 次序
+    求 z，令 m=max(z)，d 从 0.0 依 k 升序累加 exp(z[k]-m)，
+    lp[k]=z[k]-m-log(d)；EXPERT 候选为按 (-lp[k],k) 升序的前 K 项，
+    取 lp_expert[k]-ALPHA*lp_amateur[k] 最大者（并列取较小 k）作为两
+    轨下一输入，再各自追加 h 的 float 副本与 t+1。本命令无 SEED、无随
+    机源、不写文件；任一运算非有限即失败；成功 stdout 恰为 LENGTH 个
+    UTF-8 码点加 LF（LENGTH 为 0 时仅 LF），失败返回 2、stdout 空、
+    stderr 恰为 "error\\n"。
+
     python seqmodel.py sample-lstm-mha-resume MODEL START SEED TEMPERATURE
     LENGTH WINDOW STATE：前六参数及生成行为沿用 sample-lstm-mha，另以 STATE
     原子读写续跑状态。STATE 缺失时从 h0、c0、x=START 索引、memory=[h0] 与
@@ -15955,6 +16151,10 @@ def main(argv):
         elif len(argv) == 8 and argv[1] == "sample-lstm-mha-relative":
             output = _sample_lstm_mha_relative(argv[2], argv[3], argv[4],
                                                argv[5], argv[6], argv[7])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 9 and argv[1] == "contrast-lstm-mha":
+            output = _contrast_lstm_mha(argv[2], argv[3], argv[4], argv[5],
+                                        argv[6], argv[7], argv[8])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 9 and argv[1] == "sample-lstm-mha-resume":
             output = _sample_lstm_mha_resume(
