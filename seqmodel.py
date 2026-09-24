@@ -6671,6 +6671,124 @@ def _sample_transformer(model_path, start, seed_text, temperature_text,
     return "".join(out) + "\n"
 
 
+def _score_transformer(model_path, start, text, temperature_text):
+    """确定性评分指定候选 TEXT（单层 Transformer 块语言模型），返回待写字符串。
+
+    MODEL、START、TEMPERATURE 的读取、词法、十四键、F、形状及失败契约均沿
+    用 _sample_transformer；TEXT 为可空 Unicode 字符串且每个码点须在
+    vocab，否则抛 ValueError。本命令无 SEED、无随机源且不写文件。
+
+    置 prefix=[START 索引]、total=0.0，按 t 升序遍历 TEXT：每步以完整
+    prefix 构造 L×V one-hot 输入与 mask[i][j]=(j<=i) 的因果掩码，调用装
+    入参数的 TransformerBlock(V, heads, P).forward 并取末行 y；自
+    float(by[k]) 按 j 升序累加 Why[k][j]*y[j] 得 z；再按 k 升序求
+    a[k]=z[k]/TEMPERATURE、m=max(a)，d 自 0.0 依 k 升序累加
+    exp(a[k]-m)。不抽样，令 q 为 TEXT[t] 索引，
+    lp=a[q]-m-math.log(d)，total 从 0.0 按 t 升序累加 lp，再把 q 追加到
+    prefix。任一乘加、指数、对数、除法或累计结果非有限均抛 ValueError。
+    成功返回 format(total, '.17g') + '\\n'（TEXT 为空时为 "0\\n"）。
+    """
+    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
+        _load_perplexity_transformer_model(model_path)
+    V = len(vocab)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # TEMPERATURE：float() 可解析且有限、严格大于 0；inf/nan/0/负数均失败。
+    temperature = float(temperature_text)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite positive float")
+
+    # TEXT：可空 Unicode 字符串，每个码点须在词表内。
+    if type(text) is not str:
+        raise ValueError("TEXT must be a string")
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(text)
+    for t, ch in enumerate(text):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("TEXT contains an out-of-vocab character")
+        ids[t] = ix
+
+    block = TransformerBlock(V, heads, P)
+    block.attn.Wq = [list(row) for row in Wq]
+    block.attn.Wk = [list(row) for row in Wk]
+    block.attn.Wv = [list(row) for row in Wv]
+    block.attn.Wo = [list(row) for row in Wo]
+    block.W1 = [list(row) for row in W1]
+    block.b1 = list(b1)
+    block.W2 = [list(row) for row in W2]
+    block.b2 = list(b2)
+
+    prefix = [vocab.index(start)]
+    total = 0.0
+
+    for t in range(len(ids)):
+        L = len(prefix)
+
+        # L×V one-hot 输入，第 i 行仅 prefix[i] 列为 1.0。
+        x = [[0.0] * V for _ in range(L)]
+        for i in range(L):
+            x[i][prefix[i]] = 1.0
+
+        # 因果掩码：mask[i][j] = (j <= i)。
+        mask = [[j <= i for j in range(L)] for i in range(L)]
+
+        # TransformerBlock.forward 自身校验非有限并抛 ValueError。
+        y_all = block.forward(x, mask)[0]
+        y = y_all[-1]
+
+        # z_k = by_k + Σ_j Why_k,j*y_j，依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(V):
+                acc += why_row[j] * y[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # 不抽样：q 为 TEXT[t] 索引，lp=a[q]-m-log(d)，total 依 t 升序累加。
+        q = ids[t]
+        lp = a[q] - m - math.log(d)
+        if not math.isfinite(lp):
+            raise ValueError("log probability is non-finite")
+        total += lp
+        if not math.isfinite(total):
+            raise ValueError(
+                "total log probability accumulated non-finitely")
+
+        prefix.append(q)
+
+    return format(total, ".17g") + "\n"
+
+
 def _sample_transformer_anneal(model_path, start, seed_text, start_t_text,
                                end_t_text, length_text):
     """以线性退火温度从单层 Transformer 块语言模型采样 LENGTH 个码点。
@@ -18416,6 +18534,20 @@ def main(argv):
     无则取前缀末项；以该字符更新输出和 prefix。新增运算非有限即失败。输
     出契约与 sample 相同，不写文件。
 
+    python seqmodel.py score-transformer MODEL START TEXT TEMPERATURE：确定
+    性评分指定候选 TEXT。MODEL、START、TEMPERATURE 的读取与校验沿用
+    sample-transformer；TEXT 为可空 Unicode 字符串，每个码点须在 vocab，
+    否则失败。本命令无 SEED、无随机源，不写文件。置 prefix=[START 索引]、
+    total=0.0，按 t 升序遍历 TEXT：每步沿用原入口以完整 prefix 构造
+    L×V one-hot 输入与 mask[i][j]=(j<=i) 的因果掩码，执行装参的
+    TransformerBlock.forward 并取末行 y，自 float(by[k]) 起按 j 升序累加
+    Why[k][j]*y[j] 得 z，再按 k 升序求 a[k]=z[k]/TEMPERATURE、m=max(a)，
+    d 自 0.0 按 k 升序累加 exp(a[k]-m)。不抽样，令 q 为 TEXT[t] 索引，
+    lp=a[q]-m-math.log(d)，total 从 0.0 按 t 升序累加 lp，再把 q 追加到
+    prefix。任一乘加、指数、对数、除法或累计结果非有限即失败。成功返回 0、
+    stderr 为空，stdout 恰为 format(total,'.17g')+'\\n' 的 ASCII 字节，空
+    TEXT 为 "0\\n"。
+
     python seqmodel.py sample-lstm MODEL START SEED TEMPERATURE LENGTH：
     MODEL 为 version 2 的 LSTM 模型（键 version、vocab、W、b、Why、by、
     h0、c0），置 h=h0、c=c0、x=START 索引，每步以 x 的 V 长 one-hot 调用
@@ -19577,6 +19709,9 @@ def main(argv):
                 argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
                 argv[8], argv[9])
             sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 6 and argv[1] == "score-transformer":
+            output = _score_transformer(argv[2], argv[3], argv[4], argv[5])
+            sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 8 and argv[1] == "beam-transformer":
             output = _beam_transformer(
                 argv[2], argv[3], argv[4], argv[5], argv[6], argv[7])
