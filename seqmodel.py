@@ -604,6 +604,347 @@ def multihead_attention_backward(q, k, v, dc, heads, mask=None):
     return dq, dk, dv
 
 
+def _check_relative_bias(bias, heads):
+    """校验相对位置偏置 bias 为 heads×(2R+1) 的 F 矩阵，列数为正奇数。
+
+    逐行新建 float 拷贝返回 (biasc, R)；heads 与列宽（正奇数）任一不符都抛
+    ValueError。
+    """
+    if type(bias) is not list or len(bias) != heads:
+        raise ValueError(
+            "bias must be a list of shape %d×(2R+1)" % heads)
+    biasc = []
+    width = None
+    for row in bias:
+        if type(row) is not list or len(row) == 0 or len(row) % 2 != 1:
+            raise ValueError(
+                "bias must have a positive odd number of columns (2R+1)")
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            raise ValueError("bias must be a rectangular matrix")
+        nrow = []
+        for v in row:
+            if not _is_f(v):
+                raise ValueError(
+                    "bias entries must be finite numbers, got %r" % (v,))
+            nrow.append(float(v))
+        biasc.append(nrow)
+    R = (width - 1) // 2
+    return biasc, R
+
+
+def _relative_attention_weights(q, k, bias_h, R, active, T, Hd):
+    """单头相对位置偏置注意力的 softmax 权重，返回 (w, scale)。
+
+    对每个 (i, j)，分数 s 从 0.0 按 a 升序累加 q[i][a]*k[j][a]，再取
+        s/sqrt(Hd) + bias[max(-R, min(R, j-i)) + R]
+    （越界距离裁剪到 ±R 桶）。每行只在 True 位以 exp(s - max(s)) 计算
+    softmax，False 位权重为 0.0，分母按 j 升序从 0.0 累加。w 逐层新建、
+    元素均为 float；任一算术溢出或非有限结果抛 ValueError。
+    """
+    scale = math.sqrt(float(Hd))
+    w = []
+    for i in range(T):
+        qi = q[i]
+
+        # s[i][j] 从 0.0 按 a 升序累加点积，再缩放并加相对偏置。
+        s_row = [0.0] * T
+        for j in range(T):
+            kj = k[j]
+            acc = 0.0
+            for a in range(Hd):
+                try:
+                    acc += qi[a] * kj[a]
+                except OverflowError:
+                    raise ValueError(
+                        "score dot product accumulated to a non-finite value")
+                if not math.isfinite(acc):
+                    raise ValueError(
+                        "score dot product accumulated to a non-finite value")
+            rel = j - i
+            if rel < -R:
+                rel = -R
+            elif rel > R:
+                rel = R
+            sval = acc / scale + bias_h[rel + R]
+            if not math.isfinite(sval):
+                raise ValueError("score became non-finite after scaling")
+            s_row[j] = sval
+
+        # 行最大值只在 True 位取，保证至少一个 True 参与 softmax。
+        m = None
+        for j in range(T):
+            if active[i][j]:
+                sj = s_row[j]
+                if m is None or sj > m:
+                    m = sj
+
+        # e = exp(s - m) 仅在 True 位计算；分母按 j 升序从 0.0 累加。
+        e_row = [0.0] * T
+        denom = 0.0
+        for j in range(T):
+            if active[i][j]:
+                try:
+                    ev = math.exp(s_row[j] - m)
+                except OverflowError:
+                    raise ValueError("softmax exp overflowed")
+                if not math.isfinite(ev):
+                    raise ValueError("softmax exp became non-finite")
+                e_row[j] = ev
+                denom += ev
+                if not math.isfinite(denom):
+                    raise ValueError(
+                        "softmax denominator accumulated to a non-finite value")
+
+        # False 位权重保持 0.0；归一化后须有限。
+        w_row = [0.0] * T
+        for j in range(T):
+            if active[i][j]:
+                wv = e_row[j] / denom
+                if not math.isfinite(wv):
+                    raise ValueError("attention weight became non-finite")
+                w_row[j] = wv
+        w.append(w_row)
+
+    return w, scale
+
+
+def relative_multihead_attention(q, k, v, heads, bias, R, mask=None):
+    """多头相对位置偏置自注意力前向，返回 (c, w)，不修改或复用任何输入。
+
+    q、k、v 均为非空 T×D 的 F 方阵（自注意力 Tq=Tk=T），mask 为 None 或
+    元素 type 恰为 bool 的 T×T 矩阵（全屏蔽行抛 ValueError）；heads 须为非
+    bool 的正 int 且整除 D；bias 为 heads×(2R+1) 的 F 矩阵、列数为正奇数。
+    各头按连续列切分 q、k、v，分数在缩放点积上再加该头的相对位置偏置
+    （越界距离裁剪到 ±R 桶）；上下文按头序、维序拼回 T×D 的 c，w 形状为
+    heads×T×T。所有输出逐层新建、元素均为 float；任一校验或中间有限性失败
+    均抛 ValueError；相同输入结果确定。实参数量错误沿用 Python 自带的
+    TypeError。
+    """
+    Tq, Tk, D, Dv, active = _attention_check(q, k, v, mask)
+    if Tq != Tk:
+        raise ValueError(
+            "relative attention requires self attention (equal query/key "
+            "lengths), got %d and %d" % (Tq, Tk))
+    T = Tq
+    _multihead_check_heads(heads, D, Dv)
+    Hd = D // heads
+    Hdv = Dv // heads
+    c = [[0.0] * Dv for _ in range(T)]
+    w = []
+    for h in range(heads):
+        qh = _slice_columns(q, T, Hd, h * Hd)
+        kh = _slice_columns(k, T, Hd, h * Hd)
+        vh = _slice_columns(v, T, Hdv, h * Hdv)
+        wh, _scale = _relative_attention_weights(
+            qh, kh, bias[h], R, active, T, Hd)
+        w.append(wh)
+
+        # ch[i][a] 从 0.0 按 j 升序累加 wh[i][j]*vh[j][a]。
+        coff = h * Hdv
+        for i in range(T):
+            wi = wh[i]
+            crow = c[i]
+            for a in range(Hdv):
+                acc = 0.0
+                for j in range(T):
+                    wv = wi[j]
+                    if wv != 0.0:
+                        try:
+                            acc += wv * vh[j][a]
+                        except OverflowError:
+                            raise ValueError(
+                                "context accumulated to a non-finite value")
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "context accumulated to a non-finite value")
+                cv = float(acc)
+                if not math.isfinite(cv):
+                    raise ValueError("multihead context became non-finite")
+                crow[coff + a] = cv
+
+    return c, w
+
+
+def relative_multihead_attention_backward(q, k, v, dc, heads, bias, R,
+                                          w, mask=None):
+    """多头相对位置偏置自注意力反向。
+
+    返回 (dq, dk, dv, dbias)，不修改或复用任何输入。前向契约与
+    relative_multihead_attention 一致；dc 须为 T×D 的 F 矩阵；w 为前向缓存
+    的 heads×T×T 权重。各头独立反向：
+        dw[i][j] = Σ_a dc[i][a]*v[j][a]（mask False 位取 0.0）
+        ds[i][j] = w[i][j]*(dw[i][j] - Σ_j w[i][j]*dw[i][j])（False 位 0.0）
+        dq[i][a] = Σ_j (ds[i][j]/sqrt(Hd))*k[j][a]
+        dk[j][a] = Σ_i (ds[i][j]/sqrt(Hd))*q[i][a]
+        dv[j][a] = Σ_i w[i][j]*dc[i][a]
+    dbias[h] 为同形零矩阵，按 r、i、j 升序把 ds 累加至偏移桶
+    max(-R, min(R, j-i))+R。所有结果逐层新建、元素均为 float；任一校验或
+    中间有限性失败均抛 ValueError；相同输入结果确定。实参数量错误沿用
+    Python 自带的 TypeError。
+    """
+    Tq, Tk, D, Dv, active = _attention_check(q, k, v, mask)
+    if Tq != Tk:
+        raise ValueError(
+            "relative attention requires self attention (equal query/key "
+            "lengths), got %d and %d" % (Tq, Tk))
+    T = Tq
+    _multihead_check_heads(heads, D, Dv)
+    dcc = _check_matrix(dc, T, Dv, "dc")
+    # w：heads×T×T 的 F 权重矩阵（前向缓存快照）。
+    if type(w) is not list or len(w) != heads:
+        raise ValueError("w must be a list of shape %d×%d×%d"
+                         % (heads, T, T))
+    for wh in w:
+        if type(wh) is not list or len(wh) != T:
+            raise ValueError("w must be a list of shape %d×%d×%d"
+                             % (heads, T, T))
+        for wrow in wh:
+            if type(wrow) is not list or len(wrow) != T:
+                raise ValueError("w must be a list of shape %d×%d×%d"
+                                 % (heads, T, T))
+            for wv in wrow:
+                if not _is_f(wv):
+                    raise ValueError(
+                        "w entries must be finite numbers, got %r" % (wv,))
+
+    Hd = D // heads
+    Hdv = Dv // heads
+    scale = math.sqrt(float(Hd))
+    dq = [[0.0] * D for _ in range(T)]
+    dk = [[0.0] * D for _ in range(T)]
+    dv = [[0.0] * D for _ in range(T)]
+    dbias = [[0.0] * (2 * R + 1) for _ in range(heads)]
+    for h in range(heads):
+        qh = _slice_columns(q, T, Hd, h * Hd)
+        kh = _slice_columns(k, T, Hd, h * Hd)
+        vh = _slice_columns(v, T, Hdv, h * Hdv)
+        dch = _slice_columns(dcc, T, Hdv, h * Hdv)
+        wh = w[h]
+        dbh = dbias[h]
+
+        # dw、r、ds 逐头逐行计算；False 位 dw、ds 保持 0.0。
+        dw = [[0.0] * T for _ in range(T)]
+        ds = [[0.0] * T for _ in range(T)]
+        for i in range(T):
+            dci = dch[i]
+            wi = wh[i]
+            dwi = dw[i]
+            dsi = ds[i]
+
+            # dw[i][j] = Σ_a dc[i][a]*v[j][a]，a 升序，仅 True 位。
+            for j in range(T):
+                if active[i][j]:
+                    vj = vh[j]
+                    acc = 0.0
+                    for a in range(Hdv):
+                        try:
+                            acc += dci[a] * vj[a]
+                        except OverflowError:
+                            raise ValueError(
+                                "dw accumulated to a non-finite value")
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dw accumulated to a non-finite value")
+                    dwi[j] = acc
+
+            # r[i] = Σ_j w[i][j]*dw[i][j]，j 升序（False 位 w 为 0.0）。
+            racc = 0.0
+            for j in range(T):
+                try:
+                    racc += wi[j] * dwi[j]
+                except OverflowError:
+                    raise ValueError("r accumulated to a non-finite value")
+                if not math.isfinite(racc):
+                    raise ValueError("r accumulated to a non-finite value")
+
+            # ds[i][j] = w[i][j]*(dw[i][j] - r[i])，仅 True 位。
+            for j in range(T):
+                if active[i][j]:
+                    try:
+                        val = wi[j] * (dwi[j] - racc)
+                    except OverflowError:
+                        raise ValueError("ds became non-finite")
+                    if not math.isfinite(val):
+                        raise ValueError("ds became non-finite")
+                    dsi[j] = val
+
+        # dq[i][a] = Σ_j (ds[i][j]/sqrt(Hd))*k[j][a]，j 升序。
+        qoff = h * Hd
+        for i in range(T):
+            dsi = ds[i]
+            dqi = dq[i]
+            for a in range(Hd):
+                acc = 0.0
+                for j in range(T):
+                    try:
+                        acc += (dsi[j] / scale) * kh[j][a]
+                    except OverflowError:
+                        raise ValueError("dq accumulated to a non-finite value")
+                    if not math.isfinite(acc):
+                        raise ValueError("dq accumulated to a non-finite value")
+                gv = float(acc)
+                if not math.isfinite(gv):
+                    raise ValueError("dq became non-finite")
+                dqi[qoff + a] = gv
+
+        # dk[j][a] = Σ_i (ds[i][j]/sqrt(Hd))*q[i][a]，i 升序。
+        for j in range(T):
+            dkj = dk[j]
+            for a in range(Hd):
+                acc = 0.0
+                for i in range(T):
+                    try:
+                        acc += (ds[i][j] / scale) * qh[i][a]
+                    except OverflowError:
+                        raise ValueError("dk accumulated to a non-finite value")
+                    if not math.isfinite(acc):
+                        raise ValueError("dk accumulated to a non-finite value")
+                gv = float(acc)
+                if not math.isfinite(gv):
+                    raise ValueError("dk became non-finite")
+                dkj[qoff + a] = gv
+
+        # dv[j][a] = Σ_i w[i][j]*dc[i][a]，i 升序。
+        voff = h * Hdv
+        for j in range(T):
+            dvj = dv[j]
+            for a in range(Hdv):
+                acc = 0.0
+                for i in range(T):
+                    try:
+                        acc += wh[i][j] * dch[i][a]
+                    except OverflowError:
+                        raise ValueError("dv accumulated to a non-finite value")
+                    if not math.isfinite(acc):
+                        raise ValueError("dv accumulated to a non-finite value")
+                gv = float(acc)
+                if not math.isfinite(gv):
+                    raise ValueError("dv became non-finite")
+                dvj[voff + a] = gv
+
+        # dbias：零矩阵，按 r、i、j 升序把 ds 累加至偏移桶；越界距离与
+        # 前向同样裁剪到 ±R 桶。
+        for rr in range(-R, R + 1):
+            acc = 0.0
+            for i in range(T):
+                for j in range(T):
+                    rel = j - i
+                    if rel < -R:
+                        rel = -R
+                    elif rel > R:
+                        rel = R
+                    if rel == rr:
+                        acc += ds[i][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dbias accumulated to a non-finite value")
+            dbh[rr + R] = acc
+
+    return dq, dk, dv, dbias
+
+
 def attention_context_backward(n, memory, du):
     """注意力上下文加残差 u = n + attention([n], memory, memory)[0] 的反向。
 
@@ -917,6 +1258,183 @@ class MHA(object):
             raise
 
         return dx, dWq, dWk, dWv, dWo
+
+    def forward_relative(self, x, bias, mask=None):
+        """带相对位置偏置的投影多头自注意力前向，返回 (y, w) 并缓存快照。
+
+        x、mask、self.Wq/Wk/Wv/Wo 的契约与校验完全沿用 forward；bias 须为
+        heads×(2R+1) 的 F 矩阵，列数须为正奇数（R 由 (列数-1)/2 确定），否则
+        抛 ValueError。依次求 q=xWqᵀ、k=xWkᵀ、v=xWvᵀ；令 d=D/heads，每个
+        (i, j) 的分数 s 从 0.0 按 a 升序累加 q[i][r*d+a]*k[j][r*d+a]，再取
+            s/sqrt(d) + bias[r][max(-R, min(R, j-i)) + R]
+        （第 r 头、越界距离裁剪到 ±R 桶）。mask、softmax、值加权与输出投影
+        Wo 均沿用 forward。y 为 T×D、w 为 heads×T×T 的逐层新建 float 列表，
+        不修改或复用输入、bias 与投影属性，并缓存供紧随其后的
+        backward_relative 使用。任一中间量非有限抛 ValueError；任何失败都
+        清空缓存。实参数量错误沿用 Python 自带的 TypeError。
+        """
+        D, heads = self.D, self.heads
+        # 任何失败的 forward_relative 都使既有缓存失效。
+        self._cache = None
+        try:
+            xc = self._check_x(x)
+            T = len(xc)
+            biasc, R = _check_relative_bias(bias, heads)
+            Wq = _check_matrix(self.Wq, D, D, "Wq")
+            Wk = _check_matrix(self.Wk, D, D, "Wk")
+            Wv = _check_matrix(self.Wv, D, D, "Wv")
+            Wo = _check_matrix(self.Wo, D, D, "Wo")
+            Wq = [[float(v) for v in row] for row in Wq]
+            Wk = [[float(v) for v in row] for row in Wk]
+            Wv = [[float(v) for v in row] for row in Wv]
+            Wo = [[float(v) for v in row] for row in Wo]
+
+            q = self._project(Wq, xc, T, D, "q")
+            k = self._project(Wk, xc, T, D, "k")
+            v = self._project(Wv, xc, T, D, "v")
+
+            # mask 的形状、bool 类型与全屏蔽行契约由相对注意力沿用
+            # _attention_check 的同一校验保证。
+            c, w = relative_multihead_attention(
+                q, k, v, heads, biasc, R, mask)
+
+            # y[t][a] = Σ_j Wo[a][j]*c[t][j]，j 自 0.0 升序。
+            y = [[0.0] * D for _ in range(T)]
+            for t in range(T):
+                ct = c[t]
+                yt = y[t]
+                for a in range(D):
+                    Woa = Wo[a]
+                    acc = 0.0
+                    for j in range(D):
+                        acc += Woa[j] * ct[j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "output projection accumulated to a "
+                                "non-finite value")
+                    yt[a] = acc
+
+            # mask 独立快照：None 保持 None，否则逐行新建 bool 拷贝。
+            if mask is None:
+                mask_c = None
+            else:
+                mask_c = [list(mask[t]) for t in range(T)]
+        except ValueError:
+            self._cache = None
+            raise
+
+        self._cache = ("mha_relative", T, D, heads, xc, q, k, v, c, w,
+                       mask_c, biasc, R, Wq, Wk, Wv, Wo)
+        return y, w
+
+    def backward_relative(self, dy):
+        """相对位置偏置投影多头自注意力反向。
+
+        返回 (dx, dWq, dWk, dWv, dWo, dbias)。须紧随一次成功的
+        forward_relative（其后缓存未被任何其他 forward 类调用替换或被失败
+        清空），否则抛 ValueError；dy 须为与前向 y 同形的 T×D F 矩阵，否则
+        抛 ValueError。dWo、dc 沿用 backward 的 Wo 路径公式与次序；注意力
+        内部 dw 沿用值路径，并令
+            ds[i][j] = w[i][j]*(dw[i][j] - Σ_k w[i][k]*dw[i][k])
+        （求和下标 k 自 0.0 升序，mask False 位取 0.0），dq/dk 改用
+        ds/sqrt(d)，dv 及其余梯度沿用 backward 的次序；dbias 为与 bias 同形
+        的零矩阵，按 r、i、j 升序把 ds 累加至偏移桶
+        max(-R, min(R, j-i))+R。dx 为 T×D，dWq/dWk/dWv/dWo 为 D×D，dbias
+        为 heads×(2R+1) 的逐层新建 float 列表，不修改 dy、缓存或投影属性；
+        成功时缓存保留，重复调用结果相同。任一中间量非有限或反向失败均抛
+        ValueError 并清空缓存。实参数量错误沿用 Python 自带的 TypeError。
+        """
+        cache = self._cache
+        try:
+            if type(cache) is not tuple or len(cache) != 17 \
+                    or cache[0] != "mha_relative":
+                raise ValueError(
+                    "backward_relative requires a successful "
+                    "forward_relative pass before it")
+            (_, T, D, heads, xc, q, k, v, c, w, mask_c, biasc, R,
+             Wq, Wk, Wv, Wo) = cache
+            dy = _check_matrix(dy, T, D, "dy")
+            dy = [[float(z) for z in row] for row in dy]
+
+            # dWo[a][j] = Σ_t dy[t][a]*c[t][j]，t 自 0.0 升序。
+            dWo = [[0.0] * D for _ in range(D)]
+            for a in range(D):
+                dWoa = dWo[a]
+                for j in range(D):
+                    acc = 0.0
+                    for t in range(T):
+                        acc += dy[t][a] * c[t][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dWo accumulated to a non-finite value")
+                    dWoa[j] = acc
+
+            # dc[t][j] = Σ_a dy[t][a]*Wo[a][j]，a 自 0.0 升序。
+            dc = [[0.0] * D for _ in range(T)]
+            for t in range(T):
+                dyt = dy[t]
+                dct = dc[t]
+                for j in range(D):
+                    acc = 0.0
+                    for a in range(D):
+                        acc += dyt[a] * Wo[a][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dc accumulated to a non-finite value")
+                    dct[j] = acc
+
+            dq, dk, dv, dbias = relative_multihead_attention_backward(
+                q, k, v, dc, heads, biasc, R, w, mask_c)
+
+            # dWq/dWk/dWv[a][j] = Σ_t d{q,k,v}[t][a]*x[t][j]，t 升序。
+            dWq = [[0.0] * D for _ in range(D)]
+            dWk = [[0.0] * D for _ in range(D)]
+            dWv = [[0.0] * D for _ in range(D)]
+            for a in range(D):
+                dWqa, dWka, dWva = dWq[a], dWk[a], dWv[a]
+                for j in range(D):
+                    aq = ak = av = 0.0
+                    for t in range(T):
+                        aq += dq[t][a] * xc[t][j]
+                        if not math.isfinite(aq):
+                            raise ValueError(
+                                "dWq accumulated to a non-finite value")
+                        ak += dk[t][a] * xc[t][j]
+                        if not math.isfinite(ak):
+                            raise ValueError(
+                                "dWk accumulated to a non-finite value")
+                        av += dv[t][a] * xc[t][j]
+                        if not math.isfinite(av):
+                            raise ValueError(
+                                "dWv accumulated to a non-finite value")
+                    dWqa[j], dWka[j], dWva[j] = aq, ak, av
+
+            # dx[t][j]：q、k、v 三路径之和，按 a 自 0.0 升序累加。
+            dx = [[0.0] * D for _ in range(T)]
+            for t in range(T):
+                dqt, dkt, dvt = dq[t], dk[t], dv[t]
+                dxt = dx[t]
+                for j in range(D):
+                    acc = 0.0
+                    for a in range(D):
+                        acc += dqt[a] * Wq[a][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dx accumulated to a non-finite value")
+                        acc += dkt[a] * Wk[a][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dx accumulated to a non-finite value")
+                        acc += dvt[a] * Wv[a][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dx accumulated to a non-finite value")
+                    dxt[j] = acc
+        except ValueError:
+            self._cache = None
+            raise
+
+        return dx, dWq, dWk, dWv, dWo, dbias
 
     def forward_cross(self, qx, kvx, mask=None):
         """投影多头交叉注意力前向，返回 (y, w) 并缓存反向所需快照。
