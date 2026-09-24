@@ -126,6 +126,79 @@ def _tiny_lstm_mha_relative_model():
     }
 
 
+class SampleLstmMhaRelativeTopKCliTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.model_path = os.path.join(self._tmp.name, "model.json")
+        text = json.dumps(_tiny_lstm_mha_relative_model(), ensure_ascii=True,
+                          separators=(",", ":"), allow_nan=False) + "\n"
+        with open(self.model_path, "wb") as f:
+            f.write(text.encode("utf-8"))
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, _SEQMODEL, "sample-lstm-mha-relative-top-k",
+             self.model_path, *args],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def test_success_determinism_and_shape(self):
+        first = self._run("a", "0", "1.0", "0.5", "1", "5", "4")
+        second = self._run("a", "0", "1.0", "0.5", "1", "5", "4")
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(first.stderr, b"")
+        self.assertEqual(first.stdout, second.stdout)
+        self.assertTrue(first.stdout.endswith(b"\n"))
+        self.assertEqual(len(first.stdout.decode("utf-8")), 6)
+
+    def test_zero_length_outputs_lf_only(self):
+        result = self._run("a", "0", "1.0", "0.5", "1", "0", "4")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"\n")
+        self.assertEqual(result.stderr, b"")
+
+    def test_top_k_equal_vocab_size_succeeds(self):
+        result = self._run("a", "0", "1.0", "0.5", "2", "5", "4")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(len(result.stdout.decode("utf-8")), 6)
+
+    def test_top_k_above_vocab_size_fails(self):
+        result = self._run("a", "0", "1.0", "0.5", "3", "5", "4")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"error\n")
+
+    def test_top_k_huge_digit_count_fails(self):
+        result = self._run("a", "0", "1.0", "0.5", "9" * 400, "5", "4")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"error\n")
+
+    def test_bad_top_k_lexicon_fails(self):
+        for top_k in ("0", "01", "1.0", "-1", "1_0", "+1"):
+            result = self._run("a", "0", "1.0", "0.5", top_k, "5", "4")
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, b"")
+            self.assertEqual(result.stderr, b"error\n")
+
+    def test_bad_window_fails(self):
+        result = self._run("a", "0", "1.0", "0.5", "1", "5", "0")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"error\n")
+
+    def test_missing_model_fails(self):
+        result = subprocess.run(
+            [sys.executable, _SEQMODEL, "sample-lstm-mha-relative-top-k",
+             os.path.join(self._tmp.name, "nope.json"),
+             "a", "0", "1.0", "0.5", "1", "5", "4"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"error\n")
+
+
 class MhaRelativeBucketStatsCliTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

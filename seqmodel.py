@@ -11108,6 +11108,186 @@ def _sample_lstm_mha_relative_topp(model_path, start, seed_text,
     return "".join(out) + "\n"
 
 
+def _sample_lstm_mha_relative_topk(model_path, start, seed_text,
+                                   start_t_text, end_t_text, top_k_text,
+                                   length_text, window_text):
+    """以线性退火温度与 top-k 抽样、带相对位置偏置多头交叉注意力从
+    version 5 的 LSTM-MHA 模型采样。
+
+    除 TOP_K 与选样外，MODEL、START、SEED、START_T、END_T、LENGTH、
+    WINDOW 的校验、version 5 模型的 LSTM 推进、相对位置 MHA 窗口、Why/by
+    logit、稳定 softmax、线性温度退火、唯一随机源与有限性失败契约均完全沿
+    用 sample-lstm-mha-relative-anneal；模型装载不经随机初始化，整次调用
+    仅初始化一次 r=random.Random(int(SEED))，不写任何文件。
+
+    TOP_K 整串匹配 [1-9][0-9]*，且数学值 K 不超过 V=len(vocab)。先按十
+    进制位数及同长度字典序与 V 的十进制文本比较：位数更长、或同位数且字
+    典序更大即越界失败；仅比较通过后才转 int，任意位数文本都不触发整数
+    转换异常。
+
+    每步先按原顺序求温度缩放后的 a[k]、m=max(a)、e[k]=exp(a[k]-m)，d 自
+    0.0 依 k 升序累加。再将索引按 (-e[k], k) 升序排列（e 降序、并列时 k
+    升序），候选恰为该序前 K 项；s 自 0.0 按候选序累加 e。令
+    u=random()*s，再从 0.0 依候选序累加 e，选择首个累计值严格大于 u 的
+    索引；无则取候选末项。以该字符更新 x 并向 memory 追加 h 的 float 副
+    本、向 pos 追加 t+1。任一新增运算非有限均抛 ValueError。LENGTH 为 0
+    时不计算温度且仅输出 LF；为 1 时仅用 START_T。成功返回 LENGTH 个码
+    点再加一个 LF。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    (vocab, W, b, Wq, Wk, Wv, Wo, heads, bias,
+     Why, by, h0, c0) = _load_perplexity_lstm_mha_relative_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # START_T、END_T：float() 可解析且有限、严格大于 0。
+    start_t = float(start_t_text)
+    if not math.isfinite(start_t) or start_t <= 0.0:
+        raise ValueError("START_T must be a finite positive float")
+    end_t = float(end_t_text)
+    if not math.isfinite(end_t) or end_t <= 0.0:
+        raise ValueError("END_T must be a finite positive float")
+
+    # TOP_K：整串匹配 [1-9][0-9]*，且 K<=V。先以十进制位数、同位数字典序
+    # 与 str(V) 比较，越界即失败；仅通过后才 int()，任何长度文本都不会触发
+    # 整数转换异常（str(V) 受内存约束而位数有界）。
+    if not _WINDOW_RE.match(top_k_text):
+        raise ValueError("TOP_K must match [1-9][0-9]*")
+    v_text = str(V)
+    if len(top_k_text) > len(v_text) or (
+            len(top_k_text) == len(v_text) and top_k_text > v_text):
+        raise ValueError("TOP_K must not exceed len(vocab)")
+    top_k = int(top_k_text)
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    if length == 1:
+        # 仅用 START_T，不求值退火表达式。
+        def temperature_at(t):
+            return start_t
+    elif length >= 2:
+        def temperature_at(t):
+            # 严格按 START_T+(END_T-START_T)*t/(LENGTH-1) 的运算顺序求值。
+            temp = start_t + (end_t - start_t) * t / (length - 1)
+            if not math.isfinite(temp) or temp <= 0.0:
+                raise ValueError(
+                    "annealed temperature became non-finite or non-positive")
+            return temp
+    else:
+        temperature_at = None  # LENGTH 为 0：循环不执行，不计算温度。
+
+    # 不经随机初始化装入 W、b 与四组投影：整次调用对 random.Random 的唯一
+    # 一次构造即下方 random.Random(seed)，LENGTH 为 0、1 时亦如此。
+    cell = _lstm_cell_loaded(V, H, W, b)
+    mha = _mha_loaded(H, heads, Wq, Wk, Wv, Wo)
+
+    rng = random.Random(seed)
+    # 与 sample-lstm-mha-relative 相同：h0 保留模型原值，
+    # forward_cross_relative 会先复制再投影；各步 h 本就是 float。
+    memory = [h0]
+    pos = [0]
+    h = list(h0)
+    c = list(c0)
+    x = vocab.index(start)
+    out = []
+
+    for t in range(length):
+        temperature = temperature_at(t)
+        # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+        xvec = [0.0] * V
+        xvec[x] = 1.0
+        h, c = cell.forward(xvec, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        P = pos[len(memory) - len(M):]
+        ctx, _w = mha.forward_cross_relative([h], M, [t + 1], P, bias,
+                                             None)
+        ctx0 = ctx[0]
+        u = [0.0] * H
+        for i in range(H):
+            ui = h[i] + ctx0[i]
+            if not math.isfinite(ui):
+                raise ValueError("attention-adjusted hidden state became "
+                                 "non-finite")
+            u[i] = ui
+
+        # logit 仅以 u 替代 h；下标与累加顺序同 _sample_lstm_mha。
+        z = _output_logits(Why, by, u)
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # 索引按 (-e_k, k) 升序：e 降序、并列时 k 升序；候选恰为前 K 项。
+        order = sorted(range(V), key=lambda k: (-e[k], k))
+        candidates = order[:top_k]
+
+        # s 自 0.0 按候选序累加 e。
+        s = 0.0
+        for idx in candidates:
+            s += e[idx]
+            if not math.isfinite(s):
+                raise ValueError("top-k mass accumulated non-finitely")
+
+        # u=r.random()*s；按候选序自 0.0 累加 e，选首个累计值严格大于 u
+        # 者；无则取候选末项。
+        threshold = rng.random() * s
+        if not math.isfinite(threshold):
+            raise ValueError("sample threshold became non-finite")
+        chosen = candidates[-1]
+        cum = 0.0
+        for idx in candidates:
+            cum += e[idx]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > threshold:
+                chosen = idx
+                break
+
+        out.append(vocab[chosen])
+        x = chosen
+        memory.append([float(v) for v in h])
+        pos.append(t + 1)
+
+    return "".join(out) + "\n"
+
+
 def _sample_lstm_mha_topp_run(model_path, start, seed_text, start_t_text,
                               end_t_text, top_p_text, length_text,
                               window_text):
@@ -15962,6 +16142,19 @@ def main(argv):
     末项，更新 x 并追加 h 副本与 t+1 到 pos。LENGTH 为 0 时不求温度且仅
     输出 LF，为 1 时仅用 START_T。Unicode 按 UTF-8 输出，不写文件。
 
+    python seqmodel.py sample-lstm-mha-relative-top-k MODEL START SEED
+    START_T END_T TOP_K LENGTH WINDOW：以线性退火温度与 top-k 抽样、带
+    相对位置偏置多头交叉注意力从 version 5 的模型采样。除 TOP_K 与选样
+    外，模型与参数校验、LENGTH 为 0/1 的处理、退火、LSTM/相对位置 MHA
+    状态推进及唯一随机源均沿用 sample-lstm-mha-relative-anneal。TOP_K
+    整串匹配 [1-9][0-9]* 且数学值 K<=V，先按十进制位数及同长字典序与 V
+    比较，越界失败，通过后才转 int。每步按原顺序求 a[k]、m=max(a)、
+    e[k]=exp(a[k]-m)，索引按 (-e[k],k) 升序取前 K 项，s 自 0.0 依序累
+    加；u=random()*s，再依序累加 e，选首个累计值严格大于 u 的索引，无
+    则取末项，随后沿用原状态更新；任一新增运算非有限即失败。成功时
+    stdout 恰为 LENGTH 个码点的 UTF-8 编码再加一个 LF，stderr 为空，
+    不写文件。
+
     python seqmodel.py sample-lstm-mha-top-p MODEL START SEED START_T
     END_T TOP_P LENGTH WINDOW：以线性退火温度与 top-p（核）抽样、带投影
     多头交叉注意力从 version 4 的 LSTM-MHA 模型采样。除 TOP_P 与选样外，
@@ -16621,6 +16814,12 @@ def main(argv):
         elif (len(argv) == 10
               and argv[1] == "sample-lstm-mha-relative-top-p"):
             output = _sample_lstm_mha_relative_topp(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                argv[8], argv[9])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif (len(argv) == 10
+              and argv[1] == "sample-lstm-mha-relative-top-k"):
+            output = _sample_lstm_mha_relative_topk(
                 argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
                 argv[8], argv[9])
             sys.stdout.buffer.write(output.encode("utf-8"))
