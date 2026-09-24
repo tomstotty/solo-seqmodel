@@ -6671,6 +6671,131 @@ def _sample_transformer(model_path, start, seed_text, temperature_text,
     return "".join(out) + "\n"
 
 
+def _score_transformer(model_path, start, text, temperature_text):
+    """评分 TEXT 在单层 Transformer 块语言模型下的总对数概率，返回字符串。
+
+    MODEL 沿用 perplexity-transformer 的十四键顺序、形状、F 及严格 UTF-8
+    契约（_load_perplexity_transformer_model）；START、TEMPERATURE 的词法与
+    校验完全沿用 sample-transformer；TEXT 为可空 Unicode 串，逐码点均须在
+    词表内，否则抛 ValueError。本入口无 SEED、随机源，也不写任何文件。
+
+    置 prefix=[START 索引]、total=0.0；t 升序遍历 TEXT，每步以完整 prefix
+    构造 L×V one-hot 输入与 mask[i][j]=(j<=i) 的因果掩码，调用装参的
+    TransformerBlock(V,heads,P).forward 并取末行 y，自 float(by[k]) 按 j
+    升序累加 Why[k][j]*y[j] 得 z，令 a_k=z_k/TEMPERATURE 并依 k 升序求
+    m=max(a) 与 d=Σ_k exp(a_k-m)。令 q 为 TEXT[t] 的词表索引，
+    lp=a_q-m-log(d)；total 自 0.0 按 t 升序累加 lp，再把 q 追加到
+    prefix。任一乘加、指数、对数、除法或累计结果非有限均抛 ValueError。
+    成功返回 format(total,'.17g')+'\\n'，空 TEXT 为 '0\\n'。
+    """
+    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
+        _load_perplexity_transformer_model(model_path)
+    V = len(vocab)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # TEMPERATURE：float() 可解析且有限、严格大于 0；inf/nan/0/负数均失败。
+    temperature = float(temperature_text)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite positive float")
+
+    # TEXT：可空串；每个码点均须在词表内。
+    if type(text) is not str:
+        raise ValueError("TEXT must be a str")
+    table = {ch: i for i, ch in enumerate(vocab)}
+    seq = [0] * len(text)
+    for t, ch in enumerate(text):
+        q = table.get(ch)
+        if q is None:
+            raise ValueError("TEXT contains an out-of-vocab codepoint")
+        seq[t] = q
+
+    prefix = [vocab.index(start)]
+    total = 0.0
+
+    block = TransformerBlock(V, heads, P)
+    block.attn.Wq = [list(row) for row in Wq]
+    block.attn.Wk = [list(row) for row in Wk]
+    block.attn.Wv = [list(row) for row in Wv]
+    block.attn.Wo = [list(row) for row in Wo]
+    block.W1 = [list(row) for row in W1]
+    block.b1 = list(b1)
+    block.W2 = [list(row) for row in W2]
+    block.b2 = list(b2)
+
+    for t in range(len(seq)):
+        L = len(prefix)
+
+        # L×V one-hot 输入，第 i 行仅 prefix[i] 列为 1.0。
+        x = [[0.0] * V for _ in range(L)]
+        for i in range(L):
+            x[i][prefix[i]] = 1.0
+
+        # 因果掩码：mask[i][j] = (j <= i)。
+        mask = [[j <= i for j in range(L)] for i in range(L)]
+
+        # TransformerBlock.forward 自身校验非有限并抛 ValueError。
+        y_all = block.forward(x, mask)[0]
+        y = y_all[-1]
+
+        # z_k = by_k + Σ_j Why_k,j*y_j，依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(V):
+                acc += why_row[j] * y[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # a_k=z_k/T，m=max(a)，依 k 升序求值。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+
+        # d 从 0.0 依 k 升序累加 exp(a_k-m)。
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # lp = a_q - m - log(d)，total 自 0.0 按 t 升序累加。
+        log_d = math.log(d)
+        if not math.isfinite(log_d):
+            raise ValueError("log denominator became non-finite")
+        q = seq[t]
+        lp = a[q] - m
+        if not math.isfinite(lp):
+            raise ValueError("log-probability step became non-finite")
+        lp -= log_d
+        if not math.isfinite(lp):
+            raise ValueError("log-probability step became non-finite")
+        total += lp
+        if not math.isfinite(total):
+            raise ValueError("total log-probability accumulated non-finitely")
+
+        prefix.append(q)
+
+    return format(total, ".17g") + "\n"
+
+
 def _sample_transformer_anneal(model_path, start, seed_text, start_t_text,
                                end_t_text, length_text):
     """以线性退火温度从单层 Transformer 块语言模型采样 LENGTH 个码点。
@@ -18366,6 +18491,18 @@ def main(argv):
     分母与累计阈值抽样均沿用 sample；选中字符的索引追加到 prefix。任一中间
     量非有限即失败。输出契约与 sample 相同，不写文件。
 
+    python seqmodel.py score-transformer MODEL START TEXT TEMPERATURE：
+    MODEL、START、TEMPERATURE 的读取与校验沿用 sample-transformer；TEXT 为
+    可空 Unicode 串，逐码点均须在词表内，否则失败；无 SEED、随机源或文件
+    写入。置 prefix=[START 索引]、total=0.0；t 升序遍历 TEXT，每步以完整
+    prefix 构造 one-hot 输入与因果掩码，调用装参的
+    TransformerBlock(V,heads,P).forward 取末行，按既定 j、k 升序求
+    Why/by 仿射 z、温度缩放 a、m=max(a) 及 d=Σexp(a_k-m)；令 q 为
+    TEXT[t] 索引，lp=a[q]-m-log(d)，total 自 0.0 按 t 升序累加 lp，再把
+    q 追加到 prefix。任一乘加、指数、对数、除法或累计结果非有限即失败。
+    成功时 stdout 恰为 format(total,'.17g')+'\\n' 的 ASCII 字节，空 TEXT
+    为 '0\\n'。
+
     python seqmodel.py sample-transformer-anneal MODEL START SEED START_T
     END_T LENGTH：以线性退火温度从单层 Transformer 块语言模型采样。除温度
     外，MODEL、START、SEED、LENGTH 的校验，以及 prefix 的 one-hot 输入、
@@ -19552,6 +19689,9 @@ def main(argv):
             output = _beam_lstm_attn_topk_topp_nbest_scored(
                 argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
                 argv[8], argv[9], argv[10], argv[11])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 6 and argv[1] == "score-transformer":
+            output = _score_transformer(argv[2], argv[3], argv[4], argv[5])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 7 and argv[1] == "sample-transformer":
             output = _sample_transformer(argv[2], argv[3], argv[4], argv[5],
