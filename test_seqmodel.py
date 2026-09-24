@@ -401,5 +401,109 @@ class PerplexityTransformerWindowCliTest(unittest.TestCase):
         self.assertEqual(result.stderr, b"error\n")
 
 
+class SampleTransformerWindowCliTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.model_path = os.path.join(self._tmp.name, "model.json")
+        text = json.dumps(_tiny_transformer_model(), ensure_ascii=True,
+                          separators=(",", ":"), allow_nan=False) + "\n"
+        with open(self.model_path, "wb") as f:
+            f.write(text.encode("utf-8"))
+
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, _SEQMODEL, "sample-transformer-window",
+             self.model_path, *args],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def _run_full(self, start, seed, temperature, length):
+        return subprocess.run(
+            [sys.executable, _SEQMODEL, "sample-transformer",
+             self.model_path, start, seed, temperature, length],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def test_large_window_byte_identical_to_full_context(self):
+        # 各步 prefix 长度至多 LENGTH+1；WINDOW>=LENGTH+1（含任意长位数）
+        # 须与 sample-transformer 逐字节相同。
+        length = "7"
+        full = self._run_full("a", "3", "0.9", length)
+        self.assertEqual(full.returncode, 0)
+        self.assertEqual(full.stderr, b"")
+        for window in ("8", "9", "100", "9" * 80):
+            result = self._run("a", "3", "0.9", length, window)
+            self.assertEqual(result.returncode, 0, window)
+            self.assertEqual(result.stderr, b"", window)
+            self.assertEqual(result.stdout, full.stdout, window)
+            self.assertEqual(len(result.stdout.decode("utf-8")), 8)
+
+    def test_smaller_windows_are_deterministic(self):
+        for window in ("1", "2", "3", "7"):
+            first = self._run("a", "3", "0.9", "7", window)
+            second = self._run("a", "3", "0.9", "7", window)
+            self.assertEqual(first.returncode, 0, window)
+            self.assertEqual(first.stderr, b"", window)
+            self.assertEqual(first.stdout, second.stdout)
+            self.assertTrue(first.stdout.endswith(b"\n"))
+            self.assertEqual(len(first.stdout.decode("utf-8")), 8)
+
+    def test_window_smaller_than_prefix_truncates(self):
+        # LENGTH=10：WINDOW=10 在末步 prefix 长度 11 时仍截断，须与满上下文
+        # WINDOW=11 不同（小模型亦应在某步出现差异）。
+        big = self._run("a", "1", "1.0", "10", "11")
+        small = self._run("a", "1", "1.0", "10", "1")
+        self.assertEqual(big.returncode, 0)
+        self.assertEqual(small.returncode, 0)
+        full = self._run_full("a", "1", "1.0", "10")
+        self.assertEqual(big.stdout, full.stdout)
+
+    def test_zero_length_outputs_lf_only(self):
+        for window in ("1", "5", "9" * 80):
+            result = self._run("a", "0", "1.0", "0", window)
+            self.assertEqual(result.returncode, 0, window)
+            self.assertEqual(result.stdout, b"\n", window)
+            self.assertEqual(result.stderr, b"", window)
+
+    def test_bad_window_lexicon_fails(self):
+        for window in ("0", "01", "1.0", "-1", "+1", "1_0", "", "a"):
+            result = self._run("a", "0", "1.0", "5", window)
+            self.assertEqual(result.returncode, 2, window)
+            self.assertEqual(result.stdout, b"", window)
+            self.assertEqual(result.stderr, b"error\n", window)
+
+    def test_other_validation_follows_sample_transformer(self):
+        # START、SEED、TEMPERATURE、LENGTH 与 MODEL 错误协议沿用原命令。
+        bad_args = [
+            ("z", "0", "1.0", "5", "4"),       # 表外 START
+            ("a", "01", "1.0", "5", "4"),      # 非法 SEED
+            ("a", "0", "0", "5", "4"),         # 零温度
+            ("a", "0", "nan", "5", "4"),       # nan 温度
+            ("a", "0", "1.0", "-1", "4"),      # 负 LENGTH
+            ("a", "0", "1.0", "1.0", "4"),     # 非法 LENGTH
+        ]
+        for args in bad_args:
+            result = self._run(*args)
+            self.assertEqual(result.returncode, 2, args)
+            self.assertEqual(result.stdout, b"", args)
+            self.assertEqual(result.stderr, b"error\n", args)
+        result = subprocess.run(
+            [sys.executable, _SEQMODEL, "sample-transformer-window",
+             os.path.join(self._tmp.name, "nope.json"),
+             "a", "0", "1.0", "5", "4"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"error\n")
+
+    def test_wrong_argc_fails(self):
+        result = subprocess.run(
+            [sys.executable, _SEQMODEL, "sample-transformer-window",
+             self.model_path, "a", "0", "1.0", "5"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"error\n")
+
+
 if __name__ == "__main__":
     unittest.main()
