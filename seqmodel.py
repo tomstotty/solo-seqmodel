@@ -9212,9 +9212,17 @@ def _sample_lstm_mha_anneal(model_path, start, seed_text, start_t_text,
     return "".join(out) + "\n"
 
 
-def _sample_lstm_mha_topp(model_path, start, seed_text, start_t_text,
-                          end_t_text, top_p_text, length_text, window_text):
-    """以线性退火温度与 top-p（核）抽样从 version 4 的 LSTM-MHA 模型采样。
+def _sample_lstm_mha_topp_run(model_path, start, seed_text, start_t_text,
+                              end_t_text, top_p_text, length_text,
+                              window_text):
+    """sample-lstm-mha-top-p 与 -scored 共享的采样核心。
+
+    校验、LSTM/MHA 状态推进、Why/by logit、稳定 softmax、线性温度退火、
+    top-p 前缀截取、随机源初始化与消费、选索引规则及有限性失败契约均与
+    _sample_lstm_mha_topp 文档一致。返回 (text, logprobs, total)：text 为
+    生成码点拼接串（不含尾随 LF）；logprobs 为每步选中索引 k 对应的
+    a[k]-m-log(s)（s 为 top-p 前缀质量）；total 自 0.0 按 t 升序累加各
+    lp。任一 lp 或 total 非有限均抛 ValueError。
 
     除 TOP_P 与选样外，MODEL、START、SEED、LENGTH、WINDOW 的校验、LSTM/MHA
     状态推进、Why/by logit、稳定 softmax、线性温度退火、唯一随机源与有限性
@@ -9228,8 +9236,8 @@ def _sample_lstm_mha_topp(model_path, start, seed_text, start_t_text,
     s 为该前缀按该序自 0.0 累加所得之和。令 u=random()*s，再按前缀顺序自
     0.0 累加 e，选首个累计值严格大于 u 的索引；无则取前缀末项。其字符追加
     到输出并作为下一输入 x，随后向 memory 追加 h 的 float 副本。任一新增
-    运算非有限均抛 ValueError。LENGTH 为 0 时不计算温度且仅输出 LF；为 1
-    时仅用 START_T。成功返回 LENGTH 个码点再加一个 LF。
+    运算非有限均抛 ValueError。LENGTH 为 0 时不计算温度；为 1 时仅用
+    START_T。
     """
     if not _WINDOW_RE.match(window_text):
         raise ValueError("WINDOW must match [1-9][0-9]*")
@@ -9294,6 +9302,8 @@ def _sample_lstm_mha_topp(model_path, start, seed_text, start_t_text,
     c = list(c0)
     x = vocab.index(start)
     out = []
+    logprobs = []
+    total = 0.0
 
     for t in range(length):
         temperature = temperature_at(t)
@@ -9374,11 +9384,63 @@ def _sample_lstm_mha_topp(model_path, start, seed_text, start_t_text,
                 chosen = idx
                 break
 
+        # 选中索引 k 后，以既有 a、m 与前缀质量 s 计算选中项对数概率，
+        # total 自 0.0 按 t 升序累加；任一结果非有限即失败。
+        lp = a[chosen] - m - math.log(s)
+        if not math.isfinite(lp):
+            raise ValueError("selected log-prob became non-finite")
+        total += lp
+        if not math.isfinite(total):
+            raise ValueError("total log-prob accumulated non-finitely")
+        logprobs.append(lp)
+
         out.append(vocab[chosen])
         x = chosen
         memory.append([float(v) for v in h])
 
-    return "".join(out) + "\n"
+    return "".join(out), logprobs, total
+
+
+def _sample_lstm_mha_topp(model_path, start, seed_text, start_t_text,
+                          end_t_text, top_p_text, length_text, window_text):
+    """以线性退火温度与 top-p（核）抽样从 version 4 的 LSTM-MHA 模型采样。
+
+    采样与校验全部沿用 _sample_lstm_mha_topp_run，本包装仅取其生成文本。
+    成功返回 LENGTH 个码点再加一个 LF。
+    """
+    text, _logprobs, _total = _sample_lstm_mha_topp_run(
+        model_path, start, seed_text, start_t_text, end_t_text, top_p_text,
+        length_text, window_text)
+    return text + "\n"
+
+
+def _sample_lstm_mha_topp_scored(model_path, start, seed_text, start_t_text,
+                                 end_t_text, top_p_text, length_text,
+                                 window_text):
+    """sample-lstm-mha-top-p-scored：输出文本、逐步对数概率与累计对数概率。
+
+    全部校验、LSTM/MHA 状态推进、温度退火、top-p 前缀截取、随机源初始化与
+    消费、选索引规则及错误协议均沿用 sample-lstm-mha-top-p；同参须消费相
+    同随机序列并生成与原入口一致的 text。每步选中索引 k 后，以既有 a、m
+    和前缀质量 s 计算 lp=a[k]-m-log(s)；total 从 0.0 按 t 升序累加 lp，任
+    一结果非有限即失败。stdout 恰为单个 JSON 对象加 LF，键序
+    text,logprobs,total_logprob；text 为生成字符串（不含尾随 LF），
+    logprobs 为 LENGTH 长字符串列表、第 t 项为 format(lp,'.17g')，
+    total_logprob 为 format(total,'.17g')；LENGTH 为 0 时三值依次为 ""、
+    []、"0"。序列化恰用
+    json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n' 的 UTF-8 字节。不写文件。
+    """
+    text, logprobs, total = _sample_lstm_mha_topp_run(
+        model_path, start, seed_text, start_t_text, end_t_text, top_p_text,
+        length_text, window_text)
+    obj = {
+        "text": text,
+        "logprobs": [format(lp, ".17g") for lp in logprobs],
+        "total_logprob": format(total, ".17g"),
+    }
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
 
 
 def _sample_lstm_mha_topk(model_path, start, seed_text, start_t_text,
@@ -13322,6 +13384,20 @@ def main(argv):
     末项，更新 x 并追加 h 副本。LENGTH 为 0 时不求温度且仅输出 LF，为 1
     时仅用 START_T。Unicode 按 UTF-8 输出，不写文件。
 
+    python seqmodel.py sample-lstm-mha-top-p-scored MODEL START SEED
+    START_T END_T TOP_P LENGTH WINDOW：全部校验、LSTM/MHA 状态推进、温度
+    退火、top-p 前缀截取、随机源初始化与消费、选索引规则及错误协议均沿
+    用 sample-lstm-mha-top-p；同参须消费相同随机序列并生成与原入口一致
+    的 text。每步选中索引 k 后，以既有 a、m 和前缀质量 s 计算
+    lp=a[k]-m-log(s)；total 从 0.0 按 t 升序累加 lp，任一结果非有限即
+    失败。stdout 恰为单个 JSON 对象加 LF，键序 text,logprobs,
+    total_logprob；text 为生成字符串（不含尾随 LF），logprobs 为 LENGTH
+    长字符串列表、第 t 项为 format(lp,'.17g')，total_logprob 为
+    format(total,'.17g')；LENGTH 为 0 时三值依次为 ""、[]、"0"。序列化
+    恰用 json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n' 的 UTF-8 字节。返回码、stderr 及不写文件行为
+    均沿用原入口。
+
     python seqmodel.py sample-lstm-mha-top-k MODEL START SEED START_T
     END_T TOP_K LENGTH WINDOW：以线性退火温度与 top-k 抽样、带投影多头
     交叉注意力从 version 4 的 LSTM-MHA 模型采样。除 TOP_K 与选样外，模
@@ -13870,6 +13946,12 @@ def main(argv):
             output = _sample_lstm_mha_topp(argv[2], argv[3], argv[4],
                                            argv[5], argv[6], argv[7],
                                            argv[8], argv[9])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif (len(argv) == 10
+              and argv[1] == "sample-lstm-mha-top-p-scored"):
+            output = _sample_lstm_mha_topp_scored(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                argv[8], argv[9])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 10 and argv[1] == "sample-lstm-mha-top-k":
             output = _sample_lstm_mha_topk(argv[2], argv[3], argv[4],
