@@ -6544,6 +6544,133 @@ def _train_transformer(model_path, corpus_path, out_path):
                 pass
 
 
+def _sample_transformer(model_path, start, seed_text, temperature_text,
+                        length_text):
+    """从单层 Transformer 字符模型采样 LENGTH 个码点，返回待写出的字符串。
+
+    MODEL 严格沿用 perplexity-transformer 的 version 6 十四键顺序、形状、
+    F 及严格 UTF-8 契约；START、SEED、TEMPERATURE、LENGTH 的词法与校验
+    完全沿用 _sample。整次调用仅初始化一次 r=random.Random(int(SEED))，
+    不写任何文件。
+
+    置 prefix=[START 索引]。循环 LENGTH 次：令 L=len(prefix)，以 prefix 构
+    造 L×V one-hot 输入及 mask[i][j]=(j<=i) 的 L×L 因果掩码，调用装入
+    Wq、Wk、Wv、Wo、W1、b1、W2、b2 的 TransformerBlock(V, heads,
+    P).forward 并取末行 h=y[L-1]；按 perplexity-transformer 的 float
+    偏置与 j 升序累加计算 logit z_k = by_k + Σ_j Why_k,j*h_j。温度缩放、
+    减最大值 softmax、k 升序分母与累计阈值抽样逐项沿用 _sample；选中字
+    追加到输出，其索引追加到 prefix。任一中间量非有限均抛 ValueError。
+    成功返回 LENGTH 个码点再加一个 LF（零长度仅 LF）。
+    """
+    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
+        _load_perplexity_transformer_model(model_path)
+    V = len(vocab)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # TEMPERATURE：float() 可解析且有限、严格大于 0；inf/nan/0/负数均失败。
+    temperature = float(temperature_text)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    block = TransformerBlock(V, heads, P)
+    block.attn.Wq = [list(row) for row in Wq]
+    block.attn.Wk = [list(row) for row in Wk]
+    block.attn.Wv = [list(row) for row in Wv]
+    block.attn.Wo = [list(row) for row in Wo]
+    block.W1 = [list(row) for row in W1]
+    block.b1 = list(b1)
+    block.W2 = [list(row) for row in W2]
+    block.b2 = list(b2)
+
+    rng = random.Random(seed)
+    prefix = [vocab.index(start)]
+    out = []
+
+    for _t in range(length):
+        L = len(prefix)
+
+        # prefix 的 L×V one-hot 输入矩阵。
+        x = [[0.0] * V for _ in range(L)]
+        for i in range(L):
+            x[i][prefix[i]] = 1.0
+
+        # 因果掩码：mask[i][j] = (j <= i)。
+        mask = [[j <= i for j in range(L)] for i in range(L)]
+
+        y = block.forward(x, mask)[0]
+        h = y[L - 1]
+
+        # z_k = by_k + Σ_j Why_k,j*h_j，依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(V):
+                acc += why_row[j] * h[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # u=r.random()*d；自 0.0 依 k 升序累加 e_k，选首个累计值严格大于
+        # u 者；无则取词表末项。
+        u = rng.random() * d
+        if not math.isfinite(u):
+            raise ValueError("sample threshold became non-finite")
+        chosen = V - 1
+        cum = 0.0
+        for k in range(V):
+            cum += e[k]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > u:
+                chosen = k
+                break
+
+        out.append(vocab[chosen])
+        prefix.append(chosen)
+
+    return "".join(out) + "\n"
+
+
 _GRU_MODEL_KEYS = ["version", "vocab", "W", "b", "Why", "by", "h0"]
 
 
@@ -18167,6 +18294,18 @@ def main(argv):
     float、紧凑 ASCII 转义 JSON 加 LF、负零保留与同目录临时文件原子替换
     均沿用 train-lstm-mha。成功时 stdout 为空并返回 0。
 
+    python seqmodel.py sample-transformer MODEL START SEED TEMPERATURE
+    LENGTH：MODEL 沿用 perplexity-transformer 的十四键顺序、形状、F 及严
+    格 UTF-8 契约；START、SEED、TEMPERATURE、LENGTH 的词法与校验沿用
+    sample，仅创建一次 random.Random(int(SEED))。置 prefix=[START 索引]。
+    每步以 prefix 构造 L×V one-hot 输入（L=len(prefix)）及
+    mask[i][j]=(j<=i) 的因果掩码，调用装参的
+    TransformerBlock(V,heads,P).forward 并取末行 y；从 float(by[k]) 起按
+    j 升序累加 Why[k][j]*y[j] 得 z。温度缩放、减最大值 softmax、k 升序
+    分母与累计阈值抽样沿用 sample；选中字追加到输出，其索引追加到
+    prefix。中间量非有限即失败。成功返回 0、stderr 空，stdout 恰为
+    LENGTH 个 UTF-8 码点加 LF（零长度仅 LF），不写文件。
+
     python seqmodel.py train-gru-attn-tbptt MODEL CORPUS OUT WINDOW K：
     MODEL、CORPUS、OUT、0.1 更新、5.0 裁剪及成败协议沿用 train-gru；
     WINDOW 沿用 perplexity-gru-attn 的词法及任意位数安全截取。K 整串匹配
@@ -18227,6 +18366,10 @@ def main(argv):
         elif len(argv) == 7 and argv[1] == "sample-lstm":
             output = _sample_lstm(argv[2], argv[3], argv[4], argv[5],
                                   argv[6])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 7 and argv[1] == "sample-transformer":
+            output = _sample_transformer(argv[2], argv[3], argv[4], argv[5],
+                                         argv[6])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 7 and argv[1] == "sample-gru":
             output = _sample_gru(argv[2], argv[3], argv[4], argv[5],
