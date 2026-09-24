@@ -6119,6 +6119,196 @@ def _perplexity_lstm(model_path, corpus_path):
     return format(perplexity, ".17g") + "\n"
 
 
+_TRANSFORMER_MODEL_KEYS = ["version", "vocab", "heads", "P", "Wq", "Wk",
+                           "Wv", "Wo", "W1", "b1", "W2", "b2", "Why", "by"]
+
+
+def _load_perplexity_transformer_model(path):
+    """读取并校验 perplexity-transformer 模型文件，返回解包后的十三元组。
+
+    文件须为 UTF-8 编码的 JSON 对象，顶层键恰为
+    version、vocab、heads、P、Wq、Wk、Wv、Wo、W1、b1、W2、b2、Why、by
+    且按此顺序出现（重复或多余均非法）：version 的 type 恰为 int 且值为
+    6；vocab 的契约与 perplexity-lstm 相同（非空列表，每项是恰含一个码点
+    的 str，元素唯一且按码点严格升序）；heads、P 为非 bool 的正 int 且
+    heads 整除 V=len(vocab)；其余十项为 F 列表，形状依次为 V×V、V×V、
+    V×V、V×V、P×V、P、V×P、V、V×V、V。任何读取、UTF-8、JSON 或校验失败
+    均抛 ValueError（或 OSError）。
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+    # 先按严格 UTF-8 解码，再交由 json 解析（object_pairs_hook 保留键序与
+    # 重复键，root 非对象时不会得到 (key, value) 二元组列表）。
+    text = raw.decode("utf-8")
+    pairs = json.loads(text, object_pairs_hook=list)
+    if type(pairs) is not list or len(pairs) != len(_TRANSFORMER_MODEL_KEYS):
+        raise ValueError("model must be a JSON object with exactly 14 keys")
+    for pair, key in zip(pairs, _TRANSFORMER_MODEL_KEYS):
+        if type(pair) is not tuple or len(pair) != 2 or pair[0] != key:
+            raise ValueError("model keys must be exactly %r in order"
+                             % _TRANSFORMER_MODEL_KEYS)
+    model = dict(pairs)
+
+    version = model["version"]
+    if type(version) is not int or version != 6:
+        raise ValueError("version must be exactly int 6, got %r" % (version,))
+
+    vocab = model["vocab"]
+    if type(vocab) is not list or len(vocab) == 0:
+        raise ValueError("vocab must be a non-empty list")
+    for ch in vocab:
+        # len(str) 按码点计数，组合字符序列等多码点串在此被拒。
+        if type(ch) is not str or len(ch) != 1:
+            raise ValueError("vocab entries must be single-codepoint strings, "
+                             "got %r" % (ch,))
+    if len(set(vocab)) != len(vocab) or vocab != sorted(vocab):
+        raise ValueError("vocab entries must be unique and sorted by codepoint")
+    V = len(vocab)
+
+    heads = model["heads"]
+    if type(heads) is bool or type(heads) is not int or heads <= 0:
+        raise ValueError(
+            "heads must be a non-bool positive int, got %r" % (heads,))
+    if V % heads != 0:
+        raise ValueError("heads (%d) must divide V=%d" % (heads, V))
+
+    P = model["P"]
+    if type(P) is bool or type(P) is not int or P <= 0:
+        raise ValueError("P must be a non-bool positive int, got %r" % (P,))
+
+    def check_matrix(key, rows, cols):
+        mat = model[key]
+        if type(mat) is not list or len(mat) != rows:
+            raise ValueError(
+                "%s must be a list of shape %d×%d" % (key, rows, cols))
+        for row in mat:
+            if type(row) is not list or len(row) != cols:
+                raise ValueError(
+                    "%s must be a list of shape %d×%d" % (key, rows, cols))
+            for v in row:
+                if not _is_f(v):
+                    raise ValueError("%s entries must be finite numbers, got %r"
+                                     % (key, v))
+        return mat
+
+    def check_vector(key, size):
+        vec = model[key]
+        if type(vec) is not list or len(vec) != size:
+            raise ValueError("%s must be a list of length %d" % (key, size))
+        for v in vec:
+            if not _is_f(v):
+                raise ValueError("%s entries must be finite numbers, got %r"
+                                 % (key, v))
+        return vec
+
+    Wq = check_matrix("Wq", V, V)
+    Wk = check_matrix("Wk", V, V)
+    Wv = check_matrix("Wv", V, V)
+    Wo = check_matrix("Wo", V, V)
+    W1 = check_matrix("W1", P, V)
+    b1 = check_vector("b1", P)
+    W2 = check_matrix("W2", V, P)
+    b2 = check_vector("b2", V)
+    Why = check_matrix("Why", V, V)
+    by = check_vector("by", V)
+
+    return vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by
+
+
+def _perplexity_transformer(model_path, corpus_path):
+    """计算单层 Transformer 块语言模型在给定语料上的困惑度，返回字符串。
+
+    MODEL 为 version 6 的十四键严格 JSON（见
+    _load_perplexity_transformer_model）；CORPUS 沿用 perplexity-lstm 的
+    严格 UTF-8 全文码点、至少 2 码点及无表外字符契约。
+
+    令 T=len(CORPUS)-1，x 为前 T 个字符的 T×V one-hot 矩阵，mask 为 T×T
+    且 mask[i][j]=(j<=i)；将 Wq、Wk、Wv、Wo、W1、b1、W2、b2 装入
+    TransformerBlock(V, heads, P) 后以 (x, mask) 前向取 y。t 升序以
+    y[t] 替代 perplexity-lstm 中的 h，按相同的下标、float 偏置与升序累加
+    规则计算 z_k = by_k + Σ_j Why_k,j*y[t][j]，并以减最大值的
+    log-sum-exp 累加下一字符的负对数似然。任一中间量非有限（含最终
+    exp(L/T) 溢出）均抛 ValueError。成功返回
+    format(exp(L/T), '.17g') + '\\n'。
+    """
+    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
+        _load_perplexity_transformer_model(model_path)
+    V = len(vocab)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    T = len(ids) - 1
+
+    # 前 T 个字符的 T×V one-hot 输入矩阵。
+    x = [[0.0] * V for _ in range(T)]
+    for t in range(T):
+        x[t][ids[t]] = 1.0
+
+    # 因果掩码：mask[i][j] = (j <= i)。
+    mask = [[j <= i for j in range(T)] for i in range(T)]
+
+    block = TransformerBlock(V, heads, P)
+    block.attn.Wq = [list(row) for row in Wq]
+    block.attn.Wk = [list(row) for row in Wk]
+    block.attn.Wv = [list(row) for row in Wv]
+    block.attn.Wo = [list(row) for row in Wo]
+    block.W1 = [list(row) for row in W1]
+    block.b1 = list(b1)
+    block.W2 = [list(row) for row in W2]
+    block.b2 = list(b2)
+
+    y = block.forward(x, mask)[0]
+
+    L = 0.0
+    for t in range(T):
+        h = y[t]
+        target = ids[t + 1]
+
+        # z_k = by_k + Σ_j Why_k,j*h_j，依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(V):
+                acc += why_row[j] * h[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # log-sum-exp：m=max(z)，d 从 0.0 依 k 升序累加 exp(z_k-m)。
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        d = 0.0
+        for k in range(V):
+            d += math.exp(z[k] - m)
+            if not math.isfinite(d):
+                raise ValueError("softmax denominator accumulated non-finitely")
+
+        step = m + math.log(d) - z[target]
+        if not math.isfinite(step):
+            raise ValueError("cross-entropy step is non-finite")
+        L += step
+        if not math.isfinite(L):
+            raise ValueError("total cross-entropy accumulated non-finitely")
+
+    perplexity = math.exp(L / T)
+    if not math.isfinite(perplexity):
+        raise ValueError("perplexity is non-finite")
+    return format(perplexity, ".17g") + "\n"
+
+
 _GRU_MODEL_KEYS = ["version", "vocab", "W", "b", "Why", "by", "h0"]
 
 
@@ -17766,6 +17956,9 @@ def main(argv):
             _train(argv[2], argv[3], argv[4])
         elif len(argv) == 4 and argv[1] == "perplexity-lstm":
             output = _perplexity_lstm(argv[2], argv[3])
+            sys.stdout.buffer.write(output.encode("ascii"))
+        elif len(argv) == 4 and argv[1] == "perplexity-transformer":
+            output = _perplexity_transformer(argv[2], argv[3])
             sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 4 and argv[1] == "perplexity-gru":
             output = _perplexity_gru(argv[2], argv[3])
