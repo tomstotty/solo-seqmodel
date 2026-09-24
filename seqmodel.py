@@ -6812,6 +6812,146 @@ def _sample_transformer(model_path, start, seed_text, temperature_text,
     return "".join(out) + "\n"
 
 
+def _sample_transformer_window(model_path, start, seed_text, temperature_text,
+                               length_text, window_text):
+    """有限上下文版本的 sample-transformer，采样 LENGTH 个码点后返回字符串。
+
+    MODEL、START、SEED、TEMPERATURE、LENGTH 的读取、词法、校验、唯一随机源
+    初始化及输出/失败协议完全沿用 _sample_transformer；WINDOW 整串匹配
+    [1-9][0-9]*（任意位数均合法，不先转无界整数），否则抛 ValueError。
+
+    置 prefix=[START 索引]。每步以十进制位数与同长字典序安全求
+    n=min(WINDOW,len(prefix))（_safe_window_min），仅以 prefix 末尾 n 项
+    构造 n×V one-hot 输入与 mask[i][j]=(j<=i) 的 n×n 因果掩码，调用装参
+    TransformerBlock.forward 仅取末行 y；Why/by 仿射、温度缩放、减最大值
+    softmax 及 k 升序阈值抽样逐项沿用 sample-transformer；选中码点追加至
+    输出，其索引追加到完整 prefix。每步均以截断窗口独立前向，不复用任何
+    窗外状态。WINDOW 每步都不小于 prefix 长度时，末行输入与整 prefix 前向
+    完全相同（注意力对末行只依赖该行及其之前各行），故与同参
+    sample-transformer 逐字节相同。任一中间量非有限均抛 ValueError。成功
+    返回 LENGTH 个码点再加一个 LF；LENGTH 为 0 时不前向，仅返回 LF。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
+        _load_perplexity_transformer_model(model_path)
+    V = len(vocab)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # TEMPERATURE：float() 可解析且有限、严格大于 0；inf/nan/0/负数均失败。
+    temperature = float(temperature_text)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    rng = random.Random(seed)
+    prefix = [vocab.index(start)]
+
+    block = TransformerBlock(V, heads, P)
+    block.attn.Wq = [list(row) for row in Wq]
+    block.attn.Wk = [list(row) for row in Wk]
+    block.attn.Wv = [list(row) for row in Wv]
+    block.attn.Wo = [list(row) for row in Wo]
+    block.W1 = [list(row) for row in W1]
+    block.b1 = list(b1)
+    block.W2 = [list(row) for row in W2]
+    block.b2 = list(b2)
+
+    out = []
+
+    for _t in range(length):
+        L = len(prefix)
+
+        # 安全求 n=min(WINDOW,L)；超长 WINDOW 不先转无界整数。
+        n = _safe_window_min(window_text, L)
+
+        # 仅取完整 prefix 的末尾 n 项作为本步窗口。
+        tail = prefix[L - n:]
+
+        # n×V one-hot 输入，窗口第 i 行仅 tail[i] 列为 1.0。
+        x = [[0.0] * V for _ in range(n)]
+        for i in range(n):
+            x[i][tail[i]] = 1.0
+
+        # 窗口内因果掩码：mask[i][j] = (j <= i)。
+        mask = [[j <= i for j in range(n)] for i in range(n)]
+
+        # 每步独立前向，仅取末行；不携带任何窗外状态。
+        # TransformerBlock.forward 自身校验非有限并抛 ValueError。
+        y_all = block.forward(x, mask)[0]
+        y = y_all[-1]
+
+        # z_k = by_k + Σ_j Why_k,j*y_j，依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(V):
+                acc += why_row[j] * y[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # u=r.random()*d；自 0.0 依 k 升序累加 e_k，选首个累计值严格大于
+        # u 者；无则取词表末项。
+        u = rng.random() * d
+        if not math.isfinite(u):
+            raise ValueError("sample threshold became non-finite")
+        chosen = V - 1
+        cum = 0.0
+        for k in range(V):
+            cum += e[k]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > u:
+                chosen = k
+                break
+
+        out.append(vocab[chosen])
+        prefix.append(chosen)
+
+    return "".join(out) + "\n"
+
+
 _TRANSFORMER_RESUME_STATE_KEYS = ("v", "sha", "args", "p", "r")
 
 
@@ -20120,6 +20260,10 @@ def main(argv):
         elif len(argv) == 7 and argv[1] == "sample-transformer":
             output = _sample_transformer(argv[2], argv[3], argv[4], argv[5],
                                          argv[6])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 8 and argv[1] == "sample-transformer-window":
+            output = _sample_transformer_window(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 8 and argv[1] == "sample-transformer-anneal":
             output = _sample_transformer_anneal(
