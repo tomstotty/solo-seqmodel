@@ -6671,6 +6671,152 @@ def _sample_transformer(model_path, start, seed_text, temperature_text,
     return "".join(out) + "\n"
 
 
+def _sample_transformer_anneal(model_path, start, seed_text, start_t_text,
+                               end_t_text, length_text):
+    """以线性退火温度从单层 Transformer 块语言模型采样 LENGTH 个码点。
+
+    除温度外，MODEL、START、SEED、LENGTH 的校验与 prefix 的 one-hot 输入、
+    因果掩码、TransformerBlock.forward、Why/by 仿射、稳定 softmax 及词表
+    升序阈值抽样与状态更新均沿用 _sample_transformer。START_T、END_T 各经
+    float() 解析，结果须有限且严格大于 0，否则抛 ValueError。整次调用仅
+    初始化一次 r=random.Random(int(SEED))，不写任何文件。
+
+    LENGTH 为 0 时不求温度、不执行前向，仅输出 LF；为 1 时仅用 START_T；
+    否则 t 自 0 升序，第 t 步温度严格按 Python 表达式
+    START_T+(END_T-START_T)*t/(LENGTH-1) 求值，结果非有限或不大于 0 即抛
+    ValueError。每步以该温度替换 _sample_transformer 的固定温度，其余运算
+    次序不变，随机源与 prefix 跨步连续。任一中间量非有限均抛 ValueError。
+    成功返回 LENGTH 个码点再加一个 LF。
+    """
+    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
+        _load_perplexity_transformer_model(model_path)
+    V = len(vocab)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # START_T、END_T：float() 可解析且有限、严格大于 0。
+    start_t = float(start_t_text)
+    if not math.isfinite(start_t) or start_t <= 0.0:
+        raise ValueError("START_T must be a finite positive float")
+    end_t = float(end_t_text)
+    if not math.isfinite(end_t) or end_t <= 0.0:
+        raise ValueError("END_T must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    if length == 1:
+        # 仅用 START_T，不求值退火表达式。
+        def temperature_at(t):
+            return start_t
+    elif length >= 2:
+        def temperature_at(t):
+            # 严格按 START_T+(END_T-START_T)*t/(LENGTH-1) 的运算顺序求值。
+            temp = start_t + (end_t - start_t) * t / (length - 1)
+            if not math.isfinite(temp) or temp <= 0.0:
+                raise ValueError(
+                    "annealed temperature became non-finite or non-positive")
+            return temp
+    else:
+        temperature_at = None  # LENGTH 为 0：循环不执行，不计算温度。
+
+    rng = random.Random(seed)
+    prefix = [vocab.index(start)]
+    out = []
+
+    block = TransformerBlock(V, heads, P)
+    block.attn.Wq = [list(row) for row in Wq]
+    block.attn.Wk = [list(row) for row in Wk]
+    block.attn.Wv = [list(row) for row in Wv]
+    block.attn.Wo = [list(row) for row in Wo]
+    block.W1 = [list(row) for row in W1]
+    block.b1 = list(b1)
+    block.W2 = [list(row) for row in W2]
+    block.b2 = list(b2)
+
+    for t in range(length):
+        temperature = temperature_at(t)
+        L = len(prefix)
+
+        # L×V one-hot 输入，第 i 行仅 prefix[i] 列为 1.0。
+        x = [[0.0] * V for _ in range(L)]
+        for i in range(L):
+            x[i][prefix[i]] = 1.0
+
+        # 因果掩码：mask[i][j] = (j <= i)。
+        mask = [[j <= i for j in range(L)] for i in range(L)]
+
+        # TransformerBlock.forward 自身校验非有限并抛 ValueError。
+        y_all = block.forward(x, mask)[0]
+        y = y_all[-1]
+
+        # z_k = by_k + Σ_j Why_k,j*y_j，依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(V):
+                acc += why_row[j] * y[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # u=r.random()*d；自 0.0 依 k 升序累加 e_k，选首个累计值严格大于
+        # u 者；无则取词表末项。
+        u = rng.random() * d
+        if not math.isfinite(u):
+            raise ValueError("sample threshold became non-finite")
+        chosen = V - 1
+        cum = 0.0
+        for k in range(V):
+            cum += e[k]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > u:
+                chosen = k
+                break
+
+        out.append(vocab[chosen])
+        prefix.append(chosen)
+
+    return "".join(out) + "\n"
+
+
 _GRU_MODEL_KEYS = ["version", "vocab", "W", "b", "Why", "by", "h0"]
 
 
@@ -17517,6 +17663,17 @@ def main(argv):
     分母与累计阈值抽样均沿用 sample；选中字符的索引追加到 prefix。任一中间
     量非有限即失败。输出契约与 sample 相同，不写文件。
 
+    python seqmodel.py sample-transformer-anneal MODEL START SEED
+    START_T END_T LENGTH：除温度外，MODEL、START、SEED、LENGTH 校验，
+    以及 prefix 的 one-hot 输入、因果掩码、TransformerBlock.forward、
+    Why/by 仿射、稳定 softmax、词表升序阈值抽样与状态更新均沿用
+    sample-transformer。START_T、END_T 各经 float() 解析，须有限且严格
+    大于 0；整次仅初始化一次随机源。LENGTH 为 0 时不求温度、不执行前向，
+    仅输出 LF；为 1 时仅用 START_T；否则 t 自 0 升序，第 t 步温度严格按
+    START_T+(END_T-START_T)*t/(LENGTH-1) 求值且每步须有限、大于 0；以该
+    温度替换固定温度，其余运算次序不变，随机源与 prefix 跨步连续。输出
+    契约与 sample 相同，不写文件。
+
     python seqmodel.py sample-lstm MODEL START SEED TEMPERATURE LENGTH：
     MODEL 为 version 2 的 LSTM 模型（键 version、vocab、W、b、Why、by、
     h0、c0），置 h=h0、c=c0、x=START 索引，每步以 x 的 V 长 one-hot 调用
@@ -18657,6 +18814,11 @@ def main(argv):
         elif len(argv) == 7 and argv[1] == "sample-transformer":
             output = _sample_transformer(argv[2], argv[3], argv[4], argv[5],
                                          argv[6])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif (len(argv) == 8
+              and argv[1] == "sample-transformer-anneal"):
+            output = _sample_transformer_anneal(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7])
             sys.stdout.buffer.write(output.encode("utf-8"))
         else:
             raise ValueError(
