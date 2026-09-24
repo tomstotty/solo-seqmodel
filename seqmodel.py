@@ -9893,6 +9893,141 @@ def _sample_lstm_mha(model_path, start, seed_text, temperature_text,
     return "".join(out) + "\n"
 
 
+def _sample_lstm_mha_relative(model_path, start, seed_text,
+                              temperature_text, length_text, window_text):
+    """带相对位置偏置多头交叉注意力从 version 5 的模型采样 LENGTH 个码点。
+
+    MODEL、WINDOW 的读取、词法、十四键、bias、F、形状与安全截取完全沿用
+    perplexity-lstm-mha-relative；START、SEED、TEMPERATURE、LENGTH 的校
+    验、唯一随机源、温度 softmax、词表升序阈值抽样、输出及错误协议均沿
+    用 sample-lstm-mha。整次调用仅初始化一次
+    r=random.Random(int(SEED))，不写任何文件。
+
+    置 h=h0、c=c0、x=START 索引、memory=[h0]、pos=[0]。第 t 步（t 自 0
+    升序）循环 LENGTH 次：以 x 的 V 长 one-hot 调用装入 W、b 的
+    LSTMCell.forward(x, h, c)，取前两项更新 h、c；M 取 memory 末尾
+    min(WINDOW, len(memory)) 项（顺序从旧到新），P 取 pos 的同一切片，
+    以装入 Wq、Wk、Wv、Wo 构造的 MHA(H, heads) 调用
+    forward_cross_relative([h], M, [t+1], P, bias, None)，取首项 ctx，
+    按 i 升序令 u[i] = h[i] + ctx[0][i]。logit 仅以 u 替代
+    sample-lstm-mha 中的 u，温度缩放、稳定 softmax、随机阈值、k 升序累
+    计与选中规则逐项沿用；追加 vocab[k]，令 x=k，再向 memory 追加 h 的
+    float 副本、向 pos 追加 t+1。任一中间量非有限均抛 ValueError。成功
+    返回 LENGTH 个码点再加一个 LF。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    (vocab, W, b, Wq, Wk, Wv, Wo, heads, bias,
+     Why, by, h0, c0) = _load_perplexity_lstm_mha_relative_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # TEMPERATURE：float() 可解析且有限、严格大于 0；inf/nan/0/负数均失败。
+    temperature = float(temperature_text)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    # 不经随机初始化装入 W、b 与四组投影：整次调用对 random.Random 的唯一
+    # 一次构造即下方 random.Random(seed)，LENGTH 为 0 时亦如此。
+    cell = _lstm_cell_loaded(V, H, W, b)
+    mha = _mha_loaded(H, heads, Wq, Wk, Wv, Wo)
+
+    rng = random.Random(seed)
+    # 与 perplexity-lstm-mha-relative 相同：h0 保留模型原值，
+    # forward_cross_relative 会先复制再投影；各步 h 本就是 float。
+    memory = [h0]
+    pos = [0]
+    h = list(h0)
+    c = list(c0)
+    x = vocab.index(start)
+    out = []
+
+    for t in range(length):
+        # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+        xvec = [0.0] * V
+        xvec[x] = 1.0
+        h, c = cell.forward(xvec, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        P = pos[len(memory) - len(M):]
+        ctx, _w = mha.forward_cross_relative([h], M, [t + 1], P, bias,
+                                             None)
+        ctx0 = ctx[0]
+        u = [0.0] * H
+        for i in range(H):
+            ui = h[i] + ctx0[i]
+            if not math.isfinite(ui):
+                raise ValueError("attention-adjusted hidden state became "
+                                 "non-finite")
+            u[i] = ui
+
+        # logit 仅以 u 替代 h；下标与累加顺序同 _sample_lstm_mha。
+        z = _output_logits(Why, by, u)
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # u=r.random()*d；自 0.0 依 k 升序累加 e_k，选首个累计值严格大于
+        # u 者；无则取词表末项。
+        threshold = rng.random() * d
+        if not math.isfinite(threshold):
+            raise ValueError("sample threshold became non-finite")
+        chosen = V - 1
+        cum = 0.0
+        for k in range(V):
+            cum += e[k]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > threshold:
+                chosen = k
+                break
+
+        out.append(vocab[chosen])
+        x = chosen
+        memory.append([float(v) for v in h])
+        pos.append(t + 1)
+
+    return "".join(out) + "\n"
+
+
 _RESUME_STATE_KEYS = ("v", "sha", "args", "c", "x", "m", "r")
 
 
@@ -13979,9 +14114,10 @@ def _train_lstm_mha_relative(model_path, corpus_path, out_path,
     dW、db。
 
     梯度组序为 dW、db、dWq、dWk、dWv、dWo、dbias、dWhy、dby，依行序
-    累加平方和求全局范数，超过 5.0 即统一缩放至 5.0；九组参数各减去
-    0.1 倍（裁剪后的）梯度，heads、h0、c0 不变。任一中间量或结果非
-    有限均抛 ValueError。
+    累加平方和求全局范数，超过 5.0 即统一缩放至 5.0；平方和溢出时取
+    a=max|g|，同序自 0.0 累加 q+=(g/a)**2，以 (g/a)*(5.0/sqrt(q)) 为
+    裁剪梯度。九组参数各减去 0.1 倍（裁剪后的）梯度，heads、h0、c0 不
+    变。任一梯度或更新结果非有限均抛 ValueError。
 
     OUT 顶层键依次且仅为 version、vocab、W、b、Wq、Wk、Wv、Wo、heads、
     bias、Why、by、h0、c0（version 恰为 int 5，heads 仍为非 bool
@@ -14201,34 +14337,52 @@ def _train_lstm_mha_relative(model_path, corpus_path, out_path,
     _dxs, _dh0, _dc0, dW, db = cell.backward_sequence(dhs, caches)
 
     # 依 dW、db、dWq、dWk、dWv、dWo、dbias、dWhy、dby 行序累加平方和求
-    # 全局范数。
+    # 全局范数；任一梯度非有限即失败。平方和溢出（梯度本身均有限）时不
+    # 再误报失败：取 a=max|g|，同序自 0.0 累加 q+=(g/a)**2，以
+    # (g/a)*(5.0/sqrt(q)) 为裁剪梯度；未溢出路径与原先逐字节一致。
+    groups = (dW, db, dWq, dWk, dWv, dWo, dbias, dWhy, dby)
     sum_sq = 0.0
-    for group in (dW, db, dWq, dWk, dWv, dWo, dbias, dWhy, dby):
-        if type(group[0]) is list:
-            for row in group:
-                for v in row:
-                    if not math.isfinite(v):
-                        raise ValueError("gradient is non-finite")
-                    sum_sq += v * v
-                    if not math.isfinite(sum_sq):
-                        raise ValueError(
-                            "global norm accumulated to a non-finite value")
-        else:
-            for v in group:
+    max_abs = 0.0
+    overflowed = False
+    for group in groups:
+        rows = group if type(group[0]) is list else (group,)
+        for row in rows:
+            for v in row:
                 if not math.isfinite(v):
                     raise ValueError("gradient is non-finite")
-                sum_sq += v * v
-                if not math.isfinite(sum_sq):
-                    raise ValueError(
-                        "global norm accumulated to a non-finite value")
+                av = abs(v)
+                if av > max_abs:
+                    max_abs = av
+                if not overflowed:
+                    sum_sq += v * v
+                    if not math.isfinite(sum_sq):
+                        overflowed = True
 
-    global_norm = math.sqrt(sum_sq)
-    scale = 5.0 / global_norm if global_norm > 5.0 else 1.0
+    if overflowed:
+        # 同序自 0.0 累加 q+=(g/a)**2；max_abs>0（否则平方和不会溢出），
+        # 每项 (g/a)**2<=1，q 必有限。
+        q = 0.0
+        for group in groups:
+            rows = group if type(group[0]) is list else (group,)
+            for row in rows:
+                for v in row:
+                    r = v / max_abs
+                    q += r * r
+        rescale = 5.0 / math.sqrt(q)
+
+        def _clip(grad):
+            return (grad / max_abs) * rescale
+    else:
+        global_norm = math.sqrt(sum_sq)
+        scale = 5.0 / global_norm if global_norm > 5.0 else 1.0
+
+        def _clip(grad):
+            return grad * scale
 
     # 九组参数减 0.1 倍（裁剪后的）梯度；heads、h0、c0 不变。结果非有限
     # 即失败。
     def _updated(old, grad):
-        value = float(old) - 0.1 * (grad * scale)
+        value = float(old) - 0.1 * _clip(grad)
         if not math.isfinite(value):
             raise ValueError("updated parameter became non-finite")
         return value
@@ -14812,6 +14966,19 @@ def main(argv):
     整次仅构造一次 random.Random(int(SEED))；任一中间量非有限即失败；输出
     契约与 sample 相同，不写文件。
 
+    python seqmodel.py sample-lstm-mha-relative MODEL START SEED TEMPERATURE
+    LENGTH WINDOW：MODEL、WINDOW 沿用 perplexity-lstm-mha-relative
+    （version 5 十四键、bias、pos 序列与 forward_cross_relative），其余
+    参数校验、唯一随机源、温度 softmax、词表升序阈值抽样、输出及错误协议
+    均沿用 sample-lstm-mha。置 h=h0、c=c0、x=START 索引、memory=[h0]、
+    pos=[0]，第 t 步推进 LSTM 后，M 取 memory 末尾至多 WINDOW 项（从旧到
+    新），P 取 pos 的同一切片，调用 forward_cross_relative([h], M,
+    [t+1], P, bias, None)，以 h 与首行上下文之和 u 经 Why/by 求 logit 并
+    按原规则抽样，随后向 memory 追加 h 的 float 副本、向 pos 追加 t+1；
+    模型参数直接装入，不经随机初始化，整次仅构造一次
+    random.Random(int(SEED))；任一中间量非有限即失败；输出契约与 sample
+    相同，不写文件。
+
     python seqmodel.py sample-lstm-mha-resume MODEL START SEED TEMPERATURE
     LENGTH WINDOW STATE：前六参数及生成行为沿用 sample-lstm-mha，另以 STATE
     原子读写续跑状态。STATE 缺失时从 h0、c0、x=START 索引、memory=[h0] 与
@@ -15248,7 +15415,9 @@ def main(argv):
     按 M_t 从旧到新映射回完整记忆（h0 项梯度丢弃），dWq、dWk、dWv、
     dWo、dbias 按 t 降序及行列序从 0.0 累加，再调用
     LSTMCell.backward_sequence 取得 dW、db。梯度组序 dW、db、dWq、
-    dWk、dWv、dWo、dbias、dWhy、dby，heads、h0、c0 不更新；OUT 顶层
+    dWk、dWv、dWo、dbias、dWhy、dby（平方和溢出时取 a=max|g|，同序累加
+    q+=(g/a)**2，以 (g/a)*(5.0/sqrt(q)) 为裁剪梯度；梯度非有限仍失败），
+    heads、h0、c0 不更新；OUT 顶层
     键依次且仅为 version、vocab、W、b、Wq、Wk、Wv、Wo、heads、bias、
     Why、by、h0、c0，version 为 int 5，字节格式与 train-lstm-mha
     相同。成功时 stdout 为空并返回 0。
@@ -15420,6 +15589,10 @@ def main(argv):
         elif len(argv) == 8 and argv[1] == "sample-lstm-mha":
             output = _sample_lstm_mha(argv[2], argv[3], argv[4], argv[5],
                                       argv[6], argv[7])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 8 and argv[1] == "sample-lstm-mha-relative":
+            output = _sample_lstm_mha_relative(argv[2], argv[3], argv[4],
+                                               argv[5], argv[6], argv[7])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 9 and argv[1] == "sample-lstm-mha-resume":
             output = _sample_lstm_mha_resume(
