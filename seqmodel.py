@@ -1520,6 +1520,471 @@ class MHA(object):
 
         return dqx, dkvx, dWq, dWk, dWv, dWo
 
+    def forward_cross_relative(self, qx, kvx, qpos, kpos, bias, mask=None):
+        """相对位置交叉注意力前向，返回 (y, w) 并缓存反向快照。
+
+        qx、kvx、mask 与四个投影参数的契约完全沿用 forward_cross；qpos 须为
+        Tq 长 list、kpos 须为 Tk 长 list，元素均为非 bool 的 int 且各自严格
+        递增，否则抛 ValueError；bias 须为 heads×(2R+1) 的 F 矩阵（R>=0），
+        即行数恰为 heads、列数为正奇数，否则抛 ValueError。依次求
+        q=qxWqᵀ、k=kvxWkᵀ、v=kvxWvᵀ，令 d=D/heads；对第 r 头、查询 i、键 j，
+        分数 s 从 0.0 按 a 升序累加 q[i][r*d+a]*k[j][r*d+a]，再取
+        s/sqrt(d)+bias[r][max(-R,min(R,kpos[j]-qpos[i]))+R]。softmax、值
+        汇聚与 y=cWoᵀ 均沿用 forward_cross（同一 mask 作用于各头）。y 为
+        Tq×D、w 为 heads×Tq×Tk 的逐层新建 float 列表并缓存，不修改或复用
+        输入与投影属性。任一中间量非有限抛 ValueError；任何失败都清空缓存。
+        实参数量错误沿用 Python 自带的 TypeError。
+        """
+        D, heads = self.D, self.heads
+        # 任何失败的 forward_cross_relative 都使既有缓存失效。
+        self._cache = None
+        try:
+            qxc = self._check_x(qx)
+            Tq = len(qxc)
+            kvxc = self._check_x(kvx)
+            Tk = len(kvxc)
+
+            # qpos：Tq 长 list，元素为非 bool int 且严格递增。
+            if type(qpos) is not list or len(qpos) != Tq:
+                raise ValueError("qpos must be a list of length %d" % Tq)
+            qpos_c = []
+            qprev = None
+            for p in qpos:
+                if type(p) is bool or type(p) is not int:
+                    raise ValueError(
+                        "qpos entries must be non-bool integers, got %r"
+                        % (p,))
+                if qprev is not None and p <= qprev:
+                    raise ValueError(
+                        "qpos must be strictly increasing, got %r after %r"
+                        % (p, qprev))
+                qpos_c.append(p)
+                qprev = p
+
+            # kpos：Tk 长 list，契约同 qpos。
+            if type(kpos) is not list or len(kpos) != Tk:
+                raise ValueError("kpos must be a list of length %d" % Tk)
+            kpos_c = []
+            kprev = None
+            for p in kpos:
+                if type(p) is bool or type(p) is not int:
+                    raise ValueError(
+                        "kpos entries must be non-bool integers, got %r"
+                        % (p,))
+                if kprev is not None and p <= kprev:
+                    raise ValueError(
+                        "kpos must be strictly increasing, got %r after %r"
+                        % (p, kprev))
+                kpos_c.append(p)
+                kprev = p
+
+            if type(bias) is not list or len(bias) != heads or len(bias) == 0:
+                raise ValueError(
+                    "bias must be a non-empty list of shape %d×(2R+1)"
+                    % heads)
+            first_brow = bias[0]
+            if type(first_brow) is not list or len(first_brow) == 0 \
+                    or len(first_brow) % 2 != 1:
+                raise ValueError(
+                    "bias must have a positive odd number of columns, "
+                    "got %r" % (first_brow,))
+            W = 2 * (len(first_brow) // 2) + 1
+            R = W // 2
+            for brow in bias:
+                if type(brow) is not list or len(brow) != W:
+                    raise ValueError(
+                        "bias must be a list of shape %d×%d" % (heads, W))
+                for bv in brow:
+                    if not _is_f(bv):
+                        raise ValueError(
+                            "bias entries must be finite numbers, got %r"
+                            % (bv,))
+            bias_c = [[float(bv) for bv in brow] for brow in bias]
+            Wq = _check_matrix(self.Wq, D, D, "Wq")
+            Wk = _check_matrix(self.Wk, D, D, "Wk")
+            Wv = _check_matrix(self.Wv, D, D, "Wv")
+            Wo = _check_matrix(self.Wo, D, D, "Wo")
+            Wq = [[float(v) for v in row] for row in Wq]
+            Wk = [[float(v) for v in row] for row in Wk]
+            Wv = [[float(v) for v in row] for row in Wv]
+            Wo = [[float(v) for v in row] for row in Wo]
+
+            q = self._project(Wq, qxc, Tq, D, "q")
+            k = self._project(Wk, kvxc, Tk, D, "k")
+            v = self._project(Wv, kvxc, Tk, D, "v")
+
+            # mask 校验沿用 _attention_check 的同一契约（形状、bool 类型、
+            # 全屏蔽行），各头共用同一快照。
+            _, _, _, _, active = _attention_check(q, k, v, mask)
+
+            hd = D // heads
+            scale = math.sqrt(float(hd))
+            c = [[0.0] * D for _ in range(Tq)]
+            w = []
+            for r in range(heads):
+                off = r * hd
+                brow = bias_c[r]
+                wh = []
+                for i in range(Tq):
+                    qi = q[i]
+                    qpi = qpos_c[i]
+                    acti = active[i]
+
+                    # s[i][j] 从 0.0 按 a 升序累加头内点积，再除 sqrt(d)
+                    # 并加相对位置偏置（按 kpos[j]-qpos[i] 夹取桶）；仅
+                    # True 位参与 softmax。
+                    s_row = [0.0] * Tk
+                    for j in range(Tk):
+                        kj = k[j]
+                        acc = 0.0
+                        for a in range(hd):
+                            try:
+                                acc += qi[off + a] * kj[off + a]
+                            except OverflowError:
+                                raise ValueError(
+                                    "score dot product accumulated to a "
+                                    "non-finite value")
+                            if not math.isfinite(acc):
+                                raise ValueError(
+                                    "score dot product accumulated to a "
+                                    "non-finite value")
+                        rel = kpos_c[j] - qpi
+                        sval = acc / scale + brow[
+                            max(-R, min(R, rel)) + R]
+                        if not math.isfinite(sval):
+                            raise ValueError(
+                                "score became non-finite after scaling "
+                                "and bias")
+                        s_row[j] = sval
+
+                    # 行最大值只在 True 位取（每行至少一个 True）。
+                    m = None
+                    for j in range(Tk):
+                        if acti[j]:
+                            sj = s_row[j]
+                            if m is None or sj > m:
+                                m = sj
+
+                    # e = exp(s - m) 仅在 True 位计算；分母按 j 升序累加。
+                    e_row = [0.0] * Tk
+                    denom = 0.0
+                    for j in range(Tk):
+                        if acti[j]:
+                            try:
+                                ev = math.exp(s_row[j] - m)
+                            except OverflowError:
+                                raise ValueError("softmax exp overflowed")
+                            if not math.isfinite(ev):
+                                raise ValueError("softmax exp became "
+                                                 "non-finite")
+                            e_row[j] = ev
+                            denom += ev
+                            if not math.isfinite(denom):
+                                raise ValueError(
+                                    "softmax denominator accumulated to a "
+                                    "non-finite value")
+
+                    # False 位权重保持 0.0；归一化后须有限。
+                    w_row = [0.0] * Tk
+                    for j in range(Tk):
+                        if acti[j]:
+                            wv = e_row[j] / denom
+                            if not math.isfinite(wv):
+                                raise ValueError(
+                                    "attention weight became non-finite")
+                            w_row[j] = wv
+                    wh.append(w_row)
+                w.append(wh)
+
+            # c[i][r*d+a] 从 0.0 按 j 升序累加 w[r][i][j]*v[j][r*d+a]。
+            for r in range(heads):
+                off = r * hd
+                wr = w[r]
+                for i in range(Tq):
+                    wri = wr[i]
+                    ci = c[i]
+                    for a in range(hd):
+                        acc = 0.0
+                        for j in range(Tk):
+                            wv = wri[j]
+                            if wv != 0.0:
+                                try:
+                                    acc += wv * v[j][off + a]
+                                except OverflowError:
+                                    raise ValueError(
+                                        "context accumulated to a "
+                                        "non-finite value")
+                                if not math.isfinite(acc):
+                                    raise ValueError(
+                                        "context accumulated to a "
+                                        "non-finite value")
+                        ci[off + a] = acc
+
+            # y[t][a] = Σ_j Wo[a][j]*c[t][j]，j 自 0.0 升序。
+            y = [[0.0] * D for _ in range(Tq)]
+            for t in range(Tq):
+                ct = c[t]
+                yt = y[t]
+                for a in range(D):
+                    Woa = Wo[a]
+                    acc = 0.0
+                    for j in range(D):
+                        acc += Woa[j] * ct[j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "output projection accumulated to a "
+                                "non-finite value")
+                    yt[a] = acc
+
+            # mask 独立快照：None 保持 None，否则逐行新建 bool 拷贝。
+            if mask is None:
+                mask_c = None
+            else:
+                mask_c = [list(mask[t]) for t in range(Tq)]
+        except ValueError:
+            self._cache = None
+            raise
+
+        self._cache = ("mha_cross_relative", Tq, Tk, D, heads, R,
+                       qxc, kvxc, qpos_c, kpos_c, q, k, v, c, w, active,
+                       mask_c, Wq, Wk, Wv, Wo, bias_c)
+        return y, w
+
+    def backward_cross_relative(self, dy):
+        """相对位置交叉注意力反向，返回
+        (dqx, dkvx, dWq, dWk, dWv, dWo, dbias)。
+
+        须紧随一次成功的 forward_cross_relative（其后缓存未被任何其他
+        forward 类调用替换或被失败清空），否则抛 ValueError；dy 须为与前向
+        y 同形的 Tq×D F 矩阵，否则抛 ValueError。dWo 与 dc 沿用
+        backward_cross 的 Wo 路径；各头 ds、dq、dk、dv 沿用
+        backward_relative 的公式与次序（查询下标遍历 Tq、键下标遍历 Tk，
+        屏蔽位取 0.0），其中偏移桶按
+            max(-R,min(R,kpos[j]-qpos[i]))+R
+        夹取；dbias 为与 bias 同形的零矩阵，按 r、i、j 升序把 ds[i][j]
+        累加至对应桶。dWq、dWk、dWv、dqx、dkvx 的投影梯度沿用
+        backward_cross 的公式与次序（q 路径作用于 qx，k、v 两路径作用于
+        kvx）。dqx 为 Tq×D、dkvx 为 Tk×D，dWq/dWk/dWv/dWo 为 D×D，dbias
+        为 heads×(2R+1)，均逐层新建 float 列表，不修改 dy、缓存或投影
+        属性；成功时缓存保留，重复调用结果相同。任一中间量非有限或反向
+        失败均抛 ValueError 并清空缓存。实参数量错误沿用 Python 自带的
+        TypeError。
+        """
+        cache = self._cache
+        try:
+            if type(cache) is not tuple or len(cache) != 22 \
+                    or cache[0] != "mha_cross_relative":
+                raise ValueError(
+                    "backward_cross_relative requires a successful "
+                    "forward_cross_relative pass before it")
+            (_, Tq, Tk, D, heads, R, qxc, kvxc, qpos_c, kpos_c, q, k, v,
+             c, w, active, mask_c, Wq, Wk, Wv, Wo, bias_c) = cache
+            dy = _check_matrix(dy, Tq, D, "dy")
+            dy = [[float(z) for z in row] for row in dy]
+
+            # dWo[a][j] = Σ_t dy[t][a]*c[t][j]，t 自 0.0 升序。
+            dWo = [[0.0] * D for _ in range(D)]
+            for a in range(D):
+                dWoa = dWo[a]
+                for j in range(D):
+                    acc = 0.0
+                    for t in range(Tq):
+                        acc += dy[t][a] * c[t][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dWo accumulated to a non-finite value")
+                    dWoa[j] = acc
+
+            # dc[t][j] = Σ_a dy[t][a]*Wo[a][j]，a 自 0.0 升序。
+            dc = [[0.0] * D for _ in range(Tq)]
+            for t in range(Tq):
+                dyt = dy[t]
+                dct = dc[t]
+                for j in range(D):
+                    acc = 0.0
+                    for a in range(D):
+                        acc += dyt[a] * Wo[a][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dc accumulated to a non-finite value")
+                    dct[j] = acc
+
+            hd = D // heads
+            scale = math.sqrt(float(hd))
+            dq = [[0.0] * D for _ in range(Tq)]
+            dk = [[0.0] * D for _ in range(Tk)]
+            dv = [[0.0] * D for _ in range(Tk)]
+            dbias = [[0.0] * (2 * R + 1) for _ in range(heads)]
+            # 按 r、i、j 升序累加 dbias；其余每头梯度按头序拼回。
+            for r in range(heads):
+                off = r * hd
+                wr = w[r]
+                dbrow = dbias[r]
+                for i in range(Tq):
+                    wri = wr[i]
+                    dci = dc[i]
+                    acti = active[i]
+                    qpi = qpos_c[i]
+
+                    # dw[i][j] = Σ_a dc[i][off+a]*v[j][off+a]，a 升序，
+                    # 仅 True 位。
+                    dw = [0.0] * Tk
+                    for j in range(Tk):
+                        if acti[j]:
+                            vj = v[j]
+                            acc = 0.0
+                            for a in range(hd):
+                                try:
+                                    acc += dci[off + a] * vj[off + a]
+                                except OverflowError:
+                                    raise ValueError(
+                                        "dw accumulated to a non-finite value")
+                                if not math.isfinite(acc):
+                                    raise ValueError(
+                                        "dw accumulated to a non-finite value")
+                            dw[j] = acc
+
+                    # rsum = Σ_k w[i][k]*dw[i][k]，k 升序（屏蔽位 w 为
+                    # 0.0）。
+                    rsum = 0.0
+                    for kk in range(Tk):
+                        try:
+                            rsum += wri[kk] * dw[kk]
+                        except OverflowError:
+                            raise ValueError(
+                                "rsum accumulated to a non-finite value")
+                        if not math.isfinite(rsum):
+                            raise ValueError(
+                                "rsum accumulated to a non-finite value")
+
+                    # ds[i][j] = w*(dw-rsum)，仅 True 位；随即除以 sqrt(d)
+                    # 用于 dq/dk，并按偏移桶累加 dbias。
+                    dq_i = dq[i]
+                    for j in range(Tk):
+                        if acti[j]:
+                            try:
+                                dsij = wri[j] * (dw[j] - rsum)
+                            except OverflowError:
+                                raise ValueError(
+                                    "ds became non-finite")
+                            if not math.isfinite(dsij):
+                                raise ValueError("ds became non-finite")
+                            rel = kpos_c[j] - qpi
+                            bucket = max(-R, min(R, rel)) + R
+                            dbrow[bucket] += dsij
+                            if not math.isfinite(dbrow[bucket]):
+                                raise ValueError(
+                                    "dbias accumulated to a non-finite value")
+                            g = dsij / scale
+                            if not math.isfinite(g):
+                                raise ValueError(
+                                    "ds became non-finite after scaling")
+                            kj = k[j]
+                            for a in range(hd):
+                                try:
+                                    dq_i[off + a] += g * kj[off + a]
+                                except OverflowError:
+                                    raise ValueError(
+                                        "dq accumulated to a non-finite value")
+                                if not math.isfinite(dq_i[off + a]):
+                                    raise ValueError(
+                                        "dq accumulated to a non-finite value")
+                            dk_j = dk[j]
+                            qi = q[i]
+                            for a in range(hd):
+                                try:
+                                    dk_j[off + a] += g * qi[off + a]
+                                except OverflowError:
+                                    raise ValueError(
+                                        "dk accumulated to a non-finite value")
+                                if not math.isfinite(dk_j[off + a]):
+                                    raise ValueError(
+                                        "dk accumulated to a non-finite value")
+
+                # dv[j][off+a] = Σ_i w[r][i][j]*dc[i][off+a]，i 升序。
+                for j in range(Tk):
+                    dvj = dv[j]
+                    for a in range(hd):
+                        acc = 0.0
+                        for i in range(Tq):
+                            try:
+                                acc += wr[i][j] * dc[i][off + a]
+                            except OverflowError:
+                                raise ValueError(
+                                    "dv accumulated to a non-finite value")
+                            if not math.isfinite(acc):
+                                raise ValueError(
+                                    "dv accumulated to a non-finite value")
+                        dvj[off + a] = acc
+
+            # dWq[a][j] = Σ_t dq[t][a]*qx[t][j]，t 自 0.0 升序。
+            dWq = [[0.0] * D for _ in range(D)]
+            for a in range(D):
+                dWqa = dWq[a]
+                for j in range(D):
+                    acc = 0.0
+                    for t in range(Tq):
+                        acc += dq[t][a] * qxc[t][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dWq accumulated to a non-finite value")
+                    dWqa[j] = acc
+
+            # dWk/dWv[a][j] = Σ_s d{k,v}[s][a]*kvx[s][j]，s 自 0.0 升序。
+            dWk = [[0.0] * D for _ in range(D)]
+            dWv = [[0.0] * D for _ in range(D)]
+            for a in range(D):
+                dWka, dWva = dWk[a], dWv[a]
+                for j in range(D):
+                    ak = av = 0.0
+                    for s in range(Tk):
+                        ak += dk[s][a] * kvxc[s][j]
+                        if not math.isfinite(ak):
+                            raise ValueError(
+                                "dWk accumulated to a non-finite value")
+                        av += dv[s][a] * kvxc[s][j]
+                        if not math.isfinite(av):
+                            raise ValueError(
+                                "dWv accumulated to a non-finite value")
+                    dWka[j], dWva[j] = ak, av
+
+            # dqx[t][j] = Σ_a dq[t][a]*Wq[a][j]，a 自 0.0 升序。
+            dqx = [[0.0] * D for _ in range(Tq)]
+            for t in range(Tq):
+                dqt = dq[t]
+                dqxt = dqx[t]
+                for j in range(D):
+                    acc = 0.0
+                    for a in range(D):
+                        acc += dqt[a] * Wq[a][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dqx accumulated to a non-finite value")
+                    dqxt[j] = acc
+
+            # dkvx[s][j]：k、v 两路径之和，按 a 自 0.0 升序累加。
+            dkvx = [[0.0] * D for _ in range(Tk)]
+            for s in range(Tk):
+                dks, dvs = dk[s], dv[s]
+                dkvxs = dkvx[s]
+                for j in range(D):
+                    acc = 0.0
+                    for a in range(D):
+                        acc += dks[a] * Wk[a][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dkvx accumulated to a non-finite value")
+                        acc += dvs[a] * Wv[a][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "dkvx accumulated to a non-finite value")
+                    dkvxs[j] = acc
+        except ValueError:
+            self._cache = None
+            raise
+
+        return dqx, dkvx, dWq, dWk, dWv, dWo, dbias
+
     def forward_padded(self, xs, lengths, mask=None):
         """变长批投影多头自注意力前向，返回 (y, w) 并保存各样本独立快照。
 
