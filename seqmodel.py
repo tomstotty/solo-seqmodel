@@ -6544,6 +6544,133 @@ def _train_transformer(model_path, corpus_path, out_path):
                 pass
 
 
+def _sample_transformer(model_path, start, seed_text, temperature_text,
+                        length_text):
+    """从单层 Transformer 块语言模型采样 LENGTH 个码点，返回待写出的字符串。
+
+    MODEL 沿用 perplexity-transformer 的十四键顺序、形状、F 及严格 UTF-8
+    契约（_load_perplexity_transformer_model）；START、SEED、TEMPERATURE、
+    LENGTH 的词法与校验完全沿用 sample。整次调用仅初始化一次
+    r=random.Random(int(SEED))。
+
+    置 prefix=[START 索引]，循环 LENGTH 次：令 L=len(prefix)，以 prefix
+    构造 L×V one-hot 输入及 mask[i][j]=(j<=i) 的 L×L 因果掩码，调用装入
+    Wq、Wk、Wv、Wo、W1、b1、W2、b2 的 TransformerBlock(V, heads, P)
+    .forward 并取末行 y；从 float(by[k]) 起按 j 升序累加
+    Why[k][j]*y[j] 得 z_k。温度缩放、减最大值 softmax、k 升序分母与累计
+    阈值抽样均沿用 sample；选中字符追加到输出，其索引追加到 prefix。任一
+    中间量非有限均抛 ValueError。成功返回 LENGTH 个码点再加一个 LF。
+    """
+    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
+        _load_perplexity_transformer_model(model_path)
+    V = len(vocab)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # TEMPERATURE：float() 可解析且有限、严格大于 0；inf/nan/0/负数均失败。
+    temperature = float(temperature_text)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    rng = random.Random(seed)
+    prefix = [vocab.index(start)]
+    out = []
+
+    block = TransformerBlock(V, heads, P)
+    block.attn.Wq = [list(row) for row in Wq]
+    block.attn.Wk = [list(row) for row in Wk]
+    block.attn.Wv = [list(row) for row in Wv]
+    block.attn.Wo = [list(row) for row in Wo]
+    block.W1 = [list(row) for row in W1]
+    block.b1 = list(b1)
+    block.W2 = [list(row) for row in W2]
+    block.b2 = list(b2)
+
+    for _t in range(length):
+        L = len(prefix)
+
+        # L×V one-hot 输入，第 i 行仅 prefix[i] 列为 1.0。
+        x = [[0.0] * V for _ in range(L)]
+        for i in range(L):
+            x[i][prefix[i]] = 1.0
+
+        # 因果掩码：mask[i][j] = (j <= i)。
+        mask = [[j <= i for j in range(L)] for i in range(L)]
+
+        # TransformerBlock.forward 自身校验非有限并抛 ValueError。
+        y_all = block.forward(x, mask)[0]
+        y = y_all[-1]
+
+        # z_k = by_k + Σ_j Why_k,j*y_j，依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(V):
+                acc += why_row[j] * y[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # u=r.random()*d；自 0.0 依 k 升序累加 e_k，选首个累计值严格大于
+        # u 者；无则取词表末项。
+        u = rng.random() * d
+        if not math.isfinite(u):
+            raise ValueError("sample threshold became non-finite")
+        chosen = V - 1
+        cum = 0.0
+        for k in range(V):
+            cum += e[k]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > u:
+                chosen = k
+                break
+
+        out.append(vocab[chosen])
+        prefix.append(chosen)
+
+    return "".join(out) + "\n"
+
+
 _GRU_MODEL_KEYS = ["version", "vocab", "W", "b", "Why", "by", "h0"]
 
 
@@ -17380,6 +17507,16 @@ def main(argv):
     stdout 恰为 LENGTH 个采样码点的 UTF-8 编码再加一个 LF（LENGTH 为 0 时
     仅 LF），不写任何文件，返回 0。
 
+    python seqmodel.py sample-transformer MODEL START SEED TEMPERATURE
+    LENGTH：MODEL 沿用 perplexity-transformer 的十四键顺序、形状、F 及严格
+    UTF-8 契约；START、SEED、TEMPERATURE、LENGTH 的词法与校验沿用 sample。
+    整次调用仅初始化一次 random.Random(int(SEED))；置 prefix=[START 索引]，
+    每步以 prefix 构造 L×V one-hot 输入与 mask[i][j]=(j<=i) 的因果掩码，
+    调用装参的 TransformerBlock(V,heads,P).forward 取末行 y，自 float(by[k])
+    按 j 升序累加 Why[k][j]*y[j] 得 z，温度缩放、减最大值 softmax、k 升序
+    分母与累计阈值抽样均沿用 sample；选中字符的索引追加到 prefix。任一中间
+    量非有限即失败。输出契约与 sample 相同，不写文件。
+
     python seqmodel.py sample-lstm MODEL START SEED TEMPERATURE LENGTH：
     MODEL 为 version 2 的 LSTM 模型（键 version、vocab、W、b、Why、by、
     h0、c0），置 h=h0、c=c0、x=START 索引，每步以 x 的 V 长 one-hot 调用
@@ -18516,6 +18653,10 @@ def main(argv):
             output = _beam_lstm_attn_topk_topp_nbest_scored(
                 argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
                 argv[8], argv[9], argv[10], argv[11])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif len(argv) == 7 and argv[1] == "sample-transformer":
+            output = _sample_transformer(argv[2], argv[3], argv[4], argv[5],
+                                         argv[6])
             sys.stdout.buffer.write(output.encode("utf-8"))
         else:
             raise ValueError(
