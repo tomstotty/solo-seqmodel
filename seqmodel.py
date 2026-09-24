@@ -11798,6 +11798,133 @@ def _score_lstm_mha(model_path, start, text, temperature_text, window_text):
     return format(total, ".17g") + "\n"
 
 
+def _score_lstm_mha_relative(model_path, start, text, temperature_text,
+                             window_text):
+    """确定性评分指定候选 TEXT（相对位置偏置 LSTM-MHA），返回待写出字符串。
+
+    MODEL、WINDOW 的读取、词法、十四键、bias、F、形状与安全截取完全沿用
+    perplexity-lstm-mha-relative；START、TEMPERATURE 的校验沿用
+    sample-lstm-mha-relative；TEXT 为可空 Unicode 字符串且每个码点须在
+    vocab，否则抛 ValueError。本命令无 SEED、无随机源且不写文件。
+
+    置 h=h0、c=c0、x=START 索引、memory=[h0]、pos=[0]、total=0.0。按 t
+    升序遍历 TEXT：以 x 的 V 长 one-hot 调用装入 W、b 的
+    LSTMCell.forward 更新 h、c；M 取 memory 末尾 min(WINDOW, len(memory))
+    项（顺序从旧到新），P 取 pos 的同一切片，以装入 Wq、Wk、Wv、Wo 构造
+    的 MHA(H, heads) 调用 forward_cross_relative([h], M, [t+1], P, bias,
+    None)，取首项 ctx，按 i 升序令 u[i]=h[i]+ctx[0][i]；按原 Why/by 次
+    序求 z，再计算 a[k]=z[k]/TEMPERATURE、m=max(a)，d 自 0.0 依 k 升序
+    累加 exp(a[k]-m)；不抽样，令 y 为 TEXT[t] 索引，
+    lp=a[y]-m-math.log(d)，total 按 t 升序累加 lp，再置 x=y，向 memory
+    追加 h 的 float 副本、向 pos 追加 t+1。任一计算非有限均抛
+    ValueError。成功返回 format(total, '.17g') + '\\n'（TEXT 为空时为
+    "0\\n"）。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    (vocab, W, b, Wq, Wk, Wv, Wo, heads, bias,
+     Why, by, h0, c0) = _load_perplexity_lstm_mha_relative_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # TEMPERATURE：float() 可解析且有限、严格大于 0；inf/nan/0/负数均失败。
+    temperature = float(temperature_text)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("TEMPERATURE must be a finite positive float")
+
+    # TEXT：可空 Unicode 字符串，每个码点须在词表内。
+    if type(text) is not str:
+        raise ValueError("TEXT must be a string")
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(text)
+    for t, ch in enumerate(text):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("TEXT contains an out-of-vocab character")
+        ids[t] = ix
+
+    # 不经随机初始化装入 W、b 与四组投影：score 入口无 SEED，整次调用不
+    # 构造任何随机源。
+    cell = _lstm_cell_loaded(V, H, W, b)
+    mha = _mha_loaded(H, heads, Wq, Wk, Wv, Wo)
+
+    # 与 perplexity-lstm-mha-relative 相同：h0 保留模型原值，
+    # forward_cross_relative 会先复制再投影；各步 h 本就是 float。
+    memory = [h0]
+    pos = [0]
+    h = list(h0)
+    c = list(c0)
+    x = vocab.index(start)
+    total = 0.0
+
+    for t in range(len(ids)):
+        # 当前字符的 V 长 one-hot 输入，推进 LSTM 隐状态与细胞状态。
+        xvec = [0.0] * V
+        xvec[x] = 1.0
+        h, c = cell.forward(xvec, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        P = pos[len(memory) - len(M):]
+        ctx, _w = mha.forward_cross_relative([h], M, [t + 1], P, bias,
+                                             None)
+        ctx0 = ctx[0]
+        u = [0.0] * H
+        for i in range(H):
+            ui = h[i] + ctx0[i]
+            if not math.isfinite(ui):
+                raise ValueError("attention-adjusted hidden state became "
+                                 "non-finite")
+            u[i] = ui
+
+        # logit 仅以 u 替代 h；下标与累加顺序同 _sample_lstm_mha。
+        z = _output_logits(Why, by, u)
+
+        # a_k=z_k/TEMPERATURE，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k
+        # 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # 不抽样：y 为 TEXT[t] 索引，lp=a[y]-m-log(d)，total 依 t 升序累加。
+        y = ids[t]
+        lp = a[y] - m - math.log(d)
+        if not math.isfinite(lp):
+            raise ValueError("log probability is non-finite")
+        total += lp
+        if not math.isfinite(total):
+            raise ValueError(
+                "total log probability accumulated non-finitely")
+
+        x = y
+        memory.append([float(v) for v in h])
+        pos.append(t + 1)
+
+    return format(total, ".17g") + "\n"
+
+
 def _score_lstm_attn_batch(model_path, start, candidates_path,
                            temperature_text, window_text):
     """确定性评分 CANDIDATES 文件中的多个候选串，返回待写出的字符串。
@@ -15633,6 +15760,23 @@ def main(argv):
     format(total,'.17g')+'\\n' 的 ASCII 字节（空 TEXT 为 "0\\n"），
     stderr 为空并返回 0。
 
+    python seqmodel.py score-lstm-mha-relative MODEL START TEXT TEMPERATURE
+    WINDOW：确定性评分指定候选 TEXT。MODEL、WINDOW 沿用
+    perplexity-lstm-mha-relative（version 5 十四键、bias、pos 序列与
+    forward_cross_relative）；START、TEMPERATURE 与 CLI 协议沿用
+    sample-lstm-mha-relative；TEXT 为可空 Unicode 字符串且每个码点须在
+    vocab，否则失败。无 SEED、无随机源，不写文件。置 h=h0、c=c0、
+    x=START 索引、memory=[h0]、pos=[0]、total=0.0，按 t 升序遍历 TEXT：
+    每步以 x 的 one-hot 推进 h、c，M 取 memory 末尾至多 WINDOW 项（从旧
+    到新），P 取 pos 的同一切片，调用
+    forward_cross_relative([h], M, [t+1], P, bias, None)，以 h 与首行上下
+    文之和 u 经 Why/by 得 z，按原顺序计算 a[k]=z[k]/TEMPERATURE、
+    m=max(a)，d 自 0.0 依 k 升序累加 exp(a[k]-m)；不抽样，令 y 为
+    TEXT[t] 索引，lp=a[y]-m-math.log(d)，total 按 t 升序累加 lp，再置
+    x=y，向 memory 追加 h 的 float 副本、向 pos 追加 t+1。任一计算非有
+    限即失败。成功时 stdout 恰为 format(total,'.17g')+'\\n' 的 ASCII 字
+    节（空 TEXT 为 "0\\n"），stderr 为空并返回 0。
+
     python seqmodel.py score-lstm-attn MODEL START TEXT TEMPERATURE
     WINDOW：确定性评分指定候选 TEXT。MODEL、START、TEMPERATURE、WINDOW
     与 CLI 协议沿用 sample-lstm-attn；TEXT 为可空 Unicode 字符串且每个
@@ -16202,6 +16346,10 @@ def main(argv):
         elif len(argv) == 7 and argv[1] == "score-lstm-mha":
             output = _score_lstm_mha(argv[2], argv[3], argv[4], argv[5],
                                      argv[6])
+            sys.stdout.buffer.write(output.encode("ascii"))
+        elif len(argv) == 7 and argv[1] == "score-lstm-mha-relative":
+            output = _score_lstm_mha_relative(
+                argv[2], argv[3], argv[4], argv[5], argv[6])
             sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 7 and argv[1] == "score-lstm-attn":
             output = _score_lstm_attn(argv[2], argv[3], argv[4], argv[5],
