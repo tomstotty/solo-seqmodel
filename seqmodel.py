@@ -7608,6 +7608,125 @@ def _mha_head_stats(model_path, corpus_path, window_text):
                       allow_nan=False) + "\n"
 
 
+def _mha_relative_bucket_stats(model_path, corpus_path, window_text):
+    """perplexity-lstm-mha-relative 各头每步相对位置桶注意力质量，返回字符串。
+
+    MODEL、CORPUS、WINDOW 的校验、状态推进（h、c 与 memory、pos）、M/P
+    截取与 MHA.forward_cross_relative([h], M, [t+1], P, bias, None) 调用
+    完全沿用 _perplexity_lstm_mha_relative，取其权重 w 但不计算 Why、by
+    输出层与负对数似然（它们不影响状态）。令 R=(len(bias[0])-1)//2、
+    T=语料码点数-1；t 升序先以当前字符 one-hot 调用 LSTMCell.forward
+    更新 h、c，M 取 memory 末尾至多 WINDOW 项（从旧到新），P 取 pos 的
+    同一切片，在向 memory、pos 追加前取 w（heads×1×len(M)）；每头 r 置
+    mass 为 2R+1 个 0.0，按 j 升序令
+    b=max(-R,min(R,P[j]-(t+1)))+R 并累加 mass[b]+=w[r][0][j]；总量
+    total[r][b] 按 t、r、b 升序从 0.0 累加各步 mass[b]。任一累加或
+    total[r][b]/T 非有限均抛 ValueError。构造 JSON 对象：顶层键序恰为
+    version,radius,steps,items,mean；version 为 int 1，radius 为 int R，
+    steps 为 int T；items 按 t 升序，每项为 [t, rows]，rows 按 r 升序，
+    每项为 [r, masses]；mean 按 r 升序，每项为 [r, masses]。两处 masses
+    均按 b 升序，为单步质量或 total[r][b]/T 的 format(x,'.17g') 字符串
+    列表。返回 json.dumps(obj,ensure_ascii=True,separators=(',',':'),
+    allow_nan=False)+'\\n'，不写文件。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    (vocab, W, b, Wq, Wk, Wv, Wo, heads, bias,
+     _Why, _by, h0, c0) = _load_perplexity_lstm_mha_relative_model(model_path)
+    V = len(vocab)
+    H = len(h0)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    cell = LSTMCell(V, H)
+    cell.W = [list(row) for row in W]
+    cell.b = list(b)
+
+    mha = MHA(H, heads)
+    mha.Wq = [list(row) for row in Wq]
+    mha.Wk = [list(row) for row in Wk]
+    mha.Wv = [list(row) for row in Wv]
+    mha.Wo = [list(row) for row in Wo]
+
+    R = (len(bias[0]) - 1) // 2
+    nb = 2 * R + 1
+
+    memory = [h0]
+    pos = [0]
+    h = list(h0)
+    c = list(c0)
+    T = len(ids) - 1
+    total = [[0.0] * nb for _ in range(heads)]
+    items = []
+    for t in range(T):
+        x = [0.0] * V
+        x[ids[t]] = 1.0
+
+        h, c = cell.forward(x, h, c)[:2]
+
+        M = _window_tail(memory, window_text)
+        P = pos[len(memory) - len(M):]
+        _ctx, w = mha.forward_cross_relative([h], M, [t + 1], P, bias, None)
+        n = len(M)
+
+        # 第 t 步各头统计：mass 置 2R+1 个 0.0，按 j 升序把 w[r][0][j]
+        # 累入桶 b=max(-R,min(R,P[j]-(t+1)))+R；总量按 t、r、b 升序累加。
+        rows = []
+        for r in range(heads):
+            wr = w[r][0]
+            mass = [0.0] * nb
+            for j in range(n):
+                bj = max(-R, min(R, P[j] - (t + 1))) + R
+                mass[bj] += wr[j]
+                if not math.isfinite(mass[bj]):
+                    raise ValueError(
+                        "bucket mass accumulated to a non-finite value")
+            tr = total[r]
+            for bj in range(nb):
+                tr[bj] += mass[bj]
+                if not math.isfinite(tr[bj]):
+                    raise ValueError(
+                        "total bucket mass accumulated to a non-finite "
+                        "value")
+            rows.append([r, [format(mv, ".17g") for mv in mass]])
+        items.append([t, rows])
+
+        memory.append([float(v) for v in h])
+        pos.append(t + 1)
+
+    mean = []
+    for r in range(heads):
+        masses = []
+        for bj in range(nb):
+            mv = total[r][bj] / T
+            if not math.isfinite(mv):
+                raise ValueError("mean bucket mass is non-finite")
+            masses.append(format(mv, ".17g"))
+        mean.append([r, masses])
+
+    obj = {
+        "version": 1,
+        "radius": R,
+        "steps": T,
+        "items": items,
+        "mean": mean,
+    }
+    return json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+
+
 def _perplexity_gru_attn(model_path, corpus_path, window_text):
     """GRU 加注意力上下文的困惑度，返回待写出的字符串。
 
@@ -16389,6 +16508,9 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 5 and argv[1] == "mha-head-stats":
             output = _mha_head_stats(argv[2], argv[3], argv[4])
+            sys.stdout.buffer.write(output.encode("ascii"))
+        elif len(argv) == 5 and argv[1] == "mha-relative-bucket-stats":
+            output = _mha_relative_bucket_stats(argv[2], argv[3], argv[4])
             sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 5 and argv[1] == "perplexity-lstm-attn-trace":
             output = _perplexity_lstm_attn_trace(argv[2], argv[3], argv[4])
