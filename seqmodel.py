@@ -8011,6 +8011,201 @@ def _sample_transformer_top_p(model_path, start, seed_text, start_t_text,
     return "".join(out) + "\n"
 
 
+def _sample_transformer_window_top_p(model_path, start, seed_text,
+                                     start_t_text, end_t_text, top_p_text,
+                                     length_text, window_text):
+    """有限上下文加线性退火、top-p 核选样版本的 sample-transformer。
+
+    除 TOP_P 与核选样外，MODEL、START、SEED、START_T、END_T、LENGTH、
+    WINDOW 的词法与校验、模型十四键装载、装参 TransformerBlock、唯一随机
+    源、线性温度退火（含 LENGTH 的 0/1 语义与 START_T+(END_T-START_T)*t/
+    (LENGTH-1) 的严格求值次序）、窗口截断前向与有限性失败契约均逐项沿用
+    _sample_transformer_window_anneal；TOP_P 的解析与核选样逐项沿用
+    _sample_transformer_top_p；不写任何文件。
+
+    WINDOW 整串匹配 [1-9][0-9]*（任意位数均合法，不先转无界整数），否则
+    抛 ValueError。TOP_P 经 float() 解析，结果须有限且 0<TOP_P<=1，否则
+    抛 ValueError。置 prefix=[START 索引]。每步以十进制位数和同长字典序
+    安全求 n=min(WINDOW,len(prefix))，仅以末尾 n 项构造 n×V one-hot 与
+    n×n 因果 mask（mask[i][j]=(j<=i)），调用装参 TransformerBlock.forward
+    并仅取末行；每步重新截断、独立前向，不复用任何窗外状态。
+
+    每步先按原顺序求 a_k=z_k/T、m=max(a)、e_k=exp(a_k-m)，d 自 0.0 依 k
+    升序累加。再将索引按 (-e_k, k) 升序排列（e 降序、并列时 k 升序），自
+    0.0 依序累加 e，保留首个使累计值 >=TOP_P*d 的最短前缀；s 为其自 0.0
+    依序累加所得之和。令 u=r.random()*s，再按前缀顺序自 0.0 累加 e，选首
+    个累计值严格大于 u 的索引；无则取前缀末项。选中字符追加到输出，其索
+    引追加到完整 prefix（非窗口副本）。
+
+    当 WINDOW 每步都不小于 prefix 长度（数学值不小于 LENGTH+1）时，各步
+    末行与完整 prefix 前向的对应行逐元素相同，故输出与同参
+    sample-transformer-top-p 逐字节相同。LENGTH=0 时不求温度、不执行任何
+    前向，仅返回 LF。任一中间量非有限即失败。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
+        _load_perplexity_transformer_model(model_path)
+    V = len(vocab)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # START_T、END_T：float() 可解析且有限、严格大于 0。
+    start_t = float(start_t_text)
+    if not math.isfinite(start_t) or start_t <= 0.0:
+        raise ValueError("START_T must be a finite positive float")
+    end_t = float(end_t_text)
+    if not math.isfinite(end_t) or end_t <= 0.0:
+        raise ValueError("END_T must be a finite positive float")
+
+    # TOP_P：float() 可解析且有限，0<TOP_P<=1。
+    top_p = float(top_p_text)
+    if not math.isfinite(top_p) or top_p <= 0.0 or top_p > 1.0:
+        raise ValueError("TOP_P must be a finite float with 0<TOP_P<=1")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    if length == 1:
+        # 仅用 START_T，不求值退火表达式。
+        def temperature_at(t):
+            return start_t
+    elif length >= 2:
+        def temperature_at(t):
+            # 严格按 START_T+(END_T-START_T)*t/(LENGTH-1) 的运算顺序求值。
+            temp = start_t + (end_t - start_t) * t / (length - 1)
+            if not math.isfinite(temp) or temp <= 0.0:
+                raise ValueError(
+                    "annealed temperature became non-finite or non-positive")
+            return temp
+    else:
+        temperature_at = None  # LENGTH 为 0：循环不执行，不计算温度。
+
+    rng = random.Random(seed)
+    prefix = [vocab.index(start)]
+
+    block = TransformerBlock(V, heads, P)
+    block.attn.Wq = [list(row) for row in Wq]
+    block.attn.Wk = [list(row) for row in Wk]
+    block.attn.Wv = [list(row) for row in Wv]
+    block.attn.Wo = [list(row) for row in Wo]
+    block.W1 = [list(row) for row in W1]
+    block.b1 = list(b1)
+    block.W2 = [list(row) for row in W2]
+    block.b2 = list(b2)
+
+    out = []
+    for t in range(length):
+        temperature = temperature_at(t)
+
+        # 安全求 n=min(WINDOW,len(prefix))；超长 WINDOW 不先转无界整数。
+        n = _safe_window_min(window_text, len(prefix))
+
+        # 仅以末尾 n 项构造 n×V one-hot 与 n×n 局部因果 mask。
+        window_ids = prefix[len(prefix) - n:]
+        x = [[0.0] * V for _ in range(n)]
+        for i in range(n):
+            x[i][window_ids[i]] = 1.0
+        mask = [[j <= i for j in range(n)] for i in range(n)]
+
+        # TransformerBlock.forward 自身校验非有限并抛 ValueError；仅取末行。
+        y_all = block.forward(x, mask)[0]
+        y = y_all[-1]
+
+        # z_k = by_k + Σ_j Why_k,j*y_j，依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(V):
+                acc += why_row[j] * y[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # 核阈值 TOP_P*d 须有限。
+        target = top_p * d
+        if not math.isfinite(target):
+            raise ValueError("top-p target accumulated non-finitely")
+
+        # 索引按 (-e_k, k) 升序：e 降序、并列时 k 升序。
+        order = sorted(range(V), key=lambda k: (-e[k], k))
+
+        # 依该序自 0.0 累加 e，保留首个使累计值 >=TOP_P*d 的最短前缀；s 为
+        # 其自 0.0 依该序累加所得之和。浮点求和顺序不同可能令全量累计与 d
+        # 相差一 ULP，此时以全量索引为前缀（数学上其和恰为 d>=目标）。
+        chosen_prefix = []
+        s = 0.0
+        reached = False
+        for idx in order:
+            chosen_prefix.append(idx)
+            s += e[idx]
+            if not math.isfinite(s):
+                raise ValueError("top-p prefix accumulated non-finitely")
+            if s >= target:
+                reached = True
+                break
+        if not reached:
+            chosen_prefix = list(order)
+
+        # u=r.random()*s；按前缀顺序自 0.0 累加 e，选首个累计值严格大于 u
+        # 者；无则取前缀末项。
+        threshold = rng.random() * s
+        if not math.isfinite(threshold):
+            raise ValueError("sample threshold became non-finite")
+        chosen = chosen_prefix[-1]
+        cum = 0.0
+        for idx in chosen_prefix:
+            cum += e[idx]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > threshold:
+                chosen = idx
+                break
+
+        # 选中字符追加到输出、其索引追加到完整 prefix（非窗口副本）。
+        out.append(vocab[chosen])
+        prefix.append(chosen)
+
+    return "".join(out) + "\n"
+
+
 def _sample_transformer_top_k(model_path, start, seed_text, start_t_text,
                               end_t_text, top_k_text, length_text):
     """以线性退火温度、top-k 选样从单层 Transformer 块语言模型采样。
@@ -20763,6 +20958,12 @@ def main(argv):
             output = _sample_transformer_top_p(
                 argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
                 argv[8])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif (len(argv) == 10
+              and argv[1] == "sample-transformer-window-top-p"):
+            output = _sample_transformer_window_top_p(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                argv[8], argv[9])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 9 and argv[1] == "sample-transformer-top-k":
             output = _sample_transformer_top_k(
