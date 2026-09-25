@@ -2794,6 +2794,243 @@ class TransformerBlock(object):
 
         return dx, dWq, dWk, dWv, dWo, dW1, db1, dW2, db2
 
+    def forward_relative(self, x, bias, mask=None):
+        """相对位置偏置 Transformer 块前向，返回 (y, w) 并缓存反向快照。
+
+        x、mask 的契约完全沿用 forward；bias 须为 heads×(2R+1) 的 F 矩阵
+        （R>=0），即行数恰为 heads、列数为正奇数，否则抛 ValueError（校验
+        由 MHA.forward_relative 保证）。先取 (c, w) =
+        attn.forward_relative(x, bias, mask)，再按 forward 次序求
+        a = x + c、f = tanh(b1 + W1*a)、y = a + b2 + W2*f（W1/b1/W2/b2
+        的校验与快照方式同 forward）。y 为 T×D、w 为 heads×T×T 的逐层新建
+        float 列表并缓存，不修改或复用输入、bias 与参数。任一中间量非有限
+        抛 ValueError；任何失败都清空本块缓存。实参数量错误沿用 Python
+        自带的 TypeError。
+        """
+        D, P = self.D, self.P
+        # 任何失败的 forward_relative 都使既有缓存失效。
+        self._cache = None
+        try:
+            # x、bias、mask 的校验与 attn 自身缓存均由 MHA.forward_relative
+            # 保证；c、w 为逐层新建的 float 列表。
+            c, w = self.attn.forward_relative(x, bias, mask)
+            T = len(c)
+
+            W1 = _check_matrix(self.W1, P, D, "W1")
+            b1 = _check_vector(self.b1, P, "b1")
+            W2 = _check_matrix(self.W2, D, P, "W2")
+            b2 = _check_vector(self.b2, D, "b2")
+            W1 = [[float(v) for v in row] for row in W1]
+            b1 = [float(v) for v in b1]
+            W2 = [[float(v) for v in row] for row in W2]
+            b2 = [float(v) for v in b2]
+
+            # a[t][j] = x[t][j] + c[t][j]，逐元素新建 float。
+            a = [[0.0] * D for _ in range(T)]
+            for t in range(T):
+                xt = x[t]
+                ct = c[t]
+                at = a[t]
+                for j in range(D):
+                    av = float(xt[j]) + ct[j]
+                    if not math.isfinite(av):
+                        raise ValueError(
+                            "a accumulated to a non-finite value")
+                    at[j] = av
+
+            # f[t][p] = tanh(b1[p] + Σ_j W1[p][j]*a[t][j])：乘积自 0.0 按
+            # j 升序累加，循环结束后再加偏置。
+            f = [[0.0] * P for _ in range(T)]
+            for t in range(T):
+                at = a[t]
+                ft = f[t]
+                for p in range(P):
+                    W1p = W1[p]
+                    acc = 0.0
+                    for j in range(D):
+                        acc += W1p[j] * at[j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "ffn pre-activation accumulated to a "
+                                "non-finite value")
+                    acc += b1[p]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "ffn pre-activation accumulated to a "
+                            "non-finite value")
+                    fv = math.tanh(acc)
+                    if not math.isfinite(fv):
+                        raise ValueError("tanh produced a non-finite value")
+                    ft[p] = fv
+
+            # y[t][j] = a[t][j] + b2[j] + Σ_p W2[j][p]*f[t][p]：乘积自 0.0
+            # 按 p 升序累加，再加偏置，最后加残差 a[t][j]。
+            y = [[0.0] * D for _ in range(T)]
+            for t in range(T):
+                at = a[t]
+                ft = f[t]
+                yt = y[t]
+                for j in range(D):
+                    W2j = W2[j]
+                    acc = 0.0
+                    for p in range(P):
+                        acc += W2j[p] * ft[p]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "y accumulated to a non-finite value")
+                    acc += b2[j]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "y accumulated to a non-finite value")
+                    acc += at[j]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "y accumulated to a non-finite value")
+                    yt[j] = acc
+        except ValueError:
+            self._cache = None
+            raise
+
+        self._cache = ("transformerblock_relative", T, D, P, a, f, W1, W2)
+        return y, w
+
+    def backward_relative(self, dy):
+        """相对位置偏置 Transformer 块反向，返回十元组梯度。
+
+        须紧随一次成功的 forward_relative（其后缓存未被失败清空），否则抛
+        ValueError；dy 须为与前向 y 同形的 T×D F 矩阵，否则抛 ValueError。
+        按 backward 相同的公式与次序（求和均自 0.0 按下标升序累加）求
+        dW2、db2、df、dz、dW1、db1 与 da，再调用
+        attn.backward_relative(da) 得 (dxa, dWq, dWk, dWv, dWo, dbias)，令
+            dx[t][j] = da[t][j] + dxa[t][j]
+        返回 (dx, dWq, dWk, dWv, dWo, dW1, db1, dW2, db2, dbias)。dx 为
+        T×D，四个注意力投影梯度为 D×D，dW1 为 P×D、db1 长 P，dW2 为 D×P、
+        db2 长 D，dbias 为 heads×(2R+1)，均为逐层新建 float 列表，不修改
+        dy、缓存或任何参数；成功时缓存保留，重复调用结果相同。任一中间
+        量非有限或反向失败均抛 ValueError 并清空缓存。实参数量错误沿用
+        Python 自带的 TypeError。
+        """
+        cache = self._cache
+        try:
+            if type(cache) is not tuple or len(cache) != 8 \
+                    or cache[0] != "transformerblock_relative":
+                raise ValueError(
+                    "backward_relative requires a successful "
+                    "forward_relative pass before it")
+            (_, T, D, P, a, f, W1, W2) = cache
+            dy = _check_matrix(dy, T, D, "dy")
+            dy = [[float(z) for z in row] for row in dy]
+
+            # dW2[j][p] = Σ_t dy[t][j]*f[t][p]；db2[j] = Σ_t dy[t][j]，
+            # t 自 0.0 升序。
+            dW2 = [[0.0] * P for _ in range(D)]
+            db2 = [0.0] * D
+            for t in range(T):
+                dyt = dy[t]
+                ft = f[t]
+                for j in range(D):
+                    dyv = dyt[j]
+                    db2[j] += dyv
+                    if not math.isfinite(db2[j]):
+                        raise ValueError(
+                            "db2 accumulated to a non-finite value")
+                    dW2j = dW2[j]
+                    for p in range(P):
+                        dW2j[p] += dyv * ft[p]
+                        if not math.isfinite(dW2j[p]):
+                            raise ValueError(
+                                "dW2 accumulated to a non-finite value")
+
+            # df[t][p] = Σ_j dy[t][j]*W2[j][p]，j 自 0.0 升序。
+            df = [[0.0] * P for _ in range(T)]
+            for t in range(T):
+                dyt = dy[t]
+                dft = df[t]
+                for p in range(P):
+                    acc = 0.0
+                    for j in range(D):
+                        acc += dyt[j] * W2[j][p]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "df accumulated to a non-finite value")
+                    dft[p] = acc
+
+            # dz[t][p] = df[t][p]*(1 - f[t][p]^2)，逐元素新建 float。
+            dz = [[0.0] * P for _ in range(T)]
+            for t in range(T):
+                dft = df[t]
+                ft = f[t]
+                dzt = dz[t]
+                for p in range(P):
+                    fv = ft[p]
+                    zv = dft[p] * (1.0 - fv * fv)
+                    if not math.isfinite(zv):
+                        raise ValueError("dz became a non-finite value")
+                    dzt[p] = zv
+
+            # dW1[p][j] = Σ_t dz[t][p]*a[t][j]；db1[p] = Σ_t dz[t][p]，
+            # t 自 0.0 升序。
+            dW1 = [[0.0] * D for _ in range(P)]
+            db1 = [0.0] * P
+            for t in range(T):
+                dzt = dz[t]
+                at = a[t]
+                for p in range(P):
+                    dzv = dzt[p]
+                    db1[p] += dzv
+                    if not math.isfinite(db1[p]):
+                        raise ValueError(
+                            "db1 accumulated to a non-finite value")
+                    dW1p = dW1[p]
+                    for j in range(D):
+                        dW1p[j] += dzv * at[j]
+                        if not math.isfinite(dW1p[j]):
+                            raise ValueError(
+                                "dW1 accumulated to a non-finite value")
+
+            # da[t][j] = dy[t][j] + Σ_p dz[t][p]*W1[p][j]：乘积自 0.0 按 p
+            # 升序累加，循环结束后再加 dy[t][j]。
+            da = [[0.0] * D for _ in range(T)]
+            for t in range(T):
+                dyt = dy[t]
+                dzt = dz[t]
+                dat = da[t]
+                for j in range(D):
+                    acc = 0.0
+                    for p in range(P):
+                        acc += dzt[p] * W1[p][j]
+                        if not math.isfinite(acc):
+                            raise ValueError(
+                                "da accumulated to a non-finite value")
+                    acc += dyt[j]
+                    if not math.isfinite(acc):
+                        raise ValueError(
+                            "da accumulated to a non-finite value")
+                    dat[j] = acc
+
+            # 相对位置注意力子层（含其四个投影与 dbias）的反向沿用
+            # MHA.backward_relative。
+            dxa, dWq, dWk, dWv, dWo, dbias = \
+                self.attn.backward_relative(da)
+
+            # dx[t][j] = da[t][j] + dxa[t][j]，残差两路逐元素相加。
+            dx = [[0.0] * D for _ in range(T)]
+            for t in range(T):
+                dat = da[t]
+                dxat = dxa[t]
+                dxt = dx[t]
+                for j in range(D):
+                    xv = dat[j] + dxat[j]
+                    if not math.isfinite(xv):
+                        raise ValueError(
+                            "dx accumulated to a non-finite value")
+                    dxt[j] = xv
+        except ValueError:
+            self._cache = None
+            raise
+
+        return dx, dWq, dWk, dWv, dWo, dW1, db1, dW2, db2, dbias
+
     def forward_cross(self, qx, kvx, mask=None):
         """Transformer 块交叉注意力前向，返回 (y, w) 并缓存反向所需快照。
 
