@@ -6671,6 +6671,286 @@ def _train_transformer(model_path, corpus_path, out_path):
                 pass
 
 
+def _train_transformer_window(model_path, corpus_path, out_path,
+                              window_text):
+    """有限上下文版本的 train-transformer：按滑窗独立前向/反向做一次 SGD。
+
+    MODEL、CORPUS、OUT 契约完全沿用 train-transformer（version 6 十四键
+    严格 JSON、F、形状、heads 整除 V、严格 UTF-8 语料至少 2 码点且无表外
+    字符）；WINDOW 整串匹配 [1-9][0-9]*（任意位数均合法，不先转无界整
+    数），否则抛 ValueError。
+
+    令 T=len(CORPUS)-1。t 升序：以十进制位数和同长字典序安全求
+    n=min(WINDOW,t+1)、s=t+1-n；用语料索引 [s:t+1] 的 n 个字符构造 n×V
+    one-hot 与 n×n 因果 mask（mask[i][j]=(j<=i)），将 Wq、Wk、Wv、Wo、
+    W1、b1、W2、b2 装入新建的 TransformerBlock(V, heads, P) 后以
+    (x, mask) 独立前向，仅取末行 y[n-1]（对应全局位置 t）预测下一字符；
+    每个 t 都重新构造窗口序列、重新装参并独立前向/反向，不传播或复用任
+    何窗外状态。
+
+    输出层完全沿用 train-transformer 的 t/k/j 次序：z、p、g=p-onehot(
+    下一字符)，按 t 升序累加 dWhy += g⊗h、dby += g；建 n×V 零 dy，仅末
+    行按 j 升序自 0.0 以 k 升序写入 Whyᵀg，随即调用 block.backward(dy)
+    得八组块梯度，并按 t、组（dWq、dWk、dWv、dWo、dW1、db1、dW2、db2）、
+    行、列升序自 0.0 累加进全局梯度。
+
+    最终梯度组序为 dWq、dWk、dWv、dWo、dW1、db1、dW2、db2、dWhy、dby；
+    全局 5.0 范数裁剪、0.1 倍更新、十四键顺序、数组元素转 float、紧凑
+    ASCII 转义 JSON 加 LF、负零保留与同目录临时文件原子替换均沿用
+    train-transformer。WINDOW 数学值不小于 T 时，各 t 的窗口即完整前缀
+    [0:t+1]，其末行前向与整序列前向的第 t 行逐元素相同，且反向对 dy 为
+    线性、按 t 升序累加的次序一致，故 OUT 与 train-transformer 逐字节相
+    同；较小窗口只在每个 t 独立截断。任一中间量非有限均抛 ValueError；
+    任一阶段失败都保持 OUT 原状态（或不存在）并清理临时文件。成功时
+    stdout 为空并返回 0。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
+        _load_perplexity_transformer_model(model_path)
+    V = len(vocab)
+
+    with open(corpus_path, "rb") as f:
+        corpus = f.read().decode("utf-8")
+    if len(corpus) < 2:
+        raise ValueError("corpus must contain at least 2 codepoints")
+
+    table = {ch: i for i, ch in enumerate(vocab)}
+    ids = [0] * len(corpus)
+    for t, ch in enumerate(corpus):
+        ix = table.get(ch)
+        if ix is None:
+            raise ValueError("corpus contains an out-of-vocab character")
+        ids[t] = ix
+
+    T = len(ids) - 1
+
+    # 八组块梯度与两组输出层梯度的全局累加器，按 t 升序自 0.0 累加。
+    dWq = [[0.0] * V for _ in range(V)]
+    dWk = [[0.0] * V for _ in range(V)]
+    dWv = [[0.0] * V for _ in range(V)]
+    dWo = [[0.0] * V for _ in range(V)]
+    dW1 = [[0.0] * V for _ in range(P)]
+    db1 = [0.0] * P
+    dW2 = [[0.0] * P for _ in range(V)]
+    db2 = [0.0] * V
+    dWhy = [[0.0] * V for _ in range(V)]
+    dby = [0.0] * V
+
+    for t in range(T):
+        target = ids[t + 1]
+
+        # 安全求 n=min(WINDOW,t+1)、s=t+1-n；超长 WINDOW 不先转 int。
+        n = _safe_window_min(window_text, t + 1)
+        s = t + 1 - n
+
+        # 窗口 [s:t+1] 的 n×V one-hot 输入矩阵。
+        x = [[0.0] * V for _ in range(n)]
+        for i in range(n):
+            x[i][ids[s + i]] = 1.0
+
+        # 窗口内因果掩码：mask[i][j] = (j <= i)。
+        mask = [[j <= i for j in range(n)] for i in range(n)]
+
+        # 每 t 新建块、重新装参并独立前向，仅取末行；不携带任何跨 t 状态。
+        block = TransformerBlock(V, heads, P)
+        block.attn.Wq = [list(row) for row in Wq]
+        block.attn.Wk = [list(row) for row in Wk]
+        block.attn.Wv = [list(row) for row in Wv]
+        block.attn.Wo = [list(row) for row in Wo]
+        block.W1 = [list(row) for row in W1]
+        block.b1 = list(b1)
+        block.W2 = [list(row) for row in W2]
+        block.b2 = list(b2)
+
+        y = block.forward(x, mask)[0]
+        h = y[n - 1]
+
+        # z_k = by_k + Σ_j Why_k,j*h_j，自 float 偏置起依 j 升序累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(V):
+                acc += why_row[j] * h[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # softmax：m=max(z)，d 从 0.0 依 k 升序累加 exp(z_k-m)。
+        m = max(z)
+        if not math.isfinite(m):
+            raise ValueError("logit maximum is non-finite")
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            ev = math.exp(z[k] - m)
+            if not math.isfinite(ev):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ev
+            d += ev
+            if not math.isfinite(d):
+                raise ValueError("softmax denominator accumulated non-finitely")
+
+        # g = p - onehot(下一字符)。
+        g = [0.0] * V
+        for k in range(V):
+            gk = e[k] / d
+            if k == target:
+                gk -= 1.0
+            if not math.isfinite(gk):
+                raise ValueError("output gradient became non-finite")
+            g[k] = gk
+
+        # 按 t 升序累加 dWhy += g⊗h、dby += g（组内下标顺序同
+        # train-transformer）。
+        for k in range(V):
+            gk = g[k]
+            dby[k] += gk
+            if not math.isfinite(dby[k]):
+                raise ValueError("dby accumulated to a non-finite value")
+            dw_row = dWhy[k]
+            for j in range(V):
+                dw_row[j] += gk * h[j]
+                if not math.isfinite(dw_row[j]):
+                    raise ValueError("dWhy accumulated to a non-finite value")
+
+        # n×V 零 dy，仅末行写 Whyᵀg：每个 j 独立以 0.0 起按 k 升序累加。
+        dy = [[0.0] * V for _ in range(n)]
+        dy_row = dy[n - 1]
+        for j in range(V):
+            acc = 0.0
+            for k in range(V):
+                acc += Why[k][j] * g[k]
+                if not math.isfinite(acc):
+                    raise ValueError("dy accumulated to a non-finite value")
+            dy_row[j] = acc
+
+        # 本窗口一次反向：TransformerBlock.backward 内部自 0.0 按 t、行、
+        # 列升序累加八组参数梯度；零 dy 行不贡献非零梯度。
+        (_dx, t_dWq, t_dWk, t_dWv, t_dWo, t_dW1, t_db1, t_dW2, t_db2) = \
+            block.backward(dy)
+
+        # 按 t、组、行、列升序将八组块梯度自 0.0 累加进全局梯度。
+        for acc_group, new_group in (
+                (dWq, t_dWq), (dWk, t_dWk), (dWv, t_dWv), (dWo, t_dWo),
+                (dW1, t_dW1), (db1, t_db1), (dW2, t_dW2), (db2, t_db2)):
+            if type(acc_group[0]) is list:
+                for acc_row, new_row in zip(acc_group, new_group):
+                    for j in range(len(acc_row)):
+                        acc_row[j] += new_row[j]
+                        if not math.isfinite(acc_row[j]):
+                            raise ValueError(
+                                "block gradient accumulated to a non-finite "
+                                "value")
+            else:
+                for j in range(len(acc_group)):
+                    acc_group[j] += new_group[j]
+                    if not math.isfinite(acc_group[j]):
+                        raise ValueError(
+                            "block gradient accumulated to a non-finite "
+                            "value")
+
+    # 依 dWq、dWk、dWv、dWo、dW1、db1、dW2、db2、dWhy、dby 的组、行、列
+    # 序自 0.0 累加平方和求全局范数；任一梯度非有限即失败。
+    groups = (dWq, dWk, dWv, dWo, dW1, db1, dW2, db2, dWhy, dby)
+    sum_sq = 0.0
+    for group in groups:
+        if type(group[0]) is list:
+            for row in group:
+                for v in row:
+                    if not math.isfinite(v):
+                        raise ValueError("gradient is non-finite")
+                    sum_sq += v * v
+                    if not math.isfinite(sum_sq):
+                        raise ValueError(
+                            "global norm accumulated to a non-finite value")
+        else:
+            for v in group:
+                if not math.isfinite(v):
+                    raise ValueError("gradient is non-finite")
+                sum_sq += v * v
+                if not math.isfinite(sum_sq):
+                    raise ValueError(
+                        "global norm accumulated to a non-finite value")
+
+    global_norm = math.sqrt(sum_sq)
+    if not math.isfinite(global_norm):
+        raise ValueError("global norm is non-finite")
+    scale = 5.0 / global_norm if global_norm > 5.0 else 1.0
+
+    # 十组参数减 0.1 倍（裁剪后的）梯度；version、vocab、heads、P 不变。
+    # 结果非有限即失败。
+    def _updated(old, grad):
+        value = float(old) - 0.1 * (grad * scale)
+        if not math.isfinite(value):
+            raise ValueError("updated parameter became non-finite")
+        return value
+
+    new_Wq = [[_updated(Wq[a][j], dWq[a][j]) for j in range(V)]
+              for a in range(V)]
+    new_Wk = [[_updated(Wk[a][j], dWk[a][j]) for j in range(V)]
+              for a in range(V)]
+    new_Wv = [[_updated(Wv[a][j], dWv[a][j]) for j in range(V)]
+              for a in range(V)]
+    new_Wo = [[_updated(Wo[a][j], dWo[a][j]) for j in range(V)]
+              for a in range(V)]
+    new_W1 = [[_updated(W1[p][j], dW1[p][j]) for j in range(V)]
+              for p in range(P)]
+    new_b1 = [_updated(b1[p], db1[p]) for p in range(P)]
+    new_W2 = [[_updated(W2[j][p], dW2[j][p]) for p in range(P)]
+              for j in range(V)]
+    new_b2 = [_updated(b2[j], db2[j]) for j in range(V)]
+    new_Why = [[_updated(Why[k][j], dWhy[k][j]) for j in range(V)]
+               for k in range(V)]
+    new_by = [_updated(by[k], dby[k]) for k in range(V)]
+
+    obj = {
+        "version": 6,
+        "vocab": vocab,
+        "heads": heads,
+        "P": P,
+        "Wq": new_Wq,
+        "Wk": new_Wk,
+        "Wv": new_Wv,
+        "Wo": new_Wo,
+        "W1": new_W1,
+        "b1": new_b1,
+        "W2": new_W2,
+        "b2": new_b2,
+        "Why": new_Why,
+        "by": new_by,
+    }
+    text = json.dumps(obj, ensure_ascii=True, separators=(",", ":"),
+                      allow_nan=False) + "\n"
+    data = text.encode("utf-8")
+
+    # 原子写出：在 OUT 同目录建临时文件，写全并关闭后以 os.replace 替
+    # 换；失败时 OUT 保持原状态，临时文件尽量清理。
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    tmp_fd, tmp_path = tempfile.mkstemp(prefix=".tmp-train-transformer-",
+                                        dir=out_dir)
+    replaced = False
+    try:
+        try:
+            f = os.fdopen(tmp_fd, "wb")
+        except BaseException:
+            # fdopen 失败时 fd 仍由本调用方负责关闭。
+            os.close(tmp_fd)
+            raise
+        with f:
+            f.write(data)
+        os.replace(tmp_path, out_path)
+        replaced = True
+    finally:
+        if not replaced:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 def _transformer_sample_steps(vocab, block, Why, by, prefix, rng,
                               temperature, length):
     """从给定 prefix 与 rng 出发，逐项沿用 _sample_transformer 采样 length 步。
@@ -20125,6 +20405,8 @@ def main(argv):
             sys.stdout.buffer.write(output.encode("ascii"))
         elif len(argv) == 5 and argv[1] == "train-transformer":
             _train_transformer(argv[2], argv[3], argv[4])
+        elif len(argv) == 6 and argv[1] == "train-transformer-window":
+            _train_transformer_window(argv[2], argv[3], argv[4], argv[5])
         elif len(argv) == 4 and argv[1] == "perplexity-gru":
             output = _perplexity_gru(argv[2], argv[3])
             sys.stdout.buffer.write(output.encode("ascii"))
