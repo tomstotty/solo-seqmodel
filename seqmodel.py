@@ -7389,6 +7389,166 @@ def _sample_transformer_anneal(model_path, start, seed_text, start_t_text,
     return "".join(out) + "\n"
 
 
+def _sample_transformer_window_anneal(model_path, start, seed_text,
+                                      start_t_text, end_t_text, length_text,
+                                      window_text):
+    """有限上下文加线性退火版本的 sample-transformer，返回待写出的字符串。
+
+    除窗口外，MODEL、START、SEED、START_T、END_T、LENGTH 的词法与校验、
+    模型十四键装载、装参 TransformerBlock、唯一随机源、Why/by logit、线性
+    温度退火（含 LENGTH 的 0/1 语义与 START_T+(END_T-START_T)*t/
+    (LENGTH-1) 的严格求值次序）、稳定 softmax、词表升序阈值抽样、prefix
+    状态更新与有限性失败契约均逐项沿用 _sample_transformer_anneal；不写
+    任何文件。
+
+    WINDOW 整串匹配 [1-9][0-9]*（任意位数均合法，不先转无界整数），否则
+    抛 ValueError。置 prefix=[START 索引]。每步以十进制位数和同长字典序
+    安全求 n=min(WINDOW,len(prefix))，仅以末尾 n 项构造 n×V one-hot 与
+    n×n 因果 mask（mask[i][j]=(j<=i)），调用装参 TransformerBlock.forward
+    并仅取末行；每步重新截断、独立前向，不复用任何窗外状态。Why/by、温度
+    softmax 与 k 升序阈值抽样的下标与累加次序与 _sample_transformer_anneal
+    完全一致；选中字符追加到输出、其索引追加到完整 prefix。
+
+    当 WINDOW 每步都不小于 prefix 长度（数学值不小于 LENGTH+1）时，各步
+    末行与完整 prefix 前向的对应行逐元素相同（注意力对每一行只依赖该行及
+    其之前的行，FFN 逐行独立），故输出与同参 sample-transformer-anneal
+    逐字节相同。LENGTH=0 时不求温度、不执行任何前向，仅返回 LF。任一中间
+    量非有限即失败。
+    """
+    if not _WINDOW_RE.match(window_text):
+        raise ValueError("WINDOW must match [1-9][0-9]*")
+
+    (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
+        _load_perplexity_transformer_model(model_path)
+    V = len(vocab)
+
+    # START：恰为词表内的一个码点。
+    if type(start) is not str or len(start) != 1 or start not in vocab:
+        raise ValueError("START must be a single in-vocab codepoint")
+
+    # SEED：整串匹配整数词法（禁止空白、+ 前缀、前导零、下划线）。
+    if not _INT_RE.match(seed_text):
+        raise ValueError("SEED must match 0|-?[1-9][0-9]*")
+    seed = int(seed_text)
+
+    # START_T、END_T：float() 可解析且有限、严格大于 0。
+    start_t = float(start_t_text)
+    if not math.isfinite(start_t) or start_t <= 0.0:
+        raise ValueError("START_T must be a finite positive float")
+    end_t = float(end_t_text)
+    if not math.isfinite(end_t) or end_t <= 0.0:
+        raise ValueError("END_T must be a finite positive float")
+
+    # LENGTH：整串匹配非负整数词法。
+    if not _NONNEG_INT_RE.match(length_text):
+        raise ValueError("LENGTH must match 0|[1-9][0-9]*")
+    length = int(length_text)
+
+    if length == 1:
+        # 仅用 START_T，不求值退火表达式。
+        def temperature_at(t):
+            return start_t
+    elif length >= 2:
+        def temperature_at(t):
+            # 严格按 START_T+(END_T-START_T)*t/(LENGTH-1) 的运算顺序求值。
+            temp = start_t + (end_t - start_t) * t / (length - 1)
+            if not math.isfinite(temp) or temp <= 0.0:
+                raise ValueError(
+                    "annealed temperature became non-finite or non-positive")
+            return temp
+    else:
+        temperature_at = None  # LENGTH 为 0：循环不执行，不计算温度。
+
+    rng = random.Random(seed)
+    prefix = [vocab.index(start)]
+
+    block = TransformerBlock(V, heads, P)
+    block.attn.Wq = [list(row) for row in Wq]
+    block.attn.Wk = [list(row) for row in Wk]
+    block.attn.Wv = [list(row) for row in Wv]
+    block.attn.Wo = [list(row) for row in Wo]
+    block.W1 = [list(row) for row in W1]
+    block.b1 = list(b1)
+    block.W2 = [list(row) for row in W2]
+    block.b2 = list(b2)
+
+    out = []
+    for t in range(length):
+        temperature = temperature_at(t)
+
+        # 安全求 n=min(WINDOW,len(prefix))；超长 WINDOW 不先转无界整数。
+        n = _safe_window_min(window_text, len(prefix))
+
+        # 仅以末尾 n 项构造 n×V one-hot 与 n×n 局部因果 mask。
+        window_ids = prefix[len(prefix) - n:]
+        x = [[0.0] * V for _ in range(n)]
+        for i in range(n):
+            x[i][window_ids[i]] = 1.0
+        mask = [[j <= i for j in range(n)] for i in range(n)]
+
+        # TransformerBlock.forward 自身校验非有限并抛 ValueError；仅取末行。
+        y_all = block.forward(x, mask)[0]
+        y = y_all[-1]
+
+        # z_k = by_k + Σ_j Why_k,j*y_j，依 j 升序自 float 偏置累加。
+        z = [0.0] * V
+        for k in range(V):
+            acc = float(by[k])
+            why_row = Why[k]
+            for j in range(V):
+                acc += why_row[j] * y[j]
+                if not math.isfinite(acc):
+                    raise ValueError("output affine accumulated non-finitely")
+            z[k] = acc
+
+        # a_k=z_k/T，m=max(a)，e_k=exp(a_k-m)，d 自 0.0 依 k 升序累加。
+        a = [0.0] * V
+        m = None
+        for k in range(V):
+            ak = z[k] / temperature
+            if not math.isfinite(ak):
+                raise ValueError("scaled logit became non-finite")
+            a[k] = ak
+            if m is None or ak > m:
+                m = ak
+        e = [0.0] * V
+        d = 0.0
+        for k in range(V):
+            try:
+                ek = math.exp(a[k] - m)
+            except OverflowError:
+                raise ValueError("softmax exp overflowed")
+            if not math.isfinite(ek):
+                raise ValueError("softmax exp became non-finite")
+            e[k] = ek
+            d += ek
+            if not math.isfinite(d):
+                raise ValueError(
+                    "softmax denominator accumulated non-finitely")
+
+        # u=r.random()*d；自 0.0 依 k 升序累加 e_k，选首个累计值严格大于
+        # u 者；无则取词表末项。
+        u = rng.random() * d
+        if not math.isfinite(u):
+            raise ValueError("sample threshold became non-finite")
+        chosen = V - 1
+        cum = 0.0
+        for k in range(V):
+            cum += e[k]
+            if not math.isfinite(cum):
+                raise ValueError("cumulative probability accumulated "
+                                 "non-finitely")
+            if cum > u:
+                chosen = k
+                break
+
+        # 选中字符追加到输出、其索引追加到完整 prefix（非窗口副本）。
+        out.append(vocab[chosen])
+        prefix.append(chosen)
+
+    return "".join(out) + "\n"
+
+
 def _sample_transformer_top_p(model_path, start, seed_text, start_t_text,
                               end_t_text, top_p_text, length_text):
     """以线性退火温度、top-p 核选样从单层 Transformer 块语言模型采样。
@@ -8018,6 +8178,14 @@ def _beam_transformer(model_path, start, start_t_text, end_t_text,
     (vocab, heads, P, Wq, Wk, Wv, Wo, W1, b1, W2, b2, Why, by) = \
         _load_perplexity_transformer_model(model_path)
     V = len(vocab)
+
+    # 七个模型矩阵（Wq、Wk、Wv、Wo、W1、W2、Why）的外层容器类型须恰为
+    # list（拒绝 tuple 等非 list 序列），否则失败；合法模型的矩阵经装载器
+    # 本就为 list，故此校验不改变任何合法行为。
+    for _mat, _name in ((Wq, "Wq"), (Wk, "Wk"), (Wv, "Wv"), (Wo, "Wo"),
+                        (W1, "W1"), (W2, "W2"), (Why, "Why")):
+        if type(_mat) is not list:
+            raise ValueError("%s outer container must be a list" % _name)
 
     # START：恰为词表内的一个码点。
     if type(start) is not str or len(start) != 1 or start not in vocab:
@@ -20277,6 +20445,12 @@ def main(argv):
         elif len(argv) == 8 and argv[1] == "sample-transformer-anneal":
             output = _sample_transformer_anneal(
                 argv[2], argv[3], argv[4], argv[5], argv[6], argv[7])
+            sys.stdout.buffer.write(output.encode("utf-8"))
+        elif (len(argv) == 9
+              and argv[1] == "sample-transformer-window-anneal"):
+            output = _sample_transformer_window_anneal(
+                argv[2], argv[3], argv[4], argv[5], argv[6], argv[7],
+                argv[8])
             sys.stdout.buffer.write(output.encode("utf-8"))
         elif len(argv) == 8 and argv[1] == "sample-transformer-resume":
             output = _sample_transformer_resume(
